@@ -1,0 +1,3 @@
+[submodule "third_party/ccusage"]
+	path = third_party/ccusage
+	url = https://github.com/ccusage/ccusage.git
