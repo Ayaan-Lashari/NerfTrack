@@ -53,4 +53,17 @@ describe('Nerfify app shell', () => {
       /[+−]\$\d+\.\d{2} \([+−]\d+\.\d{2}%\)/,
     );
   });
+
+  it('switches cached ranges without remounting the chart or keeping a weekly label', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    const chart = await screen.findByRole('img', {
+      name: /Estimated weekly API equivalent/,
+    });
+
+    await user.click(screen.getByRole('tab', { name: '1M' }));
+
+    expect(screen.getByText('Past Month')).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: /Estimated weekly API equivalent/ })).toBe(chart);
+  });
 });

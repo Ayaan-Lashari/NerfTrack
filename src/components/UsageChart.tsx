@@ -104,6 +104,13 @@ export function UsageChart({
   const [selection, setSelection] = useState<ChartSelection | null>(null);
   const [anchorPoint, setAnchorPoint] = useState<HistoryPoint | null>(null);
 
+  useEffect(() => {
+    isDragging.current = false;
+    anchorRef.current = null;
+    setSelection(null);
+    setAnchorPoint(null);
+  }, [range]);
+
   const values = useMemo(
     () => points.map((point) => point.valueUsd).filter((value): value is number => value !== null),
     [points],

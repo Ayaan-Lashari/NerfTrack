@@ -33,6 +33,13 @@ import { demoQuote, demoStatus } from './lib/fixtures';
 import type { Annotation, DiagnosticsSummary, HistoryResponse } from './domain';
 
 const ranges: Range[] = ['1D', '1W', '1M', '3M', '6M'];
+const rangeLabels: Record<Range, string> = {
+  '1D': 'Past Day',
+  '1W': 'Past Week',
+  '1M': 'Past Month',
+  '3M': 'Past 3 Months',
+  '6M': 'Past 6 Months',
+};
 
 function formatUsd(value: number | null) {
   return value === null ? 'Not available' : `$${value.toFixed(2)}`;
@@ -117,18 +124,21 @@ function HomeView({
     anchor: HistoryPoint | null;
   } | null>(null);
   const displayValue = scrubbed?.point.valueUsd ?? quote?.valueUsd ?? null;
+  const comparisonValue = scrubbed?.anchor?.valueUsd ?? history.statistics.baselineValueUsd ?? null;
   const displayChange =
-    scrubbed?.point.valueUsd !== null && scrubbed?.anchor?.valueUsd != null
-      ? scrubbed.point.valueUsd - scrubbed.anchor.valueUsd
-      : scrubbed
-        ? null
-        : (quote?.changeUsd ?? null);
+    displayValue !== null && comparisonValue !== null ? displayValue - comparisonValue : null;
   const displayPercent =
-    displayChange !== null && scrubbed?.anchor?.valueUsd
-      ? (displayChange / scrubbed.anchor.valueUsd) * 100
-      : scrubbed
-        ? null
-        : (quote?.changePercent ?? null);
+    displayChange !== null && comparisonValue ? (displayChange / comparisonValue) * 100 : null;
+  const comparisonLabel = scrubbed?.anchor
+    ? 'Selected range'
+    : scrubbed
+      ? new Date(scrubbed.point.timestamp).toLocaleString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          hour: range === '1D' ? 'numeric' : undefined,
+          minute: range === '1D' ? '2-digit' : undefined,
+        })
+      : rangeLabels[range];
   const isEmpty = !quote || quote.status === 'empty';
   const selectRange = (nextRange: Range) => {
     setScrubbed(null);
@@ -162,7 +172,7 @@ function HomeView({
           <p className={displayChange !== null && displayChange < 0 ? 'negative' : 'positive'}>
             {formatSignedUsd(displayChange)}{' '}
             {displayPercent !== null ? `(${formatPercent(displayPercent)})` : ''}{' '}
-            <span>{scrubbed?.anchor ? 'Selected range' : 'Past Week'}</span>
+            <span>{comparisonLabel}</span>
           </p>
         )}
         {isEmpty && (
@@ -173,7 +183,6 @@ function HomeView({
       </div>
       <div className="chart-panel">
         <UsageChart
-          key={range}
           points={history.points}
           annotations={annotations}
           range={range}
@@ -254,6 +263,7 @@ export default function App() {
   const [range, setRange] = useState<Range>('1W');
   const [status, setStatus] = useState<AppStatus>(demoStatus);
   const [quote, setQuote] = useState<CurrentQuote | null>(demoQuote);
+  const activeRange = useRef(range);
   const historyCache = useRef<Partial<Record<Range, HistoryResponse>>>({});
   const [histories, setHistories] = useState<Partial<Record<Range, HistoryResponse>>>({});
   const history = histories[range] ?? null;
@@ -265,7 +275,9 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const historyRanges = ranges.every((item) => historyCache.current[item]) ? [range] : ranges;
+      const historyRanges = ranges.every((item) => historyCache.current[item])
+        ? [activeRange.current]
+        : ranges;
       const [nextQuote, nextStatus, nextHistories, nextAnnotations, nextDiagnostics, nextSettings] =
         await Promise.all([
           getCurrentQuote(),
@@ -302,7 +314,7 @@ export default function App() {
     } finally {
       setIsLoading(false);
     }
-  }, [range]);
+  }, []);
 
   useEffect(() => {
     void refresh();
@@ -317,6 +329,7 @@ export default function App() {
   }, [refresh, settings?.refreshIntervalSeconds]);
 
   const handleRangeChange = (nextRange: Range) => {
+    activeRange.current = nextRange;
     setRange(nextRange);
   };
 
