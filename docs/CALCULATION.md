@@ -22,4 +22,8 @@ Defaults are algorithm inputs, not OpenAI policy facts. They are centralized in 
 - eligible events: at least 2;
 - low-usage quarantine: at or below 3%.
 
-Display value is the median of the latest five raw quotes with the same dominant model. The “Past Week” comparison uses the equivalent median at or before seven days earlier. Cache/fast/long-context share comparability and multi-epoch trend classification remain estimator capabilities for a future schema that persists those shares; they are not claimed by the current quote store.
+Display and graph values require at least three quotes for the same dominant model and normalized weekly reset. They use the median of the latest five comparable quotes, so an isolated low-movement interval cannot become the headline or a chart baseline.
+
+Range comparisons use the current dominant model only. A baseline must be at or before the requested cutoff and no more than half a range older than that cutoff. If the requested period lacks a comparable baseline, Nerfify returns no change instead of relabeling a shorter interval as the full range. The graph is rebuilt from local observations on every configured refresh; it does not contain fixed dollar values or machine-specific paths.
+
+Cache/fast/long-context share comparability and multi-epoch trend classification remain estimator capabilities for a future schema that persists those shares; they are not claimed by the current quote store.

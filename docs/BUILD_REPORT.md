@@ -26,11 +26,11 @@ All of the following passed locally from the repository root:
 | Frontend formatting   | `npm run format:check`                                                                          | PASS            |
 | ESLint                | `npm run lint`                                                                                  | PASS            |
 | TypeScript            | `npm run typecheck`                                                                             | PASS            |
-| Frontend tests        | `npm test -- --run`                                                                             | PASS — 7 tests  |
+| Frontend tests        | `npm test -- --run`                                                                             | PASS — 8 tests  |
 | Vite production build | `npm run build`                                                                                 | PASS            |
 | Rust formatting       | `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`                                     | PASS            |
 | Rust Clippy           | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings` | PASS            |
-| Rust tests            | `cargo test --manifest-path src-tauri/Cargo.toml`                                               | PASS — 32 tests |
+| Rust tests            | `cargo test --manifest-path src-tauri/Cargo.toml`                                               | PASS — 33 tests |
 | Tauri bundle          | `npm run tauri:build`                                                                           | PASS            |
 
 The Tauri build produced:

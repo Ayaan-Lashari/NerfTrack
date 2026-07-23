@@ -36,13 +36,49 @@ struct QuotaPoint {
     used_percent: f64,
 }
 
+struct StabilizedQuote {
+    point: HistoryPoint,
+    epoch: i64,
+}
+
 type EpochKey = (Option<String>, Option<String>, i64);
+const MIN_COMPARABLE_QUOTES: usize = 3;
 
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+fn comparison_baseline(
+    quotes: &[StabilizedQuote],
+    cutoff_ms: i64,
+    tolerance_ms: i64,
+) -> Option<f64> {
+    let candidate = quotes
+        .iter()
+        .rev()
+        .find(|quote| quote.point.timestamp <= cutoff_ms)?;
+    (cutoff_ms - candidate.point.timestamp <= tolerance_ms)
+        .then_some(candidate.point.value_usd)
+        .flatten()
+}
+
+fn empty_history(range: Range) -> HistoryResponse {
+    HistoryResponse {
+        bucket: range.bucket().into(),
+        statistics: RangeStatistics {
+            range,
+            baseline_value_usd: None,
+            current_value_usd: None,
+            delta_usd: None,
+            delta_percent: None,
+            point_count: 0,
+            partial: true,
+        },
+        points: Vec::new(),
+    }
 }
 
 pub fn data_directory() -> PathBuf {
@@ -674,6 +710,75 @@ impl Database {
             .map_err(|_| "unable to read current quota".to_string())
     }
 
+    fn stabilized_quotes_for_model(
+        &self,
+        dominant_model: &str,
+    ) -> Result<Vec<StabilizedQuote>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT quotes.timestamp_ms, quotes.value_usd, quotes.raw_value_usd,
+                        quotes.weekly_used_percent, quotes.is_finalized,
+                        (SELECT (quota.reset_at_ms + 30000) / 60000
+                         FROM quota_snapshots quota
+                         WHERE quota.observed_at_ms=quotes.timestamp_ms
+                           AND quota.reset_at_ms IS NOT NULL
+                           AND ABS(quota.duration_minutes - 10080.0) <= 240.0
+                         ORDER BY quota.id DESC
+                         LIMIT 1)
+                 FROM quotes
+                 WHERE quotes.dominant_model=?1
+                   AND quotes.algorithm_version=?2
+                 ORDER BY quotes.timestamp_ms",
+            )
+            .map_err(|_| "unable to read comparable quote history".to_string())?;
+        let rows = statement
+            .query_map(params![dominant_model, ALGORITHM_VERSION], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })
+            .map_err(|_| "unable to read comparable quote history".to_string())?;
+        let mut recent_by_epoch: HashMap<i64, Vec<f64>> = HashMap::new();
+        let mut stabilized = Vec::new();
+        for row in rows {
+            let (timestamp, value, raw_value, weekly_used, is_finalized, epoch) =
+                row.map_err(|_| "unable to decode comparable quote history".to_string())?;
+            let Some(epoch) = epoch else {
+                continue;
+            };
+            let recent = recent_by_epoch.entry(epoch).or_default();
+            recent.push(value);
+            if recent.len() > 5 {
+                recent.remove(0);
+            }
+            if recent.len() < MIN_COMPARABLE_QUOTES {
+                continue;
+            }
+            let Some(value_usd) = crate::estimator::median_latest_five(recent) else {
+                continue;
+            };
+            stabilized.push(StabilizedQuote {
+                point: HistoryPoint {
+                    timestamp,
+                    value_usd: Some(value_usd),
+                    raw_value_usd: raw_value,
+                    weekly_used_percent: weekly_used,
+                    is_finalized,
+                    is_heartbeat: false,
+                    dominant_model: Some(dominant_model.to_string()),
+                },
+                epoch,
+            });
+        }
+        Ok(stabilized)
+    }
+
     pub fn latest_quote(&self) -> Result<Option<CurrentQuote>, String> {
         let mut statement = self
             .connection
@@ -719,59 +824,25 @@ impl Database {
             )
             .optional()
             .map_err(|_| "unable to identify current quota epoch".to_string())?;
-        let recent_values = {
-            let mut statement = self
-                .connection
-                .prepare(
-                    "SELECT value_usd
-                     FROM quotes
-                     WHERE ((dominant_model IS NULL AND ?1 IS NULL) OR dominant_model=?1)
-                       AND (
-                           ?2 IS NULL OR EXISTS (
-                               SELECT 1
-                               FROM quota_snapshots quota
-                               WHERE quota.observed_at_ms=quotes.timestamp_ms
-                                 AND ABS(quota.duration_minutes - 10080.0) <= 240.0
-                                 AND (quota.reset_at_ms + 30000) / 60000=?2
-                           )
-                       )
-                     ORDER BY timestamp_ms DESC
-                     LIMIT 5",
-                )
-                .map_err(|_| "unable to read comparable quotes".to_string())?;
-            let values = statement
-                .query_map(params![dominant_model, latest_reset_group], |row| {
-                    row.get::<_, f64>(0)
-                })
-                .map_err(|_| "unable to read comparable quotes".to_string())?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|_| "unable to decode comparable quotes".to_string())?;
-            values
-        };
-        let current_value = crate::estimator::median_latest_five(&recent_values);
-        let week_ago_values = {
-            let mut statement = self
-                .connection
-                .prepare(
-                    "SELECT value_usd
-                     FROM quotes
-                     WHERE timestamp_ms <= ?1
-                       AND ((dominant_model IS NULL AND ?2 IS NULL) OR dominant_model=?2)
-                     ORDER BY timestamp_ms DESC
-                     LIMIT 5",
-                )
-                .map_err(|_| "unable to read weekly comparison".to_string())?;
-            let values = statement
-                .query_map(
-                    params![latest_timestamp - 604_800_000, dominant_model],
-                    |row| row.get::<_, f64>(0),
-                )
-                .map_err(|_| "unable to read weekly comparison".to_string())?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|_| "unable to decode weekly comparison".to_string())?;
-            values
-        };
-        let previous_value = crate::estimator::median_latest_five(&week_ago_values);
+        let stabilized = dominant_model
+            .as_deref()
+            .map(|model| self.stabilized_quotes_for_model(model))
+            .transpose()?
+            .unwrap_or_default();
+        let current_value = latest_reset_group.and_then(|epoch| {
+            stabilized
+                .iter()
+                .rev()
+                .find(|quote| quote.epoch == epoch)
+                .and_then(|quote| quote.point.value_usd)
+        });
+        let previous_value = current_value.and_then(|_| {
+            comparison_baseline(
+                &stabilized,
+                latest_timestamp - Range::W1.duration_ms(),
+                Range::W1.duration_ms() / 2,
+            )
+        });
         let observed_cost_usd = latest.2;
         let weekly_used_percent = latest.3;
         let confidence = latest.5.as_str();
@@ -798,12 +869,16 @@ impl Database {
             observed_cost_usd,
             weekly_used_percent,
             reset_at,
-            status: match status {
-                "valid" => QuoteStatus::Valid,
-                "pending" => QuoteStatus::Pending,
-                "unsupported" => QuoteStatus::Unsupported,
-                "error" => QuoteStatus::Error,
-                _ => QuoteStatus::Empty,
+            status: if current_value.is_none() && status == "valid" {
+                QuoteStatus::Pending
+            } else {
+                match status {
+                    "valid" => QuoteStatus::Valid,
+                    "pending" => QuoteStatus::Pending,
+                    "unsupported" => QuoteStatus::Unsupported,
+                    "error" => QuoteStatus::Error,
+                    _ => QuoteStatus::Empty,
+                }
             },
             dominant_model,
             algorithm_version: ALGORITHM_VERSION.into(),
@@ -813,40 +888,56 @@ impl Database {
                 "low" => Confidence::Low,
                 _ => Confidence::None,
             },
-            note: Some(
-                "Values are estimates based on observed local usage and may differ from actual API pricing."
-                    .into(),
-            ),
+            note: Some("Values require at least three settled same-model observations in one weekly quota cycle and may differ from actual API pricing.".into()),
         }))
     }
 
     pub fn history(&self, range: Range) -> Result<HistoryResponse, String> {
-        let since = now_ms() - range.duration_ms();
-        let mut statement = self.connection.prepare("SELECT timestamp_ms, value_usd, raw_value_usd, weekly_used_percent, is_finalized, dominant_model, 0 AS is_heartbeat FROM quotes WHERE timestamp_ms >= ?1 UNION ALL SELECT timestamp_ms, value_usd, value_usd, weekly_used_percent, 1, NULL, 1 AS is_heartbeat FROM chart_heartbeats WHERE timestamp_ms >= ?1 ORDER BY timestamp_ms ASC").map_err(|_| "unable to read history".to_string())?;
-        let rows = statement
-            .query_map(params![since], |row| {
-                Ok(HistoryPoint {
-                    timestamp: row.get(0)?,
-                    value_usd: row.get(1)?,
-                    raw_value_usd: row.get(2)?,
-                    weekly_used_percent: row.get(3)?,
-                    is_finalized: row.get::<_, i64>(4)? != 0,
-                    is_heartbeat: row.get::<_, i64>(6)? != 0,
-                    dominant_model: row.get(5)?,
-                })
-            })
-            .map_err(|_| "unable to read history".to_string())?;
-        let mut points = Vec::new();
-        for row in rows {
-            points.push(row.map_err(|_| "unable to decode history".to_string())?);
-        }
-        let first = points.first().and_then(|point| point.value_usd);
-        let current = points.last().and_then(|point| point.value_usd);
-        let delta = current.zip(first).map(|(current, first)| current - first);
+        let latest: Option<(i64, Option<String>, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT quotes.timestamp_ms, quotes.dominant_model,
+                        (SELECT (quota.reset_at_ms + 30000) / 60000
+                         FROM quota_snapshots quota
+                         WHERE quota.observed_at_ms=quotes.timestamp_ms
+                           AND quota.reset_at_ms IS NOT NULL
+                           AND ABS(quota.duration_minutes - 10080.0) <= 240.0
+                         ORDER BY quota.id DESC
+                         LIMIT 1)
+                 FROM quotes
+                 ORDER BY quotes.timestamp_ms DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| "unable to identify current quote history".to_string())?;
+        let Some((latest_timestamp, Some(dominant_model), latest_epoch)) = latest else {
+            return Ok(empty_history(range));
+        };
+        let stabilized = self.stabilized_quotes_for_model(&dominant_model)?;
+        let since = latest_timestamp - range.duration_ms();
+        let current = latest_epoch.and_then(|epoch| {
+            stabilized
+                .iter()
+                .rev()
+                .find(|quote| quote.epoch == epoch)
+                .and_then(|quote| quote.point.value_usd)
+        });
+        let baseline =
+            current.and_then(|_| comparison_baseline(&stabilized, since, range.duration_ms() / 2));
+        let points = stabilized
+            .iter()
+            .filter(|quote| quote.point.timestamp >= since)
+            .map(|quote| quote.point.clone())
+            .collect::<Vec<_>>();
+        let delta = current
+            .zip(baseline)
+            .map(|(current, baseline)| current - baseline);
         let delta_percent = current
-            .zip(first)
-            .filter(|(_, first)| *first != 0.0)
-            .map(|(current, first)| ((current - first) / first) * 100.0);
+            .zip(baseline)
+            .filter(|(_, baseline)| *baseline != 0.0)
+            .map(|(current, baseline)| ((current - baseline) / baseline) * 100.0);
         let tolerance_ms = match &range {
             Range::D1 => 30 * 60 * 1_000,
             Range::W1 => 60 * 60 * 1_000,
@@ -855,11 +946,11 @@ impl Database {
         };
         let partial = points
             .first()
-            .is_some_and(|point| point.timestamp > since + tolerance_ms);
+            .map_or(true, |point| point.timestamp > since + tolerance_ms);
         Ok(HistoryResponse {
             statistics: RangeStatistics {
                 range: range.clone(),
-                baseline_value_usd: first,
+                baseline_value_usd: baseline,
                 current_value_usd: current,
                 delta_usd: delta,
                 delta_percent,
@@ -1052,7 +1143,7 @@ mod tests {
             connection: open_connection(&path).expect("temporary database"),
         };
         database.migrate().expect("schema");
-        let bucket_start = now_ms().div_euclid(1_800_000) * 1_800_000 - 7_200_000;
+        let bucket_start = now_ms().div_euclid(1_800_000) * 1_800_000 - 10_800_000;
         let reset_at_ms = bucket_start + 604_800_000;
         let events = vec![
             UsageEvent {
@@ -1097,7 +1188,7 @@ mod tests {
                 input_tokens: 100_000,
                 output_tokens: 10_000,
                 authenticated_official_codex: true,
-                quota_used_percent: Some(95.0),
+                quota_used_percent: Some(20.0),
                 quota_reset_at_ms: Some(reset_at_ms),
                 quota_window_minutes: Some(10_080.0),
                 quota_limit_id: Some("codex".into()),
@@ -1109,7 +1200,7 @@ mod tests {
                 input_tokens: 100_000,
                 output_tokens: 10_000,
                 authenticated_official_codex: true,
-                quota_used_percent: Some(100.0),
+                quota_used_percent: Some(25.0),
                 quota_reset_at_ms: Some(reset_at_ms),
                 quota_window_minutes: Some(10_080.0),
                 quota_limit_id: Some("codex".into()),
@@ -1117,6 +1208,30 @@ mod tests {
             },
             UsageEvent {
                 timestamp_ms: bucket_start + 5_460_000,
+                model: "gpt-5.6-sol".into(),
+                input_tokens: 100_000,
+                output_tokens: 10_000,
+                authenticated_official_codex: true,
+                quota_used_percent: Some(95.0),
+                quota_reset_at_ms: Some(reset_at_ms),
+                quota_window_minutes: Some(10_080.0),
+                quota_limit_id: Some("codex".into()),
+                ..UsageEvent::default()
+            },
+            UsageEvent {
+                timestamp_ms: bucket_start + 5_520_000,
+                model: "gpt-5.6-sol".into(),
+                input_tokens: 100_000,
+                output_tokens: 10_000,
+                authenticated_official_codex: true,
+                quota_used_percent: Some(100.0),
+                quota_reset_at_ms: Some(reset_at_ms),
+                quota_window_minutes: Some(10_080.0),
+                quota_limit_id: Some("codex".into()),
+                ..UsageEvent::default()
+            },
+            UsageEvent {
+                timestamp_ms: bucket_start + 7_260_000,
                 model: "gpt-5.6-sol".into(),
                 input_tokens: 100_000_000,
                 output_tokens: 10_000_000,
@@ -1128,7 +1243,7 @@ mod tests {
                 ..UsageEvent::default()
             },
             UsageEvent {
-                timestamp_ms: bucket_start + 5_520_000,
+                timestamp_ms: bucket_start + 7_320_000,
                 model: "gpt-5.6-sol".into(),
                 input_tokens: 100_000_000,
                 output_tokens: 10_000_000,
@@ -1160,11 +1275,102 @@ mod tests {
         assert_eq!(quote.change_usd, None);
         assert_eq!(quote.algorithm_version, "nerfify-estimator-v2");
         let history = database.history(Range::W1).expect("history");
-        assert_eq!(history.points.len(), 2);
+        assert_eq!(history.points.len(), 1);
         assert!(history
             .points
             .iter()
             .all(|point| point.value_usd.is_some_and(|value| value < 100.0)));
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_uses_same_model_stabilized_baselines() {
+        let path = std::env::temp_dir().join(format!(
+            "nerfify-history-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut database = Database {
+            path: path.clone(),
+            connection: open_connection(&path).expect("temporary database"),
+        };
+        database.migrate().expect("schema");
+        let current = now_ms();
+        let prior_reset = current - 2 * Range::W1.duration_ms();
+        let current_reset = current + Range::W1.duration_ms();
+        let insert_quote =
+            |connection: &Connection, timestamp: i64, value: f64, model: &str, reset: i64| {
+                connection
+                    .execute(
+                        "INSERT INTO quota_snapshots (
+                            observed_at_ms, reset_at_ms, duration_minutes, limit_id,
+                            used_percent, connection_quality
+                         ) VALUES (?1, ?2, 10080.0, 'codex', 20.0, 'good')",
+                        params![timestamp, reset],
+                    )
+                    .expect("quota");
+                connection
+                    .execute(
+                        "INSERT INTO quotes (
+                            timestamp_ms, value_usd, raw_value_usd, observed_cost_usd,
+                            weekly_used_percent, dominant_model, confidence, status,
+                            is_finalized, algorithm_version
+                         ) VALUES (?1, ?2, ?2, 1.0, 20.0, ?3, 'high', 'valid', 1, ?4)",
+                        params![timestamp, value, model, ALGORITHM_VERSION],
+                    )
+                    .expect("quote");
+            };
+        for (index, value) in [15.44, 17.14, 6.56, 10.65, 10.82].into_iter().enumerate() {
+            insert_quote(
+                &database.connection,
+                current - 10 * 86_400_000 + index as i64 * 21_600_000,
+                value,
+                "gpt-5.6-sol",
+                prior_reset,
+            );
+        }
+        insert_quote(
+            &database.connection,
+            current - 7_200_000,
+            98.66,
+            "gpt-5.6-luna",
+            current_reset,
+        );
+        for (index, value) in [15.51, 7.16, 10.89].into_iter().enumerate() {
+            insert_quote(
+                &database.connection,
+                current - 3_600_000 + index as i64 * 1_800_000,
+                value,
+                "gpt-5.6-sol",
+                current_reset,
+            );
+        }
+
+        let quote = database
+            .latest_quote()
+            .expect("quote")
+            .expect("current quote");
+        assert_eq!(quote.value_usd, Some(10.89));
+        assert!(quote
+            .change_usd
+            .is_some_and(|value| (value - 0.07).abs() < 0.001));
+
+        let week = database.history(Range::W1).expect("week");
+        assert_eq!(week.points.len(), 1);
+        assert_eq!(week.statistics.baseline_value_usd, Some(10.82));
+        assert!(week
+            .statistics
+            .delta_percent
+            .is_some_and(|value| (value - 0.647).abs() < 0.01));
+        assert!(week.points.iter().all(|point| {
+            point.dominant_model.as_deref() == Some("gpt-5.6-sol")
+                && point.value_usd.is_some_and(|value| value < 20.0)
+        }));
+
+        let day = database.history(Range::D1).expect("day");
+        assert_eq!(day.statistics.baseline_value_usd, None);
+        assert_eq!(day.statistics.delta_percent, None);
         drop(database);
         let _ = fs::remove_file(path);
     }

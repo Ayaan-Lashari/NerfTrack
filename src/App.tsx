@@ -138,8 +138,10 @@ function HomeView({
           hour: range === '1D' ? 'numeric' : undefined,
           minute: range === '1D' ? '2-digit' : undefined,
         })
-      : rangeLabels[range];
-  const isEmpty = !quote || quote.status === 'empty';
+      : history.statistics.baselineValueUsd === null
+        ? `${rangeLabels[range]} unavailable`
+        : rangeLabels[range];
+  const isEmpty = displayValue === null || !quote || quote.status === 'empty';
   const selectRange = (nextRange: Range) => {
     setScrubbed(null);
     onRangeChange(nextRange);
@@ -265,6 +267,7 @@ export default function App() {
   const [quote, setQuote] = useState<CurrentQuote | null>(demoQuote);
   const activeRange = useRef(range);
   const historyCache = useRef<Partial<Record<Range, HistoryResponse>>>({});
+  const refreshInFlight = useRef(false);
   const [histories, setHistories] = useState<Partial<Record<Range, HistoryResponse>>>({});
   const history = histories[range] ?? null;
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -274,14 +277,18 @@ export default function App() {
   const [loadError, setLoadError] = useState(false);
 
   const refresh = useCallback(async () => {
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
     try {
       const historyRanges = ranges.every((item) => historyCache.current[item])
         ? [activeRange.current]
         : ranges;
-      const [nextQuote, nextStatus, nextHistories, nextAnnotations, nextDiagnostics, nextSettings] =
+      // Status reconciliation imports newly written usage before every dependent read.
+      // Sequencing it first prevents a refresh from mixing old chart data with new status.
+      const nextStatus = await getCurrentStatus();
+      const [nextQuote, nextHistories, nextAnnotations, nextDiagnostics, nextSettings] =
         await Promise.all([
           getCurrentQuote(),
-          getCurrentStatus(),
           Promise.all(historyRanges.map(async (item) => [item, await getHistory(item)] as const)),
           getAnnotations(),
           getDiagnosticsSummary(),
@@ -313,6 +320,7 @@ export default function App() {
       setLoadError(true);
     } finally {
       setIsLoading(false);
+      refreshInFlight.current = false;
     }
   }, []);
 
