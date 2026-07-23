@@ -125,7 +125,12 @@ pub fn median_latest_five(values: &[f64]) -> Option<f64> {
         return None;
     }
     sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
-    Some(sorted[sorted.len() / 2])
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        Some((sorted[middle - 1] + sorted[middle]) / 2.0)
+    } else {
+        Some(sorted[middle])
+    }
 }
 
 pub fn workload_comparable(
@@ -246,5 +251,6 @@ mod tests {
             median_latest_five(&[10.0, 9.0, 8.0, 7.0, 6.0, 100.0]),
             Some(8.0)
         );
+        assert_eq!(median_latest_five(&[7.0, 12.0, 15.0, 98.0]), Some(13.5));
     }
 }

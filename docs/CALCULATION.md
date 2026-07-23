@@ -6,7 +6,7 @@ The quote is an estimate of the observed eligible Codex cost scaled to a complet
 weekly API equivalent = settled eligible cost delta / settled quota percentage delta × 100
 ```
 
-The live graph evaluates the formula from official Codex token records within the current quota window. It requires finite embedded family pricing and a positive weekly quota observation; missing provider evidence, pricing, or quota data remains pending rather than becoming a fabricated zero. Quote points are reduced to one observation per 30-minute bucket.
+The live graph evaluates the formula between consecutive official Codex observations for the same normalized weekly reset. It requires finite embedded family pricing, monotonic quota movement, settled sources, and the configured minimum movement, cost, event count, and low-usage thresholds. Quote points are reduced to one observation per 30-minute bucket. The first 100% observation may close an interval; later cost at the same saturated reset cannot create or inflate another quote.
 
 Current Codex model variants use the embedded price for their compatible GPT-5 family. This keeps desktop monitoring local and functional when a new Codex variant appears before a model-specific catalog entry; values remain estimates rather than billing statements.
 
@@ -22,4 +22,4 @@ Defaults are algorithm inputs, not OpenAI policy facts. They are centralized in 
 - eligible events: at least 2;
 - low-usage quarantine: at or below 3%.
 
-Display value is the median of the latest five workload-comparable raw quotes. Comparability requires the same dominant model and cache/fast/long-context share deltas within 15/10/10 percentage points. Trend states need one comparable decline for `watching`, three consecutive declines for `possible_reduction`, five declines of at least 15% spanning two epochs for `likely_reduction`, and persistence across two reset boundaries for `sustained_trend`.
+Display value is the median of the latest five raw quotes with the same dominant model. The “Past Week” comparison uses the equivalent median at or before seven days earlier. Cache/fast/long-context share comparability and multi-epoch trend classification remain estimator capabilities for a future schema that persists those shares; they are not claimed by the current quote store.

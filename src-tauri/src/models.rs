@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const ALGORITHM_VERSION: &str = "nerfify-estimator-v1";
+pub const ALGORITHM_VERSION: &str = "nerfify-estimator-v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]

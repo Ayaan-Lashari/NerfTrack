@@ -29,4 +29,4 @@ Codex CLI JSONL + optional stdio App Server
 
 ## Persistence and continuity
 
-The database stores accounts, source checkpoints, usage events, pricing snapshots, quota snapshots, epochs, measurements, quotes, annotations, heartbeats, settings, diagnostics, and app-run boundaries. Status refreshes reconcile new JSONL tails through the database’s serialized writer lock and rebuild 30-minute quote points from locally observed cost and weekly quota usage. No table stores prompts, raw account identifiers, or raw JSONL lines.
+The database stores accounts, source checkpoints, usage events, pricing snapshots, quota snapshots, epochs, measurements, quotes, annotations, heartbeats, settings, diagnostics, and app-run boundaries. Status refreshes reconcile new JSONL tails through the database’s serialized writer lock and rebuild 30-minute quote points from settled cost and weekly-quota deltas. Startup and settings changes rebuild the same derived quotes, so existing and future databases share one estimator path. No table stores prompts, raw account identifiers, or raw JSONL lines.

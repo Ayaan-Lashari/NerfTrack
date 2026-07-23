@@ -26,11 +26,11 @@ All of the following passed locally from the repository root:
 | Frontend formatting   | `npm run format:check`                                                                          | PASS            |
 | ESLint                | `npm run lint`                                                                                  | PASS            |
 | TypeScript            | `npm run typecheck`                                                                             | PASS            |
-| Frontend tests        | `npm test -- --run`                                                                             | PASS — 4 tests  |
+| Frontend tests        | `npm test -- --run`                                                                             | PASS — 7 tests  |
 | Vite production build | `npm run build`                                                                                 | PASS            |
 | Rust formatting       | `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`                                     | PASS            |
 | Rust Clippy           | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings` | PASS            |
-| Rust tests            | `cargo test --manifest-path src-tauri/Cargo.toml`                                               | PASS — 27 tests |
+| Rust tests            | `cargo test --manifest-path src-tauri/Cargo.toml`                                               | PASS — 32 tests |
 | Tauri bundle          | `npm run tauri:build`                                                                           | PASS            |
 
 The Tauri build produced:
@@ -73,7 +73,9 @@ release steps documented in `docs/RELEASE.md`.
 The browser-only review build still uses deterministic fixtures. Native Tauri
 builds periodically reconcile discovered or manually selected Codex JSONL
 sources, price official GPT-5-family usage locally, persist embedded weekly
-quota observations, and expose live current/history DTOs.
+quota observations, rebuild settled cost/quota-delta intervals, freeze
+saturated epochs, enforce configured estimator thresholds, and expose
+median-stabilized current/history DTOs.
 
 The CLI App Server supervisor remains available as a primitive but is not
 required when JSONL records already contain the Codex weekly quota observation.

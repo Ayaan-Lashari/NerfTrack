@@ -364,6 +364,7 @@ fn update_settings(
     let mut current = database.load_settings()?;
     current.advanced = settings;
     database.save_settings(&current)?;
+    database.rebuild_quotes()?;
     Ok(current)
 }
 

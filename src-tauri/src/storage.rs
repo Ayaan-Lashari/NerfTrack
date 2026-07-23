@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6,9 +7,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::collector::{CollectionSummary, PersistedCheckpoint};
 use crate::models::{
-    Annotation, AnnotationKind, AppSettings, Confidence, CurrentQuote, DiagnosticReason,
-    DiagnosticsSummary, HistoryPoint, HistoryResponse, QuoteStatus, Range, RangeStatistics,
-    ALGORITHM_VERSION,
+    AdvancedSettings, Annotation, AnnotationKind, AppSettings, Confidence, CurrentQuote,
+    DiagnosticReason, DiagnosticsSummary, HistoryPoint, HistoryResponse, QuoteStatus, Range,
+    RangeStatistics, ALGORITHM_VERSION,
 };
 use crate::parser::{event_fingerprint, UsageEvent};
 use crate::pricing::{
@@ -25,6 +26,17 @@ pub struct LatestQuotaObservation {
     pub reset_at_ms: Option<i64>,
     pub plan: Option<String>,
 }
+
+#[derive(Clone)]
+struct QuotaPoint {
+    account_key: Option<String>,
+    limit_id: Option<String>,
+    observed_at_ms: i64,
+    reset_at_ms: i64,
+    used_percent: f64,
+}
+
+type EpochKey = (Option<String>, Option<String>, i64);
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -120,6 +132,7 @@ impl Database {
         }
         database.restrict_directory_permissions(&directory);
         database.restrict_file_permissions();
+        database.rebuild_quotes()?;
         database.record_app_run()?;
         Ok(database)
     }
@@ -374,6 +387,7 @@ impl Database {
         account_key: Option<&str>,
         pricing_snapshot: Option<&PricingSnapshot>,
     ) -> Result<usize, String> {
+        let settings = self.load_settings()?.advanced;
         let transaction = self
             .connection
             .transaction()
@@ -400,9 +414,7 @@ impl Database {
                 inserted += 1;
             }
         }
-        if inserted > 0 {
-            Self::rebuild_quotes(&transaction)?;
-        }
+        Self::rebuild_quotes_in_transaction(&transaction, &settings)?;
         if collection.stats.partial_line_retries > 0 {
             add_diagnostic(
                 &transaction,
@@ -476,73 +488,173 @@ impl Database {
         Ok(inserted == 1)
     }
 
-    fn rebuild_quotes(transaction: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    pub fn rebuild_quotes(&mut self) -> Result<(), String> {
+        let settings = self.load_settings()?.advanced;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| "unable to start quote rebuild".to_string())?;
+        Self::rebuild_quotes_in_transaction(&transaction, &settings)?;
         transaction
-            .execute_batch(
-                "DELETE FROM quotes;
-                WITH latest_quota AS (
-                    SELECT quota.*
-                    FROM quota_snapshots quota
-                    JOIN (
-                        SELECT MAX(id) AS id
-                        FROM quota_snapshots
-                        WHERE used_percent > 0 AND reset_at_ms IS NOT NULL
-                        GROUP BY observed_at_ms / 1800000
-                    ) selected ON selected.id = quota.id
-                ),
-                totals AS (
-                    SELECT
-                        quota.id,
-                        SUM(event.cost_usd) AS observed_cost
-                    FROM latest_quota quota
-                    JOIN usage_events event
-                      ON event.pricing_status = 'priced'
-                     AND event.timestamp_ms <= quota.observed_at_ms
-                     AND event.timestamp_ms >= quota.reset_at_ms - CAST(quota.duration_minutes * 60000 AS INTEGER)
-                    GROUP BY quota.id
+            .commit()
+            .map_err(|_| "unable to commit quote rebuild".to_string())
+    }
+
+    fn rebuild_quotes_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        settings: &AdvancedSettings,
+    ) -> Result<(), String> {
+        let quota_points = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT quota.account_key, quota.limit_id, quota.observed_at_ms,
+                            quota.reset_at_ms, quota.used_percent
+                     FROM quota_snapshots quota
+                     JOIN (
+                         SELECT MAX(id) AS id
+                         FROM quota_snapshots
+                         WHERE used_percent > 0
+                           AND reset_at_ms IS NOT NULL
+                           AND ABS(duration_minutes - 10080.0) <= 240.0
+                         GROUP BY COALESCE(account_key, ''), COALESCE(limit_id, ''),
+                                  observed_at_ms / 1800000
+                     ) selected ON selected.id = quota.id
+                     ORDER BY quota.observed_at_ms",
                 )
-                INSERT INTO quotes (
-                    timestamp_ms,
-                    value_usd,
-                    raw_value_usd,
-                    observed_cost_usd,
-                    weekly_used_percent,
-                    dominant_model,
-                    confidence,
-                    status,
-                    is_finalized,
-                    algorithm_version
+                .map_err(|_| "unable to read weekly quota observations".to_string())?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(QuotaPoint {
+                        account_key: row.get(0)?,
+                        limit_id: row.get(1)?,
+                        observed_at_ms: row.get(2)?,
+                        reset_at_ms: row.get(3)?,
+                        used_percent: row.get(4)?,
+                    })
+                })
+                .map_err(|_| "unable to read weekly quota observations".to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| "unable to decode weekly quota observations".to_string())?
+        };
+
+        transaction
+            .execute("DELETE FROM quotes", [])
+            .map_err(|_| "unable to clear stale quotes".to_string())?;
+
+        let thresholds = crate::estimator::Thresholds {
+            refresh_seconds: settings.refresh_interval_seconds,
+            monitoring_gap_minutes: settings.monitoring_gap_minutes,
+            settlement_seconds: settings.settlement_window_seconds,
+            hard_settlement_seconds: settings.settlement_window_seconds,
+            minimum_decimal_quota_points: settings.minimum_quota_movement_points,
+            minimum_whole_quota_points: settings.minimum_quota_movement_points,
+            minimum_eligible_cost_usd: settings.minimum_eligible_cost_usd,
+            minimum_events: settings.minimum_events,
+            low_usage_quarantine_percent: settings.low_usage_quarantine_percent,
+        };
+        let rebuilt_at_ms = now_ms();
+        let mut previous_by_epoch: HashMap<EpochKey, QuotaPoint> = HashMap::new();
+
+        for current in quota_points {
+            let epoch_key = (
+                current.account_key.clone(),
+                current.limit_id.clone(),
+                (current.reset_at_ms + 30_000).div_euclid(60_000),
+            );
+            let Some(previous) = previous_by_epoch.insert(epoch_key, current.clone()) else {
+                continue;
+            };
+            if previous.used_percent >= 100.0 || current.used_percent <= previous.used_percent {
+                continue;
+            }
+
+            let (cost_delta_usd, event_count): (f64, i64) = transaction
+                .query_row(
+                    "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*)
+                     FROM usage_events
+                     WHERE pricing_status='priced'
+                       AND timestamp_ms > ?1
+                       AND timestamp_ms <= ?2
+                       AND ((account_key IS NULL AND ?3 IS NULL) OR account_key=?3)",
+                    params![
+                        previous.observed_at_ms,
+                        current.observed_at_ms,
+                        current.account_key
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                SELECT
-                    quota.observed_at_ms,
-                    totals.observed_cost / (quota.used_percent / 100.0),
-                    totals.observed_cost / (quota.used_percent / 100.0),
-                    totals.observed_cost,
-                    quota.used_percent,
-                    (
-                        SELECT event.model_id
-                        FROM usage_events event
-                        WHERE event.pricing_status = 'priced'
-                          AND event.timestamp_ms <= quota.observed_at_ms
-                          AND event.timestamp_ms >= quota.reset_at_ms - CAST(quota.duration_minutes * 60000 AS INTEGER)
-                        GROUP BY event.model_id
-                        ORDER BY SUM(event.cost_usd) DESC
-                        LIMIT 1
-                    ),
-                    CASE
-                        WHEN quota.used_percent >= 5 THEN 'high'
-                        WHEN quota.used_percent >= 3 THEN 'medium'
-                        ELSE 'low'
-                    END,
-                    'valid',
-                    1,
-                    'nerfify-estimator-v1'
-                FROM latest_quota quota
-                JOIN totals ON totals.id = quota.id
-                WHERE totals.observed_cost > 0
-                ORDER BY quota.observed_at_ms;",
-            )
-            .map_err(|_| "unable to rebuild live quotes".to_string())
+                .map_err(|_| "unable to measure interval cost".to_string())?;
+            let quota_delta_points = current.used_percent - previous.used_percent;
+            let decimal_quota =
+                current.used_percent.fract() != 0.0 || previous.used_percent.fract() != 0.0;
+            let decision = crate::estimator::settle_interval(
+                crate::estimator::SettlementInput {
+                    cost_delta_usd,
+                    quota_delta_points,
+                    events: event_count.max(0) as u64,
+                    decimal_quota,
+                    sources_unchanged_for_seconds: rebuilt_at_ms
+                        .saturating_sub(current.observed_at_ms)
+                        .max(0) as u64
+                        / 1_000,
+                    monotonic: true,
+                    complete: true,
+                    low_usage_percent: current.used_percent,
+                },
+                thresholds,
+            );
+            let crate::estimator::MeasurementDecision::Valid {
+                quote_usd,
+                confidence,
+            } = decision
+            else {
+                continue;
+            };
+            let dominant_model: Option<String> = transaction
+                .query_row(
+                    "SELECT model_id
+                     FROM usage_events
+                     WHERE pricing_status='priced'
+                       AND timestamp_ms > ?1
+                       AND timestamp_ms <= ?2
+                       AND ((account_key IS NULL AND ?3 IS NULL) OR account_key=?3)
+                     GROUP BY model_id
+                     ORDER BY SUM(cost_usd) DESC
+                     LIMIT 1",
+                    params![
+                        previous.observed_at_ms,
+                        current.observed_at_ms,
+                        current.account_key
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| "unable to identify interval model".to_string())?;
+            let confidence = match confidence {
+                crate::estimator::Confidence::High => "high",
+                crate::estimator::Confidence::Medium => "medium",
+                crate::estimator::Confidence::Low => "low",
+            };
+            transaction
+                .execute(
+                    "INSERT INTO quotes (
+                        timestamp_ms, value_usd, raw_value_usd, observed_cost_usd,
+                        weekly_used_percent, dominant_model, confidence, status,
+                        is_finalized, algorithm_version
+                     ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 'valid', 1, ?7)",
+                    params![
+                        current.observed_at_ms,
+                        quote_usd,
+                        cost_delta_usd,
+                        current.used_percent,
+                        dominant_model,
+                        confidence,
+                        ALGORITHM_VERSION
+                    ],
+                )
+                .map_err(|_| "unable to persist settled quote".to_string())?;
+        }
+        Ok(())
     }
 
     pub fn latest_quota_observation(&self) -> Result<Option<LatestQuotaObservation>, String> {
@@ -566,42 +678,104 @@ impl Database {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT value_usd, observed_cost_usd, weekly_used_percent, dominant_model, confidence, status
-                 FROM quotes ORDER BY timestamp_ms DESC LIMIT 2",
+                "SELECT timestamp_ms, value_usd, observed_cost_usd, weekly_used_percent,
+                        dominant_model, confidence, status
+                 FROM quotes ORDER BY timestamp_ms DESC LIMIT 5",
             )
             .map_err(|_| "unable to read current quote".to_string())?;
-        let mut rows = statement
-            .query([])
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<f64>>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
             .map_err(|_| "unable to read current quote".to_string())?;
-        let Some(current_row) = rows
-            .next()
-            .map_err(|_| "unable to read current quote".to_string())?
-        else {
+        let recent = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| "unable to decode current quote".to_string())?;
+        let Some(latest) = recent.first() else {
             return Ok(None);
         };
-        let (
-            current_value,
-            observed_cost_usd,
-            weekly_used_percent,
-            dominant_model,
-            confidence,
-            status,
-        ) = (
-            current_row.get(0).unwrap_or(None),
-            current_row.get(1).unwrap_or(None),
-            current_row.get(2).unwrap_or(None),
-            current_row.get(3).ok(),
-            current_row
-                .get::<_, String>(4)
-                .unwrap_or_else(|_| "none".into()),
-            current_row
-                .get::<_, String>(5)
-                .unwrap_or_else(|_| "empty".into()),
-        );
-        let previous_value: Option<f64> = rows
-            .next()
-            .map_err(|_| "unable to read current quote".to_string())?
-            .and_then(|row| row.get(0).ok().flatten());
+        let latest_timestamp = latest.0;
+        let dominant_model = latest.4.clone();
+        let latest_reset_group: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT (reset_at_ms + 30000) / 60000
+                 FROM quota_snapshots
+                 WHERE observed_at_ms=?1
+                   AND reset_at_ms IS NOT NULL
+                   AND ABS(duration_minutes - 10080.0) <= 240.0
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![latest_timestamp],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "unable to identify current quota epoch".to_string())?;
+        let recent_values = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT value_usd
+                     FROM quotes
+                     WHERE ((dominant_model IS NULL AND ?1 IS NULL) OR dominant_model=?1)
+                       AND (
+                           ?2 IS NULL OR EXISTS (
+                               SELECT 1
+                               FROM quota_snapshots quota
+                               WHERE quota.observed_at_ms=quotes.timestamp_ms
+                                 AND ABS(quota.duration_minutes - 10080.0) <= 240.0
+                                 AND (quota.reset_at_ms + 30000) / 60000=?2
+                           )
+                       )
+                     ORDER BY timestamp_ms DESC
+                     LIMIT 5",
+                )
+                .map_err(|_| "unable to read comparable quotes".to_string())?;
+            let values = statement
+                .query_map(params![dominant_model, latest_reset_group], |row| {
+                    row.get::<_, f64>(0)
+                })
+                .map_err(|_| "unable to read comparable quotes".to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| "unable to decode comparable quotes".to_string())?;
+            values
+        };
+        let current_value = crate::estimator::median_latest_five(&recent_values);
+        let week_ago_values = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT value_usd
+                     FROM quotes
+                     WHERE timestamp_ms <= ?1
+                       AND ((dominant_model IS NULL AND ?2 IS NULL) OR dominant_model=?2)
+                     ORDER BY timestamp_ms DESC
+                     LIMIT 5",
+                )
+                .map_err(|_| "unable to read weekly comparison".to_string())?;
+            let values = statement
+                .query_map(
+                    params![latest_timestamp - 604_800_000, dominant_model],
+                    |row| row.get::<_, f64>(0),
+                )
+                .map_err(|_| "unable to read weekly comparison".to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| "unable to decode weekly comparison".to_string())?;
+            values
+        };
+        let previous_value = crate::estimator::median_latest_five(&week_ago_values);
+        let observed_cost_usd = latest.2;
+        let weekly_used_percent = latest.3;
+        let confidence = latest.5.as_str();
+        let status = latest.6.as_str();
         let reset_at: Option<i64> = self
             .connection
             .query_row(
@@ -614,7 +788,9 @@ impl Database {
             .flatten();
         Ok(Some(CurrentQuote {
             value_usd: current_value,
-            change_usd: current_value.zip(previous_value).map(|(current, previous)| current - previous),
+            change_usd: current_value
+                .zip(previous_value)
+                .map(|(current, previous)| current - previous),
             change_percent: current_value
                 .zip(previous_value)
                 .filter(|(_, previous)| *previous != 0.0)
@@ -622,7 +798,7 @@ impl Database {
             observed_cost_usd,
             weekly_used_percent,
             reset_at,
-            status: match status.as_str() {
+            status: match status {
                 "valid" => QuoteStatus::Valid,
                 "pending" => QuoteStatus::Pending,
                 "unsupported" => QuoteStatus::Unsupported,
@@ -631,7 +807,7 @@ impl Database {
             },
             dominant_model,
             algorithm_version: ALGORITHM_VERSION.into(),
-            confidence: match confidence.as_str() {
+            confidence: match confidence {
                 "high" => Confidence::High,
                 "medium" => Confidence::Medium,
                 "low" => Confidence::Low,
@@ -671,6 +847,15 @@ impl Database {
             .zip(first)
             .filter(|(_, first)| *first != 0.0)
             .map(|(current, first)| ((current - first) / first) * 100.0);
+        let tolerance_ms = match &range {
+            Range::D1 => 30 * 60 * 1_000,
+            Range::W1 => 60 * 60 * 1_000,
+            Range::M1 => 4 * 60 * 60 * 1_000,
+            Range::M3 | Range::M6 => 8 * 60 * 60 * 1_000,
+        };
+        let partial = points
+            .first()
+            .is_some_and(|point| point.timestamp > since + tolerance_ms);
         Ok(HistoryResponse {
             statistics: RangeStatistics {
                 range: range.clone(),
@@ -679,7 +864,7 @@ impl Database {
                 delta_usd: delta,
                 delta_percent,
                 point_count: points.len(),
-                partial: !points.is_empty() && !matches!(range, Range::D1),
+                partial,
             },
             bucket: range.bucket().into(),
             points,
@@ -867,10 +1052,11 @@ mod tests {
             connection: open_connection(&path).expect("temporary database"),
         };
         database.migrate().expect("schema");
-        let reset_at_ms = now_ms() + 86_400_000;
+        let bucket_start = now_ms().div_euclid(1_800_000) * 1_800_000 - 7_200_000;
+        let reset_at_ms = bucket_start + 604_800_000;
         let events = vec![
             UsageEvent {
-                timestamp_ms: now_ms() - 60_000,
+                timestamp_ms: bucket_start + 60_000,
                 model: "gpt-5.6-sol".into(),
                 input_tokens: 1_000_000,
                 output_tokens: 100_000,
@@ -882,12 +1068,72 @@ mod tests {
                 ..UsageEvent::default()
             },
             UsageEvent {
-                timestamp_ms: now_ms(),
+                timestamp_ms: bucket_start + 1_860_000,
                 model: "gpt-5.6-sol".into(),
                 input_tokens: 100_000,
                 output_tokens: 10_000,
                 authenticated_official_codex: true,
-                quota_used_percent: Some(11.0),
+                quota_used_percent: Some(12.0),
+                quota_reset_at_ms: Some(reset_at_ms),
+                quota_window_minutes: Some(10_080.0),
+                quota_limit_id: Some("codex".into()),
+                ..UsageEvent::default()
+            },
+            UsageEvent {
+                timestamp_ms: bucket_start + 1_920_000,
+                model: "gpt-5.6-sol".into(),
+                input_tokens: 100_000,
+                output_tokens: 10_000,
+                authenticated_official_codex: true,
+                quota_used_percent: Some(15.0),
+                quota_reset_at_ms: Some(reset_at_ms),
+                quota_window_minutes: Some(10_080.0),
+                quota_limit_id: Some("codex".into()),
+                ..UsageEvent::default()
+            },
+            UsageEvent {
+                timestamp_ms: bucket_start + 3_660_000,
+                model: "gpt-5.6-sol".into(),
+                input_tokens: 100_000,
+                output_tokens: 10_000,
+                authenticated_official_codex: true,
+                quota_used_percent: Some(95.0),
+                quota_reset_at_ms: Some(reset_at_ms),
+                quota_window_minutes: Some(10_080.0),
+                quota_limit_id: Some("codex".into()),
+                ..UsageEvent::default()
+            },
+            UsageEvent {
+                timestamp_ms: bucket_start + 3_720_000,
+                model: "gpt-5.6-sol".into(),
+                input_tokens: 100_000,
+                output_tokens: 10_000,
+                authenticated_official_codex: true,
+                quota_used_percent: Some(100.0),
+                quota_reset_at_ms: Some(reset_at_ms),
+                quota_window_minutes: Some(10_080.0),
+                quota_limit_id: Some("codex".into()),
+                ..UsageEvent::default()
+            },
+            UsageEvent {
+                timestamp_ms: bucket_start + 5_460_000,
+                model: "gpt-5.6-sol".into(),
+                input_tokens: 100_000_000,
+                output_tokens: 10_000_000,
+                authenticated_official_codex: true,
+                quota_used_percent: Some(100.0),
+                quota_reset_at_ms: Some(reset_at_ms),
+                quota_window_minutes: Some(10_080.0),
+                quota_limit_id: Some("codex".into()),
+                ..UsageEvent::default()
+            },
+            UsageEvent {
+                timestamp_ms: bucket_start + 5_520_000,
+                model: "gpt-5.6-sol".into(),
+                input_tokens: 100_000_000,
+                output_tokens: 10_000_000,
+                authenticated_official_codex: true,
+                quota_used_percent: Some(100.0),
                 quota_reset_at_ms: Some(reset_at_ms),
                 quota_window_minutes: Some(10_080.0),
                 quota_limit_id: Some("codex".into()),
@@ -910,12 +1156,15 @@ mod tests {
             .expect("quote")
             .expect("current quote");
         assert!(quote.value_usd.is_some_and(|value| value > 0.0));
-        assert_eq!(quote.weekly_used_percent, Some(11.0));
-        assert!(!database
-            .history(Range::W1)
-            .expect("history")
+        assert_eq!(quote.weekly_used_percent, Some(100.0));
+        assert_eq!(quote.change_usd, None);
+        assert_eq!(quote.algorithm_version, "nerfify-estimator-v2");
+        let history = database.history(Range::W1).expect("history");
+        assert_eq!(history.points.len(), 2);
+        assert!(history
             .points
-            .is_empty());
+            .iter()
+            .all(|point| point.value_usd.is_some_and(|value| value < 100.0)));
         drop(database);
         let _ = fs::remove_file(path);
     }
