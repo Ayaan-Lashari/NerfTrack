@@ -45,8 +45,10 @@ describe('UsageChart', () => {
       toJSON: () => ({}),
     });
     fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 100 }));
+    expect(chart).toHaveAttribute('aria-grabbed', 'true');
     fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 900 }));
     fireEvent(chart, new MouseEvent('pointerup', { bubbles: true, clientX: 900 }));
+    expect(chart).toHaveAttribute('aria-grabbed', 'false');
     expect(onScrub).toHaveBeenCalledTimes(2);
     expect(onScrub.mock.calls[1][0].timestamp).toBeGreaterThan(onScrub.mock.calls[0][0].timestamp);
   });

@@ -21,6 +21,7 @@ interface ChartSelection {
   point: HistoryPoint;
   coordinate: { x: number; y: number };
   pointIndex: number | null;
+  source: 'hover' | 'held' | 'locked' | 'keyboard';
 }
 
 function formatDate(timestamp: number, range: Range) {
@@ -145,11 +146,11 @@ export function UsageChart({
     const point = points[index];
     const coordinate = coordinates[index];
     if (!point || !coordinate) return;
-    setSelection({ point, coordinate, pointIndex: index });
+    setSelection({ point, coordinate, pointIndex: index, source: 'keyboard' });
     onScrub?.(point);
   };
 
-  const updateSelection = (clientX: number) => {
+  const updateSelection = (clientX: number, source: ChartSelection['source']) => {
     const svg = svgRef.current;
     if (!svg || points.length === 0) return;
     const rect = svg.getBoundingClientRect();
@@ -170,6 +171,7 @@ export function UsageChart({
       point,
       coordinate: { x: plotLeft + ratio * (plotRight - plotLeft), y },
       pointIndex: null,
+      source,
     });
     onScrub?.(point);
   };
@@ -183,7 +185,7 @@ export function UsageChart({
         } else {
           const point = points[nextIndex];
           const coordinate = coordinates[nextIndex];
-          setSelection({ point, coordinate, pointIndex: nextIndex });
+          setSelection({ point, coordinate, pointIndex: nextIndex, source: 'keyboard' });
         }
       }
     }
@@ -244,20 +246,24 @@ export function UsageChart({
         {!points.length && <div className="chart-empty">Waiting for weekly observations</div>}
         <svg
           ref={svgRef}
-          className="chart-canvas"
+          className={`chart-canvas ${isDragging.current ? 'is-scrubbing' : ''}`}
           viewBox={`0 0 ${chartWidth} ${chartHeight}`}
           role="img"
           aria-label="Estimated weekly API equivalent history chart. Use arrow keys to move between points."
+          aria-grabbed={isDragging.current}
           tabIndex={0}
           onPointerDown={(event) => {
             event.currentTarget.setPointerCapture?.(event.pointerId);
             isDragging.current = true;
-            updateSelection(event.clientX);
+            updateSelection(event.clientX, 'held');
           }}
           onPointerMove={(event) => {
             if (isDragging.current || event.pointerType === 'mouse') {
               const coalesced = event.nativeEvent.getCoalescedEvents?.();
-              updateSelection(coalesced?.at(-1)?.clientX ?? event.clientX);
+              updateSelection(
+                coalesced?.at(-1)?.clientX ?? event.clientX,
+                isDragging.current ? 'held' : 'hover',
+              );
             }
           }}
           onPointerUp={(event) => {
@@ -265,9 +271,24 @@ export function UsageChart({
               event.currentTarget.releasePointerCapture?.(event.pointerId);
             }
             isDragging.current = false;
+            setSelection((current) =>
+              current?.source === 'held' ? { ...current, source: 'locked' } : current,
+            );
           }}
           onPointerCancel={() => {
             isDragging.current = false;
+          }}
+          onLostPointerCapture={() => {
+            isDragging.current = false;
+            setSelection((current) =>
+              current?.source === 'held' ? { ...current, source: 'locked' } : current,
+            );
+          }}
+          onPointerLeave={() => {
+            if (!isDragging.current && selection?.source === 'hover') {
+              setSelection(null);
+              onScrub?.(null);
+            }
           }}
           onDoubleClick={() => {
             setSelection(null);
@@ -338,7 +359,11 @@ export function UsageChart({
             );
           })}
           {selectedCoordinate && selected && (
-            <g className="chart-crosshair">
+            <g
+              className={`chart-crosshair ${
+                selection?.source === 'held' ? 'chart-crosshair-held' : ''
+              }`}
+            >
               <line
                 x1={selectedCoordinate.x}
                 x2={selectedCoordinate.x}

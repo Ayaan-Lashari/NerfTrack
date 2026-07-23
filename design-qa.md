@@ -29,6 +29,8 @@ The combined comparison shows the reference and implementation chart regions tog
 ## Interaction verification
 
 - Mouse hover follows the pointer without requiring a click.
+- Passive hover retains the normal arrow cursor.
+- Pressing enters a distinct grabbed state; pointer capture keeps scrubbing active along the full drag path and release locks the selected value.
 - Press-and-drag scrubbing selects continuously interpolated time and value data rather than snapping to stored vertices.
 - A one-pixel pointer sweep returned six distinct values (`$392.97`, `$393.07`, `$393.48`, `$393.90`, `$394.31`, `$394.73`), confirming fine-grained tracking.
 - Selection persisted after pointer release.
@@ -42,7 +44,8 @@ The combined comparison shows the reference and implementation chart regions tog
 2. Added a baseline rule using the first visible weekly value.
 3. Interaction review found pointer selection snapped to stored observations (P1).
 4. Replaced nearest-point mouse selection with timestamp/value interpolation and hover tracking.
-5. Final live verification confirms pixel-level pointer movement without vertex sticking.
+5. Added an explicit held/locked interaction state so press-hold-drag is distinguishable from passive hover.
+6. Final live verification confirms pixel-level pointer movement, native hold-and-drag capture, normal hover cursor, and no console errors.
 
 ## Findings
 
