@@ -419,7 +419,7 @@ p {
 }
 .chart-line {
   fill: none;
-  stroke: var(--green);
+  stroke: var(--chart-color, var(--green));
   stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
@@ -462,11 +462,11 @@ p {
 }
 .chart-crosshair circle {
   fill: var(--bg);
-  stroke: var(--green);
+  stroke: var(--chart-color, var(--green));
   stroke-width: 2;
 }
 .chart-crosshair circle + circle {
-  fill: var(--green);
+  fill: var(--chart-color, var(--green));
   stroke: none;
 }
 .chart-anchor-marker line {

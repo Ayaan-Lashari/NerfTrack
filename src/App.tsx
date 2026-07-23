@@ -178,6 +178,7 @@ function HomeView({
           annotations={annotations}
           range={range}
           reducedMotion={reducedMotion}
+          changeUsd={history.statistics.deltaUsd}
           onScrub={(point, anchor) => setScrubbed(point ? { point, anchor } : null)}
         />
         <div className="chart-actions">

@@ -7,6 +7,7 @@ interface UsageChartProps {
   annotations: Annotation[];
   range: Range;
   reducedMotion: boolean;
+  changeUsd?: number | null;
   onScrub?: (point: HistoryPoint | null, anchor: HistoryPoint | null) => void;
 }
 
@@ -94,6 +95,7 @@ export function UsageChart({
   annotations,
   range,
   reducedMotion,
+  changeUsd = null,
   onScrub,
 }: UsageChartProps) {
   const svgRef = useRef<SVGSVGElement>(null);
@@ -157,6 +159,14 @@ export function UsageChart({
     };
   }, [anchorPoint, bounds.max, bounds.min, points]);
   const baselineCoordinate = coordinates.find((_, index) => points[index]?.valueUsd !== null);
+  const dragChange =
+    anchorPoint?.valueUsd != null &&
+    selected?.valueUsd != null &&
+    (selection?.source === 'held' || selection?.source === 'locked')
+      ? selected.valueUsd - anchorPoint.valueUsd
+      : null;
+  const isNegative = (dragChange ?? changeUsd ?? 0) < 0;
+  const chartColor = isNegative ? '#ff5d73' : '#5cf07a';
 
   const selectPoint = (index: number) => {
     const point = points[index];
@@ -250,7 +260,12 @@ export function UsageChart({
   ];
 
   return (
-    <div className={`usage-chart ${reducedMotion ? 'reduced-motion' : ''}`}>
+    <div
+      className={`usage-chart chart-${isNegative ? 'negative' : 'positive'} ${
+        reducedMotion ? 'reduced-motion' : ''
+      }`}
+      style={{ '--chart-color': chartColor } as React.CSSProperties}
+    >
       <div className="chart-canvas-wrap">
         {selected && selectedCoordinate && (
           <div
@@ -325,9 +340,9 @@ export function UsageChart({
         >
           <defs>
             <linearGradient id="usage-area" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="#5cf07a" stopOpacity="0.3" />
-              <stop offset="0.72" stopColor="#5cf07a" stopOpacity="0.09" />
-              <stop offset="1" stopColor="#5cf07a" stopOpacity="0" />
+              <stop offset="0" stopColor={chartColor} stopOpacity="0.3" />
+              <stop offset="0.72" stopColor={chartColor} stopOpacity="0.09" />
+              <stop offset="1" stopColor={chartColor} stopOpacity="0" />
             </linearGradient>
           </defs>
           {gridValues.map((_, index) => {

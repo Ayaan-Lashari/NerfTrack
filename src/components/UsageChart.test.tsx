@@ -13,9 +13,11 @@ describe('UsageChart', () => {
         annotations={demoAnnotations}
         range="1W"
         reducedMotion={false}
+        changeUsd={-1}
       />,
     );
     const chart = screen.getByRole('img', { name: /Estimated weekly API equivalent/ });
+    expect(chart.closest('.usage-chart')).toHaveClass('chart-negative');
     await user.click(chart);
     await user.keyboard('{ArrowLeft}');
     expect(screen.getAllByText(/May/).length).toBeGreaterThan(0);
@@ -51,6 +53,7 @@ describe('UsageChart', () => {
     expect(chart).toHaveAttribute('aria-grabbed', 'false');
     expect(chart.querySelector('.chart-anchor-marker')).toBeInTheDocument();
     expect(chart.querySelector('.chart-crosshair')).toBeInTheDocument();
+    expect(chart.closest('.usage-chart')).toHaveClass('chart-negative');
     expect(onScrub).toHaveBeenCalledTimes(2);
     expect(onScrub.mock.calls[1][0].timestamp).toBeGreaterThan(onScrub.mock.calls[0][0].timestamp);
     expect(onScrub.mock.calls[1][1]).toEqual(onScrub.mock.calls[0][0]);
@@ -109,5 +112,9 @@ describe('UsageChart', () => {
     expect(interpolated.valueUsd).toBeCloseTo(50);
     expect(interpolated.timestamp).not.toBe(points[0].timestamp);
     expect(interpolated.timestamp).not.toBe(points[1].timestamp);
+
+    fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 200 }));
+    fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 800 }));
+    expect(chart.closest('.usage-chart')).toHaveClass('chart-positive');
   });
 });

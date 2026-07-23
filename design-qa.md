@@ -35,6 +35,7 @@ The combined comparison shows the reference and implementation chart regions tog
 - The starting point remains marked with a light endpoint and guide while the green ending point follows the drag.
 - Live start-to-end verification produced `$382.13`, `−$11.05`, and `−2.81%`.
 - All five history ranges are cached by range after initial load; switching tabs paints the matching dataset immediately and stale requests cannot replace it.
+- Normal charts use the selected range delta for color; held drags use the live end-minus-start delta. Negative line/fill/endpoint states are red and positive states are green.
 - Press-and-drag scrubbing selects continuously interpolated time and value data rather than snapping to stored vertices.
 - A one-pixel pointer sweep returned six distinct values (`$392.97`, `$393.07`, `$393.48`, `$393.90`, `$394.31`, `$394.73`), confirming fine-grained tracking.
 - Selection persisted after pointer release.
@@ -52,7 +53,8 @@ The combined comparison shows the reference and implementation chart regions tog
 6. Added Apple-style start-to-end dollar and percentage comparison during held drags.
 7. Added separate starting and ending endpoint markers.
 8. Replaced the shared history state with a range-keyed cache to remove stale-data lag between time windows.
-9. Final live verification confirms both endpoint markers, immediate 1D/6M switching, correct start/end comparison, and no console errors.
+9. Unified normal and drag chart color with the signed comparison value.
+10. Final live verification confirms red normal/negative drag states, a green `+$11.58 (+3.03%)` positive drag state, and no console errors.
 
 ## Findings
 
