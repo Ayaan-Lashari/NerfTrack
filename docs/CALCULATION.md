@@ -8,7 +8,7 @@ weekly API equivalent = settled eligible cost delta / settled quota percentage d
 
 The live graph evaluates the formula between consecutive official Codex observations for the same normalized weekly reset. It requires finite embedded family pricing, monotonic quota movement, settled sources, and the configured minimum movement, cost, event count, and low-usage thresholds. Quote points are reduced to one observation per 30-minute bucket. The first 100% observation may close an interval; later cost at the same saturated reset cannot create or inflate another quote.
 
-Current Codex model variants use the embedded price for their compatible GPT-5 family. This keeps desktop monitoring local and functional when a new Codex variant appears before a model-specific catalog entry; values remain estimates rather than billing statements.
+Current Codex model variants use embedded official prices, including distinct Sol, Terra, and Luna rates. Unknown GPT-5.6 variants fall back to the Terra rate so desktop monitoring remains local while values remain estimates rather than billing statements.
 
 Defaults are algorithm inputs, not OpenAI policy facts. They are centralized in `estimator.rs` and the active algorithm version is stored with each quote:
 

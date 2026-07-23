@@ -140,19 +140,23 @@ pub fn embedded_codex_snapshot(events: &[UsageEvent], observed_at_ms: i64) -> Pr
 }
 
 fn codex_family_price(model: &str) -> Option<Price> {
-    let (input_per_million, cached_input_per_million, output_per_million) = if model
-        .starts_with("gpt-5.4")
-        || model.starts_with("gpt-5.5")
-        || model.starts_with("gpt-5.6")
-    {
-        (2.5, 0.25, 15.0)
-    } else if model.starts_with("gpt-5.2") || model.starts_with("gpt-5.3") {
-        (1.75, 0.175, 14.0)
-    } else if model == "gpt-5" || model.starts_with("gpt-5-") || model.starts_with("gpt-5.1") {
-        (1.25, 0.125, 10.0)
-    } else {
-        return None;
-    };
+    let (input_per_million, cached_input_per_million, output_per_million) =
+        if model.starts_with("gpt-5.6-sol") {
+            (5.0, 0.5, 30.0)
+        } else if model.starts_with("gpt-5.6-luna") {
+            (1.0, 0.1, 6.0)
+        } else if model.starts_with("gpt-5.4")
+            || model.starts_with("gpt-5.5")
+            || model.starts_with("gpt-5.6")
+        {
+            (2.5, 0.25, 15.0)
+        } else if model.starts_with("gpt-5.2") || model.starts_with("gpt-5.3") {
+            (1.75, 0.175, 14.0)
+        } else if model == "gpt-5" || model.starts_with("gpt-5-") || model.starts_with("gpt-5.1") {
+            (1.25, 0.125, 10.0)
+        } else {
+            return None;
+        };
     Some(Price {
         input_per_million,
         cached_input_per_million,
@@ -296,10 +300,17 @@ mod tests {
     }
 
     #[test]
-    fn prices_current_codex_family_without_model_specific_code() {
-        let mut usage = event("gpt-5.6-sol");
-        usage.authenticated_official_codex = true;
-        let snapshot = embedded_codex_snapshot(&[usage.clone()], 1);
-        assert!(price_event(&usage, &snapshot).is_ok());
+    fn prices_current_codex_tiers_at_their_distinct_rates() {
+        for (model, expected) in [
+            ("gpt-5.6-sol", 7.1),
+            ("gpt-5.6-terra", 3.55),
+            ("gpt-5.6-luna", 1.42),
+        ] {
+            let mut usage = event(model);
+            usage.authenticated_official_codex = true;
+            let snapshot = embedded_codex_snapshot(&[usage.clone()], 1);
+            let cost = price_event(&usage, &snapshot).expect("cost");
+            assert!((cost - expected).abs() < f64::EPSILON);
+        }
     }
 }

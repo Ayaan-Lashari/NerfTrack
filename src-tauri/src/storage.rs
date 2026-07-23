@@ -341,7 +341,7 @@ impl Database {
             let _ = self.connection.execute_batch("ROLLBACK;");
             return Err("database migration failed".into());
         }
-        if previous_version < 3 {
+        if previous_version < 4 {
             self.connection
                 .execute_batch(
                     "BEGIN IMMEDIATE;
@@ -356,7 +356,8 @@ impl Database {
                     DELETE FROM diagnostics;
                     INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (2, strftime('%s','now') * 1000);
                     INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (3, strftime('%s','now') * 1000);
-                    PRAGMA user_version=3;
+                    INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (4, strftime('%s','now') * 1000);
+                    PRAGMA user_version=4;
                     COMMIT;",
                 )
                 .map_err(|_| "database live-data migration failed".to_string())?;
@@ -1192,6 +1193,44 @@ mod tests {
     }
 
     #[test]
+    fn migration_v4_discards_misparsed_usage_for_reimport() {
+        let path = std::env::temp_dir().join(format!(
+            "nerfify-parser-migration-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut database = Database {
+            path: path.clone(),
+            connection: open_connection(&path).expect("temporary database"),
+        };
+        database.migrate().expect("schema");
+        database
+            .connection
+            .execute(
+                "INSERT INTO usage_events (
+                    fingerprint, timestamp_ms, model_id, input_tokens,
+                    cached_input_tokens, output_tokens, pricing_status
+                 ) VALUES ('old', 1, 'gpt-5.6-sol', 1, 0, 0, 'priced')",
+                [],
+            )
+            .expect("old usage");
+        database
+            .connection
+            .pragma_update(None, "user_version", 3)
+            .expect("old schema version");
+
+        database.migrate().expect("parser migration");
+
+        let events: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
+            .expect("usage count");
+        assert_eq!(events, 0);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn live_collection_produces_current_quote_and_history() {
         let path = std::env::temp_dir().join(format!(
             "nerfify-live-{}-{}.db",
@@ -1203,6 +1242,13 @@ mod tests {
             connection: open_connection(&path).expect("temporary database"),
         };
         database.migrate().expect("schema");
+        assert_eq!(
+            database
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("schema version"),
+            4
+        );
         let hot_path_indexes: i64 = database
             .connection
             .query_row(

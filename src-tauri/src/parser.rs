@@ -72,6 +72,29 @@ fn get_u64(value: &Value, keys: &[&str]) -> u64 {
         .unwrap_or(0)
 }
 
+fn token_totals(value: &Value) -> CumulativeTotals {
+    CumulativeTotals {
+        input_tokens: get_u64(value, &["input_tokens", "input", "prompt_tokens", "prompt"]),
+        cached_input_tokens: get_u64(
+            value,
+            &[
+                "cached_input_tokens",
+                "cache_read_input_tokens",
+                "cache_read",
+                "cached_input",
+            ],
+        ),
+        output_tokens: get_u64(
+            value,
+            &["output_tokens", "output", "completion_tokens", "completion"],
+        ),
+        reasoning_tokens: get_u64(
+            value,
+            &["reasoning_tokens", "reasoning_output_tokens", "reasoning"],
+        ),
+    }
+}
+
 fn finite_f64(value: Option<&Value>) -> Option<f64> {
     value
         .and_then(Value::as_f64)
@@ -161,7 +184,7 @@ pub fn parse_jsonl_line_with_state(
         || value.get("turn_context").is_some();
     let last_token_usage = nested(&value, &[&["payload", "info", "last_token_usage"]]);
     let total_token_usage = nested(&value, &[&["payload", "info", "total_token_usage"]]);
-    let usage = nested(
+    let direct_usage = nested(
         &value,
         &[
             &["usage"],
@@ -170,10 +193,9 @@ pub fn parse_jsonl_line_with_state(
             &["response", "usage"],
             &["payload", "usage"],
             &["payload", "token_usage"],
-            &["payload", "info", "last_token_usage"],
-            &["payload", "info", "total_token_usage"],
         ],
     );
+    let usage = direct_usage.or(last_token_usage).or(total_token_usage);
     let model_from_record = string_at(
         &value,
         &[
@@ -254,25 +276,13 @@ pub fn parse_jsonl_line_with_state(
         .clone()
         .or_else(|| state.active_model.clone())
         .unwrap_or_else(|| "unknown".into());
-    let mut input_tokens = get_u64(usage, &["input_tokens", "input", "prompt_tokens", "prompt"]);
-    let mut cached_input_tokens = get_u64(
-        usage,
-        &[
-            "cached_input_tokens",
-            "cache_read_input_tokens",
-            "cache_read",
-            "cached_input",
-        ],
-    );
-    let mut output_tokens = get_u64(
-        usage,
-        &["output_tokens", "output", "completion_tokens", "completion"],
-    );
-    let mut reasoning_tokens = get_u64(
-        usage,
-        &["reasoning_tokens", "reasoning_output_tokens", "reasoning"],
-    );
-    let cumulative = bool_at(
+    let CumulativeTotals {
+        mut input_tokens,
+        mut cached_input_tokens,
+        mut output_tokens,
+        mut reasoning_tokens,
+    } = token_totals(usage);
+    let explicitly_cumulative = bool_at(
         &value,
         &[
             &["cumulative"],
@@ -282,28 +292,25 @@ pub fn parse_jsonl_line_with_state(
             &["usage", "cumulative"],
             &["usage", "is_cumulative"],
         ],
-    ) || last_token_usage.is_some()
-        || total_token_usage.is_some();
-    if cumulative {
-        let key = turn_from_record
+    );
+    let cumulative = last_token_usage.is_none()
+        && (explicitly_cumulative || (direct_usage.is_none() && total_token_usage.is_some()));
+    if cumulative || total_token_usage.is_some() {
+        let key = session_from_record
             .as_deref()
             .map(opaque_identifier)
-            .or_else(|| state.active_turn_id.clone())
-            .or_else(|| session_from_record.as_deref().map(opaque_identifier))
             .or_else(|| state.active_session_id.clone())
-            .or_else(|| model_from_record.clone())
             .unwrap_or_else(|| "global".into());
-        let current = CumulativeTotals {
-            input_tokens,
-            cached_input_tokens,
-            output_tokens,
-            reasoning_tokens,
-        };
-        let previous = state.cumulative.insert(key, current).unwrap_or_default();
-        input_tokens = input_tokens.saturating_sub(previous.input_tokens);
-        cached_input_tokens = cached_input_tokens.saturating_sub(previous.cached_input_tokens);
-        output_tokens = output_tokens.saturating_sub(previous.output_tokens);
-        reasoning_tokens = reasoning_tokens.saturating_sub(previous.reasoning_tokens);
+        let previous = state.cumulative.get(&key).copied().unwrap_or_default();
+        if cumulative {
+            input_tokens = input_tokens.saturating_sub(previous.input_tokens);
+            cached_input_tokens = cached_input_tokens.saturating_sub(previous.cached_input_tokens);
+            output_tokens = output_tokens.saturating_sub(previous.output_tokens);
+            reasoning_tokens = reasoning_tokens.saturating_sub(previous.reasoning_tokens);
+        }
+        state
+            .cumulative
+            .insert(key, token_totals(total_token_usage.unwrap_or(usage)));
     }
     if input_tokens == 0 && output_tokens == 0 && reasoning_tokens == 0 {
         return Err("record has no token measurement".into());
@@ -565,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn token_count_updates_are_deltas_with_distinct_fingerprints() {
+    fn last_token_usage_updates_are_independent_with_distinct_fingerprints() {
         let mut state = ParserState::default();
         parse_jsonl_line_with_state(
             r#"{"type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.6-sol"}}"#,
@@ -584,10 +591,31 @@ mod tests {
         )
         .expect("second")
         .expect("usage");
+        assert_eq!(second.input_tokens, 140);
+        assert_eq!(second.cached_input_tokens, 100);
+        assert_eq!(second.output_tokens, 14);
+        assert_ne!(event_fingerprint(&first), event_fingerprint(&second));
+    }
+
+    #[test]
+    fn total_token_usage_fallback_is_cumulative() {
+        let mut state = ParserState::default();
+        let first = parse_jsonl_line_with_state(
+            r#"{"timestamp":1735689600,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10}}}}"#,
+            &mut state,
+        )
+        .expect("first")
+        .expect("usage");
+        let second = parse_jsonl_line_with_state(
+            r#"{"timestamp":1735689660,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"cached_input_tokens":100,"output_tokens":14}}}}"#,
+            &mut state,
+        )
+        .expect("second")
+        .expect("usage");
+        assert_eq!(first.input_tokens, 100);
         assert_eq!(second.input_tokens, 40);
         assert_eq!(second.cached_input_tokens, 20);
         assert_eq!(second.output_tokens, 4);
-        assert_ne!(event_fingerprint(&first), event_fingerprint(&second));
     }
 
     #[test]
