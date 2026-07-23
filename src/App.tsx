@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AdvancedSettings,
   AppSettings,
@@ -130,6 +130,10 @@ function HomeView({
         ? null
         : (quote?.changePercent ?? null);
   const isEmpty = !quote || quote.status === 'empty';
+  const selectRange = (nextRange: Range) => {
+    setScrubbed(null);
+    onRangeChange(nextRange);
+  };
 
   return (
     <section className="home-page page-shell">
@@ -142,7 +146,7 @@ function HomeView({
           </div>
         </div>
         <div className="hero-controls">
-          <RangeSelector range={range} onChange={onRangeChange} />
+          <RangeSelector range={range} onChange={selectRange} />
           <button
             className="more-button"
             aria-label="More chart options"
@@ -169,6 +173,7 @@ function HomeView({
       </div>
       <div className="chart-panel">
         <UsageChart
+          key={range}
           points={history.points}
           annotations={annotations}
           range={range}
@@ -248,7 +253,9 @@ export default function App() {
   const [range, setRange] = useState<Range>('1W');
   const [status, setStatus] = useState<AppStatus>(demoStatus);
   const [quote, setQuote] = useState<CurrentQuote | null>(demoQuote);
-  const [history, setHistory] = useState<HistoryResponse | null>(null);
+  const historyCache = useRef<Partial<Record<Range, HistoryResponse>>>({});
+  const [histories, setHistories] = useState<Partial<Record<Range, HistoryResponse>>>({});
+  const history = histories[range] ?? null;
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsSummary | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -257,25 +264,29 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [nextQuote, nextStatus, nextHistory, nextAnnotations, nextDiagnostics, nextSettings] =
+      const historyRanges = ranges.every((item) => historyCache.current[item]) ? [range] : ranges;
+      const [nextQuote, nextStatus, nextHistories, nextAnnotations, nextDiagnostics, nextSettings] =
         await Promise.all([
           getCurrentQuote(),
           getCurrentStatus(),
-          getHistory(range),
+          Promise.all(historyRanges.map(async (item) => [item, await getHistory(item)] as const)),
           getAnnotations(),
           getDiagnosticsSummary(),
           getSettings(),
         ]);
+      const historyUpdates = Object.fromEntries(nextHistories) as Partial<
+        Record<Range, HistoryResponse>
+      >;
+      Object.assign(historyCache.current, historyUpdates);
       setQuote(nextQuote);
       setStatus(nextStatus);
-      setHistory(nextHistory);
+      setHistories((current) => ({ ...current, ...historyUpdates }));
       setAnnotations(nextAnnotations);
       setDiagnostics(nextDiagnostics);
       setSettings(nextSettings);
       setLoadError(false);
     } catch {
       setQuote(null);
-      setHistory(null);
       setAnnotations([]);
       setDiagnostics(null);
       setStatus((current) => ({

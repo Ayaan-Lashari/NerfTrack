@@ -469,6 +469,20 @@ p {
   fill: var(--green);
   stroke: none;
 }
+.chart-anchor-marker line {
+  stroke: rgba(224, 232, 235, 0.46);
+  stroke-width: 0.9;
+  stroke-dasharray: 3 3;
+}
+.chart-anchor-marker circle {
+  fill: var(--bg);
+  stroke: #dce4e8;
+  stroke-width: 2;
+}
+.chart-anchor-marker circle + circle {
+  fill: #dce4e8;
+  stroke: none;
+}
 .chart-crosshair-held line {
   stroke: rgba(235, 241, 243, 0.88);
 }

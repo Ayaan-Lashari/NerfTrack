@@ -49,6 +49,8 @@ describe('UsageChart', () => {
     fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 900 }));
     fireEvent(chart, new MouseEvent('pointerup', { bubbles: true, clientX: 900 }));
     expect(chart).toHaveAttribute('aria-grabbed', 'false');
+    expect(chart.querySelector('.chart-anchor-marker')).toBeInTheDocument();
+    expect(chart.querySelector('.chart-crosshair')).toBeInTheDocument();
     expect(onScrub).toHaveBeenCalledTimes(2);
     expect(onScrub.mock.calls[1][0].timestamp).toBeGreaterThan(onScrub.mock.calls[0][0].timestamp);
     expect(onScrub.mock.calls[1][1]).toEqual(onScrub.mock.calls[0][0]);

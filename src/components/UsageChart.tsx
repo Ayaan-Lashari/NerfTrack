@@ -100,6 +100,7 @@ export function UsageChart({
   const isDragging = useRef(false);
   const anchorRef = useRef<HistoryPoint | null>(null);
   const [selection, setSelection] = useState<ChartSelection | null>(null);
+  const [anchorPoint, setAnchorPoint] = useState<HistoryPoint | null>(null);
 
   const values = useMemo(
     () => points.map((point) => point.valueUsd).filter((value): value is number => value !== null),
@@ -141,6 +142,20 @@ export function UsageChart({
     : '';
   const selected = selection?.point ?? null;
   const selectedCoordinate = selection?.coordinate ?? null;
+  const anchorCoordinate = useMemo(() => {
+    if (!anchorPoint || points.length === 0) return null;
+    const firstTimestamp = points[0].timestamp;
+    const lastTimestamp = points.at(-1)?.timestamp ?? firstTimestamp;
+    const duration = Math.max(lastTimestamp - firstTimestamp, 1);
+    const valueRange = Math.max(bounds.max - bounds.min, 1);
+    return {
+      x: plotLeft + ((anchorPoint.timestamp - firstTimestamp) / duration) * (plotRight - plotLeft),
+      y:
+        anchorPoint.valueUsd === null
+          ? plotBottom
+          : plotTop + ((bounds.max - anchorPoint.valueUsd) / valueRange) * (plotBottom - plotTop),
+    };
+  }, [anchorPoint, bounds.max, bounds.min, points]);
   const baselineCoordinate = coordinates.find((_, index) => points[index]?.valueUsd !== null);
 
   const selectPoint = (index: number) => {
@@ -216,6 +231,7 @@ export function UsageChart({
     if (event.key === 'Escape') {
       setSelection(null);
       anchorRef.current = null;
+      setAnchorPoint(null);
       onScrub?.(null, null);
     }
   };
@@ -263,6 +279,7 @@ export function UsageChart({
             event.currentTarget.setPointerCapture?.(event.pointerId);
             isDragging.current = true;
             anchorRef.current = updateSelection(event.clientX, 'held', 'self');
+            setAnchorPoint(anchorRef.current);
           }}
           onPointerMove={(event) => {
             if (isDragging.current || event.pointerType === 'mouse') {
@@ -301,6 +318,7 @@ export function UsageChart({
           onDoubleClick={() => {
             setSelection(null);
             anchorRef.current = null;
+            setAnchorPoint(null);
             onScrub?.(null, null);
           }}
           onKeyDown={keyHandler}
@@ -367,6 +385,13 @@ export function UsageChart({
               </g>
             );
           })}
+          {anchorCoordinate && (selection?.source === 'held' || selection?.source === 'locked') && (
+            <g className="chart-anchor-marker">
+              <line x1={anchorCoordinate.x} x2={anchorCoordinate.x} y1={plotTop} y2={plotBottom} />
+              <circle cx={anchorCoordinate.x} cy={anchorCoordinate.y} r={5.5} />
+              <circle cx={anchorCoordinate.x} cy={anchorCoordinate.y} r={2.25} />
+            </g>
+          )}
           {selectedCoordinate && selected && (
             <g
               className={`chart-crosshair ${

@@ -32,7 +32,9 @@ The combined comparison shows the reference and implementation chart regions tog
 - Passive hover retains the normal arrow cursor.
 - Pressing enters a distinct grabbed state; pointer capture keeps scrubbing active along the full drag path and release locks the selected value.
 - The press point becomes the comparison baseline; the headline updates throughout the drag with the current value, signed dollar difference, and signed percentage difference.
+- The starting point remains marked with a light endpoint and guide while the green ending point follows the drag.
 - Live start-to-end verification produced `$382.13`, `−$11.05`, and `−2.81%`.
+- All five history ranges are cached by range after initial load; switching tabs paints the matching dataset immediately and stale requests cannot replace it.
 - Press-and-drag scrubbing selects continuously interpolated time and value data rather than snapping to stored vertices.
 - A one-pixel pointer sweep returned six distinct values (`$392.97`, `$393.07`, `$393.48`, `$393.90`, `$394.31`, `$394.73`), confirming fine-grained tracking.
 - Selection persisted after pointer release.
@@ -48,7 +50,9 @@ The combined comparison shows the reference and implementation chart regions tog
 4. Replaced nearest-point mouse selection with timestamp/value interpolation and hover tracking.
 5. Added an explicit held/locked interaction state so press-hold-drag is distinguishable from passive hover.
 6. Added Apple-style start-to-end dollar and percentage comparison during held drags.
-7. Final live verification confirms pixel-level pointer movement, native hold-and-drag capture, start/end comparison, normal hover cursor, and no console errors.
+7. Added separate starting and ending endpoint markers.
+8. Replaced the shared history state with a range-keyed cache to remove stale-data lag between time windows.
+9. Final live verification confirms both endpoint markers, immediate 1D/6M switching, correct start/end comparison, and no console errors.
 
 ## Findings
 
