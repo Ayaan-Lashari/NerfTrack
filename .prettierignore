@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+third_party/
+design-reference/
+src-tauri/target/
+package-lock.json
+*.png
