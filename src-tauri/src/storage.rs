@@ -69,6 +69,32 @@ fn comparison_baseline(quotes: &[WeightedQuote], cutoff_ms: i64, tolerance_ms: i
         .flatten()
 }
 
+fn graph_points(
+    quotes: &[WeightedQuote],
+    since_ms: i64,
+    current_epoch: Option<i64>,
+    keep_current_detail: bool,
+) -> Vec<HistoryPoint> {
+    let mut completed = HashMap::new();
+    let mut current = Vec::new();
+    for quote in quotes
+        .iter()
+        .filter(|quote| quote.point.timestamp >= since_ms)
+    {
+        if keep_current_detail && Some(quote.epoch) == current_epoch {
+            current.push(quote.point.clone());
+        } else {
+            completed.insert(quote.epoch, quote.point.clone());
+        }
+    }
+    let mut points = completed.into_values().chain(current).collect::<Vec<_>>();
+    points.sort_by_key(|point| point.timestamp);
+    for point in &mut points {
+        point.epoch = None;
+    }
+    points
+}
+
 fn empty_history(range: Range) -> HistoryResponse {
     HistoryResponse {
         bucket: range.bucket().into(),
@@ -959,11 +985,12 @@ impl Database {
         });
         let baseline =
             current.and_then(|_| comparison_baseline(&weighted, since, range.duration_ms() / 2));
-        let points = weighted
-            .iter()
-            .filter(|quote| quote.point.timestamp >= since)
-            .map(|quote| quote.point.clone())
-            .collect::<Vec<_>>();
+        let points = graph_points(
+            &weighted,
+            since,
+            latest_epoch,
+            matches!(range, Range::D1 | Range::W1),
+        );
         let delta = current
             .zip(baseline)
             .map(|(current, baseline)| current - baseline);
@@ -1528,5 +1555,56 @@ mod tests {
         assert_eq!(day.statistics.delta_percent, None);
         drop(database);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn graph_keeps_manual_resets_exact_without_transient_old_cycles() {
+        let quote = |timestamp, value, epoch| WeightedQuote {
+            point: HistoryPoint {
+                timestamp,
+                value_usd: Some(value),
+                raw_value_usd: Some(value),
+                weekly_used_percent: Some(10.0),
+                is_finalized: true,
+                is_heartbeat: false,
+                dominant_model: None,
+                epoch: Some(epoch),
+            },
+            epoch,
+            observed_cost_usd: value / 10.0,
+        };
+        let quotes = vec![
+            quote(1, 40.0, 10),
+            quote(2, 20.0, 10),
+            quote(3, 30.0, 11),
+            quote(4, 25.0, 11),
+            quote(5, 18.0, 12),
+            quote(6, 19.0, 12),
+        ];
+
+        let points = graph_points(&quotes, 0, Some(12), true);
+
+        assert_eq!(
+            points
+                .iter()
+                .map(|point| (point.timestamp, point.value_usd))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, Some(20.0)),
+                (4, Some(25.0)),
+                (5, Some(18.0)),
+                (6, Some(19.0))
+            ]
+        );
+        assert!(points.iter().all(|point| point.epoch.is_none()));
+
+        let long_range = graph_points(&quotes, 0, Some(12), false);
+        assert_eq!(
+            long_range
+                .iter()
+                .map(|point| (point.timestamp, point.value_usd))
+                .collect::<Vec<_>>(),
+            vec![(2, Some(20.0)), (4, Some(25.0)), (6, Some(19.0))]
+        );
     }
 }
