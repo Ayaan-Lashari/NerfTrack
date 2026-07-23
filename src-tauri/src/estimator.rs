@@ -1,5 +1,3 @@
-use std::cmp::Ordering;
-
 use crate::models::ALGORITHM_VERSION;
 
 #[derive(Debug, Clone, Copy)]
@@ -108,28 +106,6 @@ pub fn settle_interval(input: SettlementInput, thresholds: Thresholds) -> Measur
     MeasurementDecision::Valid {
         quote_usd,
         confidence,
-    }
-}
-
-pub fn median_latest_five(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    let start = values.len().saturating_sub(5);
-    let mut sorted: Vec<f64> = values[start..]
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect();
-    if sorted.is_empty() {
-        return None;
-    }
-    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
-    let middle = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
-        Some((sorted[middle - 1] + sorted[middle]) / 2.0)
-    } else {
-        Some(sorted[middle])
     }
 }
 
@@ -243,14 +219,5 @@ mod tests {
         assert!(workload_comparable(true, 15.0, 10.0, 10.0));
         assert!(!workload_comparable(true, 15.1, 10.0, 10.0));
         assert!(!workload_comparable(false, 0.0, 0.0, 0.0));
-    }
-
-    #[test]
-    fn median_uses_latest_five_values() {
-        assert_eq!(
-            median_latest_five(&[10.0, 9.0, 8.0, 7.0, 6.0, 100.0]),
-            Some(8.0)
-        );
-        assert_eq!(median_latest_five(&[7.0, 12.0, 15.0, 98.0]), Some(13.5));
     }
 }

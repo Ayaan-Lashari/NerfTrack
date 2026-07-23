@@ -70,15 +70,17 @@ describe('UsageChart', () => {
         isFinalized: true,
         isHeartbeat: false,
         dominantModel: null,
+        epoch: 1,
       },
       {
-        timestamp: 1000,
+        timestamp: 86_400_000,
         valueUsd: 100,
         rawValueUsd: 100,
         weeklyUsedPercent: 100,
         isFinalized: true,
         isHeartbeat: false,
         dominantModel: null,
+        epoch: 1,
       },
     ];
     render(
@@ -108,7 +110,7 @@ describe('UsageChart', () => {
     fireEvent(chart, hoverEvent);
 
     const interpolated = onScrub.mock.calls.at(-1)?.[0];
-    expect(interpolated.timestamp).toBeCloseTo(500);
+    expect(interpolated.timestamp).toBeCloseTo(43_200_000);
     expect(interpolated.valueUsd).toBeCloseTo(50);
     expect(interpolated.timestamp).not.toBe(points[0].timestamp);
     expect(interpolated.timestamp).not.toBe(points[1].timestamp);
@@ -116,5 +118,15 @@ describe('UsageChart', () => {
     fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 200 }));
     fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 800 }));
     expect(chart.closest('.usage-chart')).toHaveClass('chart-positive');
+  });
+
+  it('breaks the rendered path between weekly quota epochs', () => {
+    const points = getDemoHistory('1W')
+      .points.slice(0, 4)
+      .map((point, index) => ({ ...point, epoch: index < 2 ? 1 : 2 }));
+    render(<UsageChart points={points} annotations={[]} range="1W" reducedMotion={false} />);
+
+    const path = document.querySelector('.chart-line');
+    expect(path?.getAttribute('d')?.match(/M /g)).toHaveLength(2);
   });
 });

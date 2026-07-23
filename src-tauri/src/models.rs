@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const ALGORITHM_VERSION: &str = "nerfify-estimator-v2";
+pub const ALGORITHM_VERSION: &str = "nerfify-estimator-v3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -179,6 +179,7 @@ pub struct HistoryPoint {
     pub is_finalized: bool,
     pub is_heartbeat: bool,
     pub dominant_model: Option<String>,
+    pub epoch: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

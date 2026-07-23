@@ -190,6 +190,7 @@ function HomeView({
           range={range}
           reducedMotion={reducedMotion}
           changeUsd={history.statistics.deltaUsd}
+          baselineValueUsd={history.statistics.baselineValueUsd}
           onScrub={(point, anchor) => setScrubbed(point ? { point, anchor } : null)}
         />
         <div className="chart-actions">

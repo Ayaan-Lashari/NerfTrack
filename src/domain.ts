@@ -55,6 +55,7 @@ export interface HistoryPoint {
   isFinalized: boolean;
   isHeartbeat: boolean;
   dominantModel: string | null;
+  epoch: number | null;
 }
 
 export interface RangeStatistics {

@@ -22,8 +22,14 @@ Defaults are algorithm inputs, not OpenAI policy facts. They are centralized in 
 - eligible events: at least 2;
 - low-usage quarantine: at or below 3%.
 
-Display and graph values require at least three quotes for the same dominant model and normalized weekly reset. They use the median of the latest five comparable quotes, so an isolated low-movement interval cannot become the headline or a chart baseline.
+Display and graph values are cumulative weighted estimates within each normalized weekly reset:
 
-Range comparisons use the current dominant model only. A baseline must be at or before the requested cutoff and no more than half a range older than that cutoff. If the requested period lacks a comparable baseline, Nerfify returns no change instead of relabeling a shorter interval as the full range. The graph is rebuilt from local observations on every configured refresh; it does not contain fixed dollar values or machine-specific paths.
+```text
+weighted weekly equivalent = sum(settled eligible cost) / sum(settled quota percentage movement) × 100
+```
 
-Cache/fast/long-context share comparability and multi-epoch trend classification remain estimator capabilities for a future schema that persists those shares; they are not claimed by the current quote store.
+All priced models contribute to the same weighted value, including newly named models supplied by an authenticated official pricing source. Unknown-price usage stays pending rather than being assigned a guessed price. No model names, dollar values, or machine paths are hardwired into the aggregation.
+
+Repeated unchanged quota heartbeats are discarded, while small consecutive movements accumulate until they meet the configured threshold. This prevents polling from postponing settlement and avoids losing several real one-point movements. Nerfify still refreshes on the configured interval and only adds a new value after the configured settlement window.
+
+A range baseline must be at or before the requested cutoff and no more than half a range older than that cutoff. If the requested period lacks a baseline, Nerfify returns no change instead of relabeling a shorter interval as the full range. The chart uses the full selected time axis and breaks its path at weekly reset boundaries so missing time is not drawn as continuous data.

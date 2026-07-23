@@ -68,7 +68,7 @@ export const demoQuote: CurrentQuote = {
   resetAt: demoStatus.resetAt,
   status: 'valid',
   dominantModel: 'gpt-5-codex',
-  algorithmVersion: 'nerfify-estimator-v1',
+  algorithmVersion: 'nerfify-estimator-v3',
   confidence: 'high',
   note: 'Values are estimates based on observed local usage and may differ from actual API pricing.',
 };
@@ -136,6 +136,7 @@ export function getDemoHistory(range: Range): HistoryResponse {
       isFinalized: index < total - 2,
       isHeartbeat: index % 10 === 0,
       dominantModel: index % 6 === 0 ? 'gpt-5-codex-mini' : 'gpt-5-codex',
+      epoch: Math.floor(index / Math.max(Math.floor(total / 3), 1)),
     };
   });
   const finalValue = demoQuote.valueUsd ?? 0;

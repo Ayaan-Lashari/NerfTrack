@@ -26,7 +26,7 @@ All of the following passed locally from the repository root:
 | Frontend formatting   | `npm run format:check`                                                                          | PASS            |
 | ESLint                | `npm run lint`                                                                                  | PASS            |
 | TypeScript            | `npm run typecheck`                                                                             | PASS            |
-| Frontend tests        | `npm test -- --run`                                                                             | PASS — 8 tests  |
+| Frontend tests        | `npm test -- --run`                                                                             | PASS — 9 tests  |
 | Vite production build | `npm run build`                                                                                 | PASS            |
 | Rust formatting       | `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`                                     | PASS            |
 | Rust Clippy           | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings` | PASS            |
@@ -75,7 +75,7 @@ builds periodically reconcile discovered or manually selected Codex JSONL
 sources, price official GPT-5-family usage locally, persist embedded weekly
 quota observations, rebuild settled cost/quota-delta intervals, freeze
 saturated epochs, enforce configured estimator thresholds, and expose
-median-stabilized current/history DTOs.
+all-model weighted current/history DTOs with reset-aware chart segments.
 
 The CLI App Server supervisor remains available as a primitive but is not
 required when JSONL records already contain the Codex weekly quota observation.

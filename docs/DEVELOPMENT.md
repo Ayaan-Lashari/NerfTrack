@@ -19,4 +19,4 @@ The Vite browser mode uses sanitized deterministic fixtures to make the dashboar
 
 ## Verification expectations
 
-Parser tests cover token normalization, turn-context model attribution, cumulative-delta recovery, explicit request/turn IDs, and partial final lines. Estimator tests cover settlement, low-usage quarantine, comparability, and median display. Add storage, App Server, and UI tests alongside every new state or DTO field. Keep tests deterministic and do not fixture prompts, account identifiers, full paths, database files, or logs.
+Parser tests cover token normalization, turn-context model attribution, cumulative-delta recovery, explicit request/turn IDs, and partial final lines. Estimator tests cover settlement, low-usage quarantine, and comparability; storage tests cover weighted single-, mixed-, and future-model display values. Add storage, App Server, and UI tests alongside every new state or DTO field. Keep tests deterministic and do not fixture prompts, account identifiers, full paths, database files, or logs.

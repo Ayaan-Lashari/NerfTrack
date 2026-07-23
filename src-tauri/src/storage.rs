@@ -36,13 +36,21 @@ struct QuotaPoint {
     used_percent: f64,
 }
 
-struct StabilizedQuote {
+struct WeightedQuote {
     point: HistoryPoint,
     epoch: i64,
+    observed_cost_usd: f64,
 }
 
 type EpochKey = (Option<String>, Option<String>, i64);
-const MIN_COMPARABLE_QUOTES: usize = 3;
+
+#[derive(Default)]
+struct EpochAggregate {
+    cost_usd: f64,
+    quota_points: f64,
+    model: Option<String>,
+    mixed: bool,
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -51,11 +59,7 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-fn comparison_baseline(
-    quotes: &[StabilizedQuote],
-    cutoff_ms: i64,
-    tolerance_ms: i64,
-) -> Option<f64> {
+fn comparison_baseline(quotes: &[WeightedQuote], cutoff_ms: i64, tolerance_ms: i64) -> Option<f64> {
     let candidate = quotes
         .iter()
         .rev()
@@ -543,19 +547,29 @@ impl Database {
         let quota_points = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT quota.account_key, quota.limit_id, quota.observed_at_ms,
-                            quota.reset_at_ms, quota.used_percent
-                     FROM quota_snapshots quota
-                     JOIN (
-                         SELECT MAX(id) AS id
-                         FROM quota_snapshots
+                    "WITH observed AS (
+                         SELECT quota.*,
+                                LAG(used_percent) OVER (
+                                    PARTITION BY COALESCE(account_key, ''),
+                                                 COALESCE(limit_id, '')
+                                    ORDER BY observed_at_ms, id
+                                ) AS previous_used_percent,
+                                LAG(reset_at_ms) OVER (
+                                    PARTITION BY COALESCE(account_key, ''),
+                                                 COALESCE(limit_id, '')
+                                    ORDER BY observed_at_ms, id
+                                ) AS previous_reset_at_ms
+                         FROM quota_snapshots quota
                          WHERE used_percent > 0
                            AND reset_at_ms IS NOT NULL
                            AND ABS(duration_minutes - 10080.0) <= 240.0
-                         GROUP BY COALESCE(account_key, ''), COALESCE(limit_id, ''),
-                                  observed_at_ms / 1800000
-                     ) selected ON selected.id = quota.id
-                     ORDER BY quota.observed_at_ms",
+                     )
+                     SELECT account_key, limit_id, observed_at_ms, reset_at_ms, used_percent
+                     FROM observed
+                     WHERE previous_used_percent IS NULL
+                        OR used_percent<>previous_used_percent
+                        OR reset_at_ms<>previous_reset_at_ms
+                     ORDER BY observed_at_ms",
                 )
                 .map_err(|_| "unable to read weekly quota observations".to_string())?;
             let rows = statement
@@ -597,7 +611,8 @@ impl Database {
                 current.limit_id.clone(),
                 (current.reset_at_ms + 30_000).div_euclid(60_000),
             );
-            let Some(previous) = previous_by_epoch.insert(epoch_key, current.clone()) else {
+            let Some(previous) = previous_by_epoch.get(&epoch_key).cloned() else {
+                previous_by_epoch.insert(epoch_key, current);
                 continue;
             };
             if previous.used_percent >= 100.0 || current.used_percent <= previous.used_percent {
@@ -646,6 +661,7 @@ impl Database {
             else {
                 continue;
             };
+            previous_by_epoch.insert(epoch_key, current.clone());
             let dominant_model: Option<String> = transaction
                 .query_row(
                     "SELECT model_id
@@ -710,15 +726,13 @@ impl Database {
             .map_err(|_| "unable to read current quota".to_string())
     }
 
-    fn stabilized_quotes_for_model(
-        &self,
-        dominant_model: &str,
-    ) -> Result<Vec<StabilizedQuote>, String> {
+    fn weighted_quotes(&self) -> Result<Vec<WeightedQuote>, String> {
         let mut statement = self
             .connection
             .prepare(
                 "SELECT quotes.timestamp_ms, quotes.value_usd, quotes.raw_value_usd,
-                        quotes.weekly_used_percent, quotes.is_finalized,
+                        quotes.observed_cost_usd, quotes.weekly_used_percent,
+                        quotes.is_finalized, quotes.dominant_model,
                         (SELECT (quota.reset_at_ms + 30000) / 60000
                          FROM quota_snapshots quota
                          WHERE quota.observed_at_ms=quotes.timestamp_ms
@@ -727,56 +741,78 @@ impl Database {
                          ORDER BY quota.id DESC
                          LIMIT 1)
                  FROM quotes
-                 WHERE quotes.dominant_model=?1
-                   AND quotes.algorithm_version=?2
+                 WHERE quotes.algorithm_version=?1
                  ORDER BY quotes.timestamp_ms",
             )
-            .map_err(|_| "unable to read comparable quote history".to_string())?;
+            .map_err(|_| "unable to read weighted quote history".to_string())?;
         let rows = statement
-            .query_map(params![dominant_model, ALGORITHM_VERSION], |row| {
+            .query_map(params![ALGORITHM_VERSION], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, f64>(1)?,
                     row.get::<_, Option<f64>>(2)?,
-                    row.get::<_, Option<f64>>(3)?,
-                    row.get::<_, i64>(4)? != 0,
-                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, Option<f64>>(4)?,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
                 ))
             })
-            .map_err(|_| "unable to read comparable quote history".to_string())?;
-        let mut recent_by_epoch: HashMap<i64, Vec<f64>> = HashMap::new();
-        let mut stabilized = Vec::new();
+            .map_err(|_| "unable to read weighted quote history".to_string())?;
+        let mut aggregate_by_epoch: HashMap<i64, EpochAggregate> = HashMap::new();
+        let mut weighted = Vec::new();
         for row in rows {
-            let (timestamp, value, raw_value, weekly_used, is_finalized, epoch) =
-                row.map_err(|_| "unable to decode comparable quote history".to_string())?;
+            let (
+                timestamp,
+                value,
+                raw_value,
+                observed_cost,
+                weekly_used,
+                is_finalized,
+                model,
+                epoch,
+            ) = row.map_err(|_| "unable to decode weighted quote history".to_string())?;
             let Some(epoch) = epoch else {
                 continue;
             };
-            let recent = recent_by_epoch.entry(epoch).or_default();
-            recent.push(value);
-            if recent.len() > 5 {
-                recent.remove(0);
-            }
-            if recent.len() < MIN_COMPARABLE_QUOTES {
+            if !value.is_finite() || value <= 0.0 || !observed_cost.is_finite() {
                 continue;
             }
-            let Some(value_usd) = crate::estimator::median_latest_five(recent) else {
+            let quota_points = observed_cost / value * 100.0;
+            if !quota_points.is_finite() || quota_points <= 0.0 {
                 continue;
+            }
+            let aggregate = aggregate_by_epoch.entry(epoch).or_default();
+            aggregate.cost_usd += observed_cost;
+            aggregate.quota_points += quota_points;
+            if let Some(model) = model {
+                match aggregate.model.as_deref() {
+                    None => aggregate.model = Some(model),
+                    Some(existing) if existing != model => aggregate.mixed = true,
+                    _ => {}
+                }
+            }
+            let display_model = if aggregate.mixed {
+                Some("mixed".to_string())
+            } else {
+                aggregate.model.clone()
             };
-            stabilized.push(StabilizedQuote {
+            weighted.push(WeightedQuote {
                 point: HistoryPoint {
                     timestamp,
-                    value_usd: Some(value_usd),
+                    value_usd: Some(aggregate.cost_usd / aggregate.quota_points * 100.0),
                     raw_value_usd: raw_value,
                     weekly_used_percent: weekly_used,
                     is_finalized,
                     is_heartbeat: false,
-                    dominant_model: Some(dominant_model.to_string()),
+                    dominant_model: display_model,
+                    epoch: Some(epoch),
                 },
                 epoch,
+                observed_cost_usd: aggregate.cost_usd,
             });
         }
-        Ok(stabilized)
+        Ok(weighted)
     }
 
     pub fn latest_quote(&self) -> Result<Option<CurrentQuote>, String> {
@@ -808,7 +844,6 @@ impl Database {
             return Ok(None);
         };
         let latest_timestamp = latest.0;
-        let dominant_model = latest.4.clone();
         let latest_reset_group: Option<i64> = self
             .connection
             .query_row(
@@ -824,26 +859,18 @@ impl Database {
             )
             .optional()
             .map_err(|_| "unable to identify current quota epoch".to_string())?;
-        let stabilized = dominant_model
-            .as_deref()
-            .map(|model| self.stabilized_quotes_for_model(model))
-            .transpose()?
-            .unwrap_or_default();
-        let current_value = latest_reset_group.and_then(|epoch| {
-            stabilized
-                .iter()
-                .rev()
-                .find(|quote| quote.epoch == epoch)
-                .and_then(|quote| quote.point.value_usd)
-        });
+        let weighted = self.weighted_quotes()?;
+        let current = latest_reset_group
+            .and_then(|epoch| weighted.iter().rev().find(|quote| quote.epoch == epoch));
+        let current_value = current.and_then(|quote| quote.point.value_usd);
         let previous_value = current_value.and_then(|_| {
             comparison_baseline(
-                &stabilized,
+                &weighted,
                 latest_timestamp - Range::W1.duration_ms(),
                 Range::W1.duration_ms() / 2,
             )
         });
-        let observed_cost_usd = latest.2;
+        let observed_cost_usd = current.map(|quote| quote.observed_cost_usd);
         let weekly_used_percent = latest.3;
         let confidence = latest.5.as_str();
         let status = latest.6.as_str();
@@ -880,7 +907,7 @@ impl Database {
                     _ => QuoteStatus::Empty,
                 }
             },
-            dominant_model,
+            dominant_model: current.and_then(|quote| quote.point.dominant_model.clone()),
             algorithm_version: ALGORITHM_VERSION.into(),
             confidence: match confidence {
                 "high" => Confidence::High,
@@ -888,15 +915,15 @@ impl Database {
                 "low" => Confidence::Low,
                 _ => Confidence::None,
             },
-            note: Some("Values require at least three settled same-model observations in one weekly quota cycle and may differ from actual API pricing.".into()),
+            note: Some("Weighted from every settled priced model in the current weekly quota cycle; unknown-price usage remains pending.".into()),
         }))
     }
 
     pub fn history(&self, range: Range) -> Result<HistoryResponse, String> {
-        let latest: Option<(i64, Option<String>, Option<i64>)> = self
+        let latest: Option<(i64, Option<i64>)> = self
             .connection
             .query_row(
-                "SELECT quotes.timestamp_ms, quotes.dominant_model,
+                "SELECT quotes.timestamp_ms,
                         (SELECT (quota.reset_at_ms + 30000) / 60000
                          FROM quota_snapshots quota
                          WHERE quota.observed_at_ms=quotes.timestamp_ms
@@ -908,25 +935,25 @@ impl Database {
                  ORDER BY quotes.timestamp_ms DESC
                  LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|_| "unable to identify current quote history".to_string())?;
-        let Some((latest_timestamp, Some(dominant_model), latest_epoch)) = latest else {
+        let Some((latest_timestamp, latest_epoch)) = latest else {
             return Ok(empty_history(range));
         };
-        let stabilized = self.stabilized_quotes_for_model(&dominant_model)?;
+        let weighted = self.weighted_quotes()?;
         let since = latest_timestamp - range.duration_ms();
         let current = latest_epoch.and_then(|epoch| {
-            stabilized
+            weighted
                 .iter()
                 .rev()
                 .find(|quote| quote.epoch == epoch)
                 .and_then(|quote| quote.point.value_usd)
         });
         let baseline =
-            current.and_then(|_| comparison_baseline(&stabilized, since, range.duration_ms() / 2));
-        let points = stabilized
+            current.and_then(|_| comparison_baseline(&weighted, since, range.duration_ms() / 2));
+        let points = weighted
             .iter()
             .filter(|quote| quote.point.timestamp >= since)
             .map(|quote| quote.point.clone())
@@ -1273,9 +1300,10 @@ mod tests {
         assert!(quote.value_usd.is_some_and(|value| value > 0.0));
         assert_eq!(quote.weekly_used_percent, Some(100.0));
         assert_eq!(quote.change_usd, None);
-        assert_eq!(quote.algorithm_version, "nerfify-estimator-v2");
+        assert_eq!(quote.algorithm_version, "nerfify-estimator-v3");
         let history = database.history(Range::W1).expect("history");
-        assert_eq!(history.points.len(), 1);
+        assert_eq!(history.points.len(), 3);
+        assert_eq!(history.statistics.current_value_usd, quote.value_usd);
         assert!(history
             .points
             .iter()
@@ -1285,7 +1313,71 @@ mod tests {
     }
 
     #[test]
-    fn history_uses_same_model_stabilized_baselines() {
+    fn small_movements_accumulate_and_heartbeats_do_not_delay_settlement() {
+        let path = std::env::temp_dir().join(format!(
+            "nerfify-heartbeats-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut database = Database {
+            path: path.clone(),
+            connection: open_connection(&path).expect("temporary database"),
+        };
+        database.migrate().expect("schema");
+        let bucket_start = now_ms().div_euclid(1_800_000) * 1_800_000 - 10_800_000;
+        let first_observation = bucket_start + 60_000;
+        let first_heartbeat = bucket_start + 120_000;
+        let eleven_observation = bucket_start + 180_000;
+        let eleven_heartbeat = bucket_start + 240_000;
+        let twelve_observation = bucket_start + 300_000;
+        let changed_observation = bucket_start + 360_000;
+        let changed_heartbeat = bucket_start + 420_000;
+        let reset_at_ms = bucket_start + Range::W1.duration_ms();
+        let events = [
+            (first_observation, 10.0),
+            (first_heartbeat, 10.0),
+            (eleven_observation, 11.0),
+            (eleven_heartbeat, 11.0),
+            (twelve_observation, 12.0),
+            (changed_observation, 13.0),
+            (changed_heartbeat, 13.0),
+        ]
+        .into_iter()
+        .map(|(timestamp_ms, quota_used_percent)| UsageEvent {
+            timestamp_ms,
+            model: "gpt-5.6-sol".into(),
+            input_tokens: 100_000,
+            output_tokens: 10_000,
+            authenticated_official_codex: true,
+            quota_used_percent: Some(quota_used_percent),
+            quota_reset_at_ms: Some(reset_at_ms),
+            quota_window_minutes: Some(10_080.0),
+            quota_limit_id: Some("codex".into()),
+            ..UsageEvent::default()
+        })
+        .collect::<Vec<_>>();
+        let pricing = embedded_codex_snapshot(&events, now_ms());
+        database
+            .persist_collection(
+                &CollectionSummary {
+                    events,
+                    ..CollectionSummary::default()
+                },
+                None,
+                Some(&pricing),
+            )
+            .expect("persist heartbeat data");
+
+        let history = database.history(Range::W1).expect("history");
+        assert_eq!(history.points.len(), 1);
+        assert_eq!(history.points[0].timestamp, changed_observation);
+
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_weights_single_mixed_and_future_models() {
         let path = std::env::temp_dir().join(format!(
             "nerfify-history-{}-{}.db",
             std::process::id(),
@@ -1299,74 +1391,116 @@ mod tests {
         let current = now_ms();
         let prior_reset = current - 2 * Range::W1.duration_ms();
         let current_reset = current + Range::W1.duration_ms();
-        let insert_quote =
-            |connection: &Connection, timestamp: i64, value: f64, model: &str, reset: i64| {
-                connection
-                    .execute(
-                        "INSERT INTO quota_snapshots (
+        let insert_quote = |connection: &Connection,
+                            timestamp: i64,
+                            cost: f64,
+                            quota_points: f64,
+                            used_percent: f64,
+                            model: &str,
+                            reset: i64| {
+            let value = cost / quota_points * 100.0;
+            connection
+                .execute(
+                    "INSERT INTO quota_snapshots (
                             observed_at_ms, reset_at_ms, duration_minutes, limit_id,
                             used_percent, connection_quality
-                         ) VALUES (?1, ?2, 10080.0, 'codex', 20.0, 'good')",
-                        params![timestamp, reset],
-                    )
-                    .expect("quota");
-                connection
-                    .execute(
-                        "INSERT INTO quotes (
+                         ) VALUES (?1, ?2, 10080.0, 'codex', ?3, 'good')",
+                    params![timestamp, reset, used_percent],
+                )
+                .expect("quota");
+            connection
+                .execute(
+                    "INSERT INTO quotes (
                             timestamp_ms, value_usd, raw_value_usd, observed_cost_usd,
                             weekly_used_percent, dominant_model, confidence, status,
                             is_finalized, algorithm_version
-                         ) VALUES (?1, ?2, ?2, 1.0, 20.0, ?3, 'high', 'valid', 1, ?4)",
-                        params![timestamp, value, model, ALGORITHM_VERSION],
-                    )
-                    .expect("quote");
-            };
-        for (index, value) in [15.44, 17.14, 6.56, 10.65, 10.82].into_iter().enumerate() {
+                         ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, 'high', 'valid', 1, ?6)",
+                    params![
+                        timestamp,
+                        value,
+                        cost,
+                        used_percent,
+                        model,
+                        ALGORITHM_VERSION
+                    ],
+                )
+                .expect("quote");
+        };
+        for (index, (cost, model)) in [
+            (0.9, "gpt-5.5"),
+            (1.0, "gpt-future-official"),
+            (0.944, "gpt-5.5"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             insert_quote(
                 &database.connection,
                 current - 10 * 86_400_000 + index as i64 * 21_600_000,
-                value,
-                "gpt-5.6-sol",
+                cost,
+                10.0,
+                (index + 1) as f64 * 10.0,
+                model,
                 prior_reset,
             );
         }
-        insert_quote(
-            &database.connection,
-            current - 7_200_000,
-            98.66,
-            "gpt-5.6-luna",
-            current_reset,
-        );
-        for (index, value) in [15.51, 7.16, 10.89].into_iter().enumerate() {
+        let current_intervals = [
+            (2.959_801_5, 3.0, "gpt-5.6-luna"),
+            (1.240_624_5, 8.0, "gpt-5.6-sol"),
+            (0.716_424_5, 10.0, "gpt-5.6-sol"),
+            (0.871_220_5, 8.0, "gpt-5.6-sol"),
+            (0.305_190_75, 3.0, "gpt-5.6-sol"),
+        ];
+        let mut used_percent = 0.0;
+        for (index, (cost, quota_points, model)) in current_intervals.into_iter().enumerate() {
+            used_percent += quota_points;
             insert_quote(
                 &database.connection,
-                current - 3_600_000 + index as i64 * 1_800_000,
-                value,
-                "gpt-5.6-sol",
+                current - 4 * 3_600_000 + index as i64 * 3_600_000,
+                cost,
+                quota_points,
+                used_percent,
+                model,
                 current_reset,
             );
         }
 
+        let expected_current =
+            current_intervals.iter().map(|item| item.0).sum::<f64>() / used_percent * 100.0;
+        let expected_previous = (0.9 + 1.0 + 0.944) / 30.0 * 100.0;
         let quote = database
             .latest_quote()
             .expect("quote")
             .expect("current quote");
-        assert_eq!(quote.value_usd, Some(10.89));
+        assert!(quote
+            .value_usd
+            .is_some_and(|value| (value - expected_current).abs() < 0.000_001));
+        assert!(quote
+            .observed_cost_usd
+            .is_some_and(|value| (value - 6.093_261_75).abs() < 0.000_001));
+        assert_eq!(quote.dominant_model.as_deref(), Some("mixed"));
         assert!(quote
             .change_usd
-            .is_some_and(|value| (value - 0.07).abs() < 0.001));
+            .is_some_and(
+                |value| (value - (expected_current - expected_previous)).abs() < 0.000_001
+            ));
 
         let week = database.history(Range::W1).expect("week");
-        assert_eq!(week.points.len(), 1);
-        assert_eq!(week.statistics.baseline_value_usd, Some(10.82));
+        assert_eq!(week.points.len(), 5);
         assert!(week
             .statistics
-            .delta_percent
-            .is_some_and(|value| (value - 0.647).abs() < 0.01));
-        assert!(week.points.iter().all(|point| {
-            point.dominant_model.as_deref() == Some("gpt-5.6-sol")
-                && point.value_usd.is_some_and(|value| value < 20.0)
-        }));
+            .baseline_value_usd
+            .is_some_and(|value| (value - expected_previous).abs() < 0.000_001));
+        assert_eq!(
+            week.points.last().and_then(|point| point.value_usd),
+            Some(expected_current)
+        );
+        assert_eq!(
+            week.points
+                .last()
+                .and_then(|point| point.dominant_model.as_deref()),
+            Some("mixed")
+        );
 
         let day = database.history(Range::D1).expect("day");
         assert_eq!(day.statistics.baseline_value_usd, None);

@@ -425,6 +425,9 @@ p {
   stroke-linejoin: round;
   vector-effect: non-scaling-stroke;
 }
+.chart-point {
+  fill: var(--chart-color, var(--green));
+}
 .chart-y-label,
 .chart-x-label {
   fill: #8b949e;
