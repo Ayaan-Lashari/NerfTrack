@@ -216,7 +216,9 @@ fn parse_range(value: &str) -> Result<Range, String> {
 }
 
 #[tauri::command]
-fn get_current_quote(state: State<'_, AppState>) -> Result<Option<models::CurrentQuote>, String> {
+async fn get_current_quote(
+    state: State<'_, AppState>,
+) -> Result<Option<models::CurrentQuote>, String> {
     state
         .database
         .lock()
@@ -225,7 +227,7 @@ fn get_current_quote(state: State<'_, AppState>) -> Result<Option<models::Curren
 }
 
 #[tauri::command]
-fn get_current_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
+async fn get_current_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
     // ponytail: polling scans all source names; replace with a file watcher if large histories
     // make the configured refresh interval measurably slow.
     let reconciliation_failed = state.reconcile().is_err();
@@ -233,7 +235,7 @@ fn get_current_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
 }
 
 #[tauri::command]
-fn get_history(
+async fn get_history(
     state: State<'_, AppState>,
     range: String,
 ) -> Result<models::HistoryResponse, String> {
@@ -245,7 +247,7 @@ fn get_history(
 }
 
 #[tauri::command]
-fn get_annotations(state: State<'_, AppState>) -> Result<Vec<models::Annotation>, String> {
+async fn get_annotations(state: State<'_, AppState>) -> Result<Vec<models::Annotation>, String> {
     state
         .database
         .lock()
@@ -263,7 +265,7 @@ fn reset_annotations(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_diagnostics_summary(
+async fn get_diagnostics_summary(
     state: State<'_, AppState>,
 ) -> Result<models::DiagnosticsSummary, String> {
     state
@@ -343,7 +345,7 @@ fn select_codex_executable(state: State<'_, AppState>) -> Result<RedactedSelecti
 }
 
 #[tauri::command]
-fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+async fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
     state
         .database
         .lock()

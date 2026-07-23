@@ -299,6 +299,14 @@ impl Database {
                 count INTEGER NOT NULL DEFAULT 0,
                 updated_at_ms INTEGER NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_usage_events_account_pricing_time
+                ON usage_events(account_key, pricing_status, timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_quota_snapshots_account_limit_time
+                ON quota_snapshots(account_key, limit_id, observed_at_ms, id);
+            CREATE INDEX IF NOT EXISTS idx_quota_snapshots_time
+                ON quota_snapshots(observed_at_ms, id);
+            CREATE INDEX IF NOT EXISTS idx_quotes_algorithm_time
+                ON quotes(algorithm_version, timestamp_ms);
             INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (1, strftime('%s','now') * 1000);
             COMMIT;",
             )
@@ -550,13 +558,11 @@ impl Database {
                     "WITH observed AS (
                          SELECT quota.*,
                                 LAG(used_percent) OVER (
-                                    PARTITION BY COALESCE(account_key, ''),
-                                                 COALESCE(limit_id, '')
+                                    PARTITION BY account_key, limit_id
                                     ORDER BY observed_at_ms, id
                                 ) AS previous_used_percent,
                                 LAG(reset_at_ms) OVER (
-                                    PARTITION BY COALESCE(account_key, ''),
-                                                 COALESCE(limit_id, '')
+                                    PARTITION BY account_key, limit_id
                                     ORDER BY observed_at_ms, id
                                 ) AS previous_reset_at_ms
                          FROM quota_snapshots quota
@@ -626,7 +632,7 @@ impl Database {
                      WHERE pricing_status='priced'
                        AND timestamp_ms > ?1
                        AND timestamp_ms <= ?2
-                       AND ((account_key IS NULL AND ?3 IS NULL) OR account_key=?3)",
+                       AND account_key IS ?3",
                     params![
                         previous.observed_at_ms,
                         current.observed_at_ms,
@@ -669,7 +675,7 @@ impl Database {
                      WHERE pricing_status='priced'
                        AND timestamp_ms > ?1
                        AND timestamp_ms <= ?2
-                       AND ((account_key IS NULL AND ?3 IS NULL) OR account_key=?3)
+                       AND account_key IS ?3
                      GROUP BY model_id
                      ORDER BY SUM(cost_usd) DESC
                      LIMIT 1",
@@ -1170,6 +1176,21 @@ mod tests {
             connection: open_connection(&path).expect("temporary database"),
         };
         database.migrate().expect("schema");
+        let hot_path_indexes: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name IN (
+                     'idx_usage_events_account_pricing_time',
+                     'idx_quota_snapshots_account_limit_time',
+                     'idx_quota_snapshots_time',
+                     'idx_quotes_algorithm_time'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("hot path indexes");
+        assert_eq!(hot_path_indexes, 4);
         let bucket_start = now_ms().div_euclid(1_800_000) * 1_800_000 - 10_800_000;
         let reset_at_ms = bucket_start + 604_800_000;
         let events = vec![
