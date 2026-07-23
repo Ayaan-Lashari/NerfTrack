@@ -51,6 +51,7 @@ describe('UsageChart', () => {
     expect(chart).toHaveAttribute('aria-grabbed', 'false');
     expect(onScrub).toHaveBeenCalledTimes(2);
     expect(onScrub.mock.calls[1][0].timestamp).toBeGreaterThan(onScrub.mock.calls[0][0].timestamp);
+    expect(onScrub.mock.calls[1][1]).toEqual(onScrub.mock.calls[0][0]);
   });
 
   it('interpolates between stored vertices instead of snapping to them', () => {

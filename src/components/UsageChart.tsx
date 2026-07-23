@@ -7,7 +7,7 @@ interface UsageChartProps {
   annotations: Annotation[];
   range: Range;
   reducedMotion: boolean;
-  onScrub?: (point: HistoryPoint | null) => void;
+  onScrub?: (point: HistoryPoint | null, anchor: HistoryPoint | null) => void;
 }
 
 const chartWidth = 1000;
@@ -98,6 +98,7 @@ export function UsageChart({
 }: UsageChartProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const isDragging = useRef(false);
+  const anchorRef = useRef<HistoryPoint | null>(null);
   const [selection, setSelection] = useState<ChartSelection | null>(null);
 
   const values = useMemo(
@@ -147,21 +148,25 @@ export function UsageChart({
     const coordinate = coordinates[index];
     if (!point || !coordinate) return;
     setSelection({ point, coordinate, pointIndex: index, source: 'keyboard' });
-    onScrub?.(point);
+    onScrub?.(point, null);
   };
 
-  const updateSelection = (clientX: number, source: ChartSelection['source']) => {
+  const updateSelection = (
+    clientX: number,
+    source: ChartSelection['source'],
+    anchor: HistoryPoint | null | 'self' = null,
+  ) => {
     const svg = svgRef.current;
-    if (!svg || points.length === 0) return;
+    if (!svg || points.length === 0) return null;
     const rect = svg.getBoundingClientRect();
-    if (rect.width <= 0) return;
+    if (rect.width <= 0) return null;
     const svgX = ((clientX - rect.left) / rect.width) * chartWidth;
     const ratio = Math.max(0, Math.min(1, (svgX - plotLeft) / (plotRight - plotLeft)));
     const firstTimestamp = points[0].timestamp;
     const lastTimestamp = points.at(-1)?.timestamp ?? firstTimestamp;
     const timestamp = firstTimestamp + ratio * (lastTimestamp - firstTimestamp);
     const point = interpolatePoint(points, timestamp);
-    if (!point) return;
+    if (!point) return null;
     const valueRange = Math.max(bounds.max - bounds.min, 1);
     const y =
       point.valueUsd === null
@@ -173,7 +178,8 @@ export function UsageChart({
       pointIndex: null,
       source,
     });
-    onScrub?.(point);
+    onScrub?.(point, anchor === 'self' ? point : anchor);
+    return point;
   };
 
   useEffect(() => {
@@ -209,7 +215,8 @@ export function UsageChart({
     }
     if (event.key === 'Escape') {
       setSelection(null);
-      onScrub?.(null);
+      anchorRef.current = null;
+      onScrub?.(null, null);
     }
   };
 
@@ -255,7 +262,7 @@ export function UsageChart({
           onPointerDown={(event) => {
             event.currentTarget.setPointerCapture?.(event.pointerId);
             isDragging.current = true;
-            updateSelection(event.clientX, 'held');
+            anchorRef.current = updateSelection(event.clientX, 'held', 'self');
           }}
           onPointerMove={(event) => {
             if (isDragging.current || event.pointerType === 'mouse') {
@@ -263,6 +270,7 @@ export function UsageChart({
               updateSelection(
                 coalesced?.at(-1)?.clientX ?? event.clientX,
                 isDragging.current ? 'held' : 'hover',
+                isDragging.current ? anchorRef.current : null,
               );
             }
           }}
@@ -287,12 +295,13 @@ export function UsageChart({
           onPointerLeave={() => {
             if (!isDragging.current && selection?.source === 'hover') {
               setSelection(null);
-              onScrub?.(null);
+              onScrub?.(null, null);
             }
           }}
           onDoubleClick={() => {
             setSelection(null);
-            onScrub?.(null);
+            anchorRef.current = null;
+            onScrub?.(null, null);
           }}
           onKeyDown={keyHandler}
         >

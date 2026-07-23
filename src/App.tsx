@@ -112,10 +112,23 @@ function HomeView({
   onRangeChange: (range: Range) => void;
   onResetAnnotations: () => void;
 }) {
-  const [scrubbed, setScrubbed] = useState<HistoryPoint | null>(null);
-  const displayValue = scrubbed?.valueUsd ?? quote?.valueUsd ?? null;
-  const displayChange = scrubbed ? null : (quote?.changeUsd ?? null);
-  const displayPercent = scrubbed ? null : (quote?.changePercent ?? null);
+  const [scrubbed, setScrubbed] = useState<{
+    point: HistoryPoint;
+    anchor: HistoryPoint | null;
+  } | null>(null);
+  const displayValue = scrubbed?.point.valueUsd ?? quote?.valueUsd ?? null;
+  const displayChange =
+    scrubbed?.point.valueUsd !== null && scrubbed?.anchor?.valueUsd != null
+      ? scrubbed.point.valueUsd - scrubbed.anchor.valueUsd
+      : scrubbed
+        ? null
+        : (quote?.changeUsd ?? null);
+  const displayPercent =
+    displayChange !== null && scrubbed?.anchor?.valueUsd
+      ? (displayChange / scrubbed.anchor.valueUsd) * 100
+      : scrubbed
+        ? null
+        : (quote?.changePercent ?? null);
   const isEmpty = !quote || quote.status === 'empty';
 
   return (
@@ -145,7 +158,7 @@ function HomeView({
           <p className={displayChange !== null && displayChange < 0 ? 'negative' : 'positive'}>
             {formatSignedUsd(displayChange)}{' '}
             {displayPercent !== null ? `(${formatPercent(displayPercent)})` : ''}{' '}
-            <span>Past Week</span>
+            <span>{scrubbed?.anchor ? 'Selected range' : 'Past Week'}</span>
           </p>
         )}
         {isEmpty && (
@@ -160,7 +173,7 @@ function HomeView({
           annotations={annotations}
           range={range}
           reducedMotion={reducedMotion}
-          onScrub={setScrubbed}
+          onScrub={(point, anchor) => setScrubbed(point ? { point, anchor } : null)}
         />
         <div className="chart-actions">
           <span>
