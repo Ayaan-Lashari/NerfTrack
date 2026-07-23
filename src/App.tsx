@@ -281,9 +281,15 @@ export default function App() {
 
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 10_000);
-    return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    const timer = window.setInterval(
+      () => void refresh(),
+      (settings?.refreshIntervalSeconds ?? 10) * 1_000,
+    );
+    return () => window.clearInterval(timer);
+  }, [refresh, settings?.refreshIntervalSeconds]);
 
   const handleRangeChange = (nextRange: Range) => {
     setRange(nextRange);

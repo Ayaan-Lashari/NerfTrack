@@ -26,6 +26,11 @@ pub struct UsageEvent {
     pub long_context_multiplier: f64,
     pub fast_mode: bool,
     pub fast_mode_multiplier: f64,
+    pub quota_used_percent: Option<f64>,
+    pub quota_reset_at_ms: Option<i64>,
+    pub quota_window_minutes: Option<f64>,
+    pub quota_limit_id: Option<String>,
+    pub plan: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -41,6 +46,7 @@ pub struct ParserState {
     pub active_provider: Option<String>,
     pub active_backend: Option<String>,
     pub active_session_id: Option<String>,
+    pub active_turn_id: Option<String>,
     pub cumulative: BTreeMap<String, CumulativeTotals>,
 }
 
@@ -64,6 +70,25 @@ fn get_u64(value: &Value, keys: &[&str]) -> u64 {
             })
         })
         .unwrap_or(0)
+}
+
+fn finite_f64(value: Option<&Value>) -> Option<f64> {
+    value
+        .and_then(Value::as_f64)
+        .filter(|number| number.is_finite())
+}
+
+fn weekly_rate_limit(rate_limits: Option<&Value>) -> Option<&Value> {
+    ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|key| rate_limits?.get(key))
+        .filter_map(|window| {
+            let minutes = finite_f64(window.get("window_minutes"))?;
+            Some((window, (minutes - 10_080.0).abs()))
+        })
+        .filter(|(_, distance)| *distance <= 240.0)
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(window, _)| window)
 }
 
 fn nested<'a>(value: &'a Value, paths: &[&[&str]]) -> Option<&'a Value> {
@@ -195,6 +220,17 @@ pub fn parse_jsonl_line_with_state(
             &["payload", "session", "id"],
         ],
     );
+    let turn_from_record = string_at(
+        &value,
+        &[
+            &["turn_id"],
+            &["turnId"],
+            &["turn", "id"],
+            &["payload", "turn_id"],
+            &["payload", "turnId"],
+            &["payload", "turn", "id"],
+        ],
+    );
     if let Some(model) = model_from_record.clone() {
         state.active_model = Some(model);
     }
@@ -206,6 +242,9 @@ pub fn parse_jsonl_line_with_state(
     }
     if let Some(session_id) = session_from_record.clone() {
         state.active_session_id = Some(opaque_identifier(&session_id));
+    }
+    if let Some(turn_id) = turn_from_record.clone() {
+        state.active_turn_id = Some(opaque_identifier(&turn_id));
     }
     if is_turn_context && usage.is_none() {
         return Ok(None);
@@ -243,11 +282,14 @@ pub fn parse_jsonl_line_with_state(
             &["usage", "cumulative"],
             &["usage", "is_cumulative"],
         ],
-    ) || (last_token_usage.is_none() && total_token_usage.is_some());
+    ) || last_token_usage.is_some()
+        || total_token_usage.is_some();
     if cumulative {
-        let key = session_from_record
+        let key = turn_from_record
             .as_deref()
             .map(opaque_identifier)
+            .or_else(|| state.active_turn_id.clone())
+            .or_else(|| session_from_record.as_deref().map(opaque_identifier))
             .or_else(|| state.active_session_id.clone())
             .or_else(|| model_from_record.clone())
             .unwrap_or_else(|| "global".into());
@@ -268,6 +310,30 @@ pub fn parse_jsonl_line_with_state(
     }
     let provider = provider_from_record.or_else(|| state.active_provider.clone());
     let backend = backend_from_record.or_else(|| state.active_backend.clone());
+    let rate_limits = nested(&value, &[&["payload", "rate_limits"], &["rate_limits"]]);
+    let weekly_limit = weekly_rate_limit(rate_limits);
+    let quota_limit_id = rate_limits
+        .and_then(|limits| {
+            string_at(
+                limits,
+                &[&["limit_id"], &["limitId"], &["primary", "limit_id"]],
+            )
+        })
+        .or_else(|| Some("codex".into()).filter(|_| weekly_limit.is_some()));
+    let quota_used_percent = finite_f64(weekly_limit.and_then(|window| window.get("used_percent")));
+    let quota_reset_at_ms = weekly_limit
+        .and_then(|window| window.get("resets_at"))
+        .and_then(Value::as_i64)
+        .map(|timestamp| {
+            if timestamp < 10_000_000_000 {
+                timestamp * 1000
+            } else {
+                timestamp
+            }
+        });
+    let quota_window_minutes =
+        finite_f64(weekly_limit.and_then(|window| window.get("window_minutes")));
+    let plan = rate_limits.and_then(|limits| string_at(limits, &[&["plan_type"], &["plan"]]));
     let authenticated_official_codex = value
         .get("authenticated_codex")
         .and_then(Value::as_bool)
@@ -281,7 +347,10 @@ pub fn parse_jsonl_line_with_state(
             .is_some_and(|item| item.eq_ignore_ascii_case("codex"))
             && provider
                 .as_deref()
-                .is_some_and(|item| item.eq_ignore_ascii_case("openai"));
+                .is_some_and(|item| item.eq_ignore_ascii_case("openai"))
+        || quota_limit_id
+            .as_deref()
+            .is_some_and(|limit| limit.eq_ignore_ascii_case("codex"));
     let fast_mode = bool_at(&value, &[&["fast_mode"], &["payload", "fast_mode"]]);
     let long_context = bool_at(&value, &[&["long_context"], &["payload", "long_context"]]);
     Ok(Some(UsageEvent {
@@ -301,17 +370,7 @@ pub fn parse_jsonl_line_with_state(
                 &["payload", "requestId"],
             ],
         ),
-        turn_id: string_at(
-            &value,
-            &[
-                &["turn_id"],
-                &["turnId"],
-                &["turn", "id"],
-                &["payload", "turn_id"],
-                &["payload", "turnId"],
-                &["payload", "turn", "id"],
-            ],
-        ),
+        turn_id: turn_from_record.or_else(|| state.active_turn_id.clone()),
         session_id: session_from_record
             .as_deref()
             .map(opaque_identifier)
@@ -342,19 +401,21 @@ pub fn parse_jsonl_line_with_state(
         .and_then(Value::as_f64)
         .filter(|number| number.is_finite() && *number > 0.0)
         .unwrap_or(1.0),
+        quota_used_percent,
+        quota_reset_at_ms,
+        quota_window_minutes,
+        quota_limit_id,
+        plan,
     }))
 }
 
 pub fn event_fingerprint(event: &UsageEvent) -> String {
-    if event.request_id.is_some() || event.turn_id.is_some() {
-        let mut digest = Sha256::new();
-        digest.update(b"nerfify-explicit-id:");
-        digest.update(event.request_id.as_deref().unwrap_or("").as_bytes());
-        digest.update([0]);
-        digest.update(event.turn_id.as_deref().unwrap_or("").as_bytes());
-        return format!("fingerprint:{:x}", digest.finalize());
-    }
     let mut digest = Sha256::new();
+    digest.update(b"nerfify-event:");
+    digest.update(event.request_id.as_deref().unwrap_or("").as_bytes());
+    digest.update([0]);
+    digest.update(event.turn_id.as_deref().unwrap_or("").as_bytes());
+    digest.update([0]);
     digest.update(event.timestamp_ms.to_le_bytes());
     digest.update(
         event
@@ -486,7 +547,7 @@ mod tests {
         .expect("context")
         .is_none());
         let event = parse_jsonl_line_with_state(
-            r#"{"timestamp":"2026-07-11T12:09:01.915Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":8,"reasoning_output_tokens":3},"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":8,"reasoning_output_tokens":3}}}}"#,
+            r#"{"timestamp":"2026-07-11T12:09:01.915Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":8,"reasoning_output_tokens":3},"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":8,"reasoning_output_tokens":3}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":12.5,"window_minutes":10080,"resets_at":1783774800},"plan_type":"plus"}}}"#,
             &mut state,
         )
         .expect("token count")
@@ -497,5 +558,53 @@ mod tests {
         assert_eq!(event.cached_input_tokens, 20);
         assert_eq!(event.reasoning_tokens, 3);
         assert_eq!(event.explicit_provider.as_deref(), Some("openai"));
+        assert_eq!(event.quota_used_percent, Some(12.5));
+        assert_eq!(event.quota_reset_at_ms, Some(1_783_774_800_000));
+        assert_eq!(event.plan.as_deref(), Some("plus"));
+        assert!(event.authenticated_official_codex);
+    }
+
+    #[test]
+    fn token_count_updates_are_deltas_with_distinct_fingerprints() {
+        let mut state = ParserState::default();
+        parse_jsonl_line_with_state(
+            r#"{"type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.6-sol"}}"#,
+            &mut state,
+        )
+        .expect("context");
+        let first = parse_jsonl_line_with_state(
+            r#"{"timestamp":1735689600,"payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10}}}}"#,
+            &mut state,
+        )
+        .expect("first")
+        .expect("usage");
+        let second = parse_jsonl_line_with_state(
+            r#"{"timestamp":1735689660,"payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":140,"cached_input_tokens":100,"output_tokens":14}}}}"#,
+            &mut state,
+        )
+        .expect("second")
+        .expect("usage");
+        assert_eq!(second.input_tokens, 40);
+        assert_eq!(second.cached_input_tokens, 20);
+        assert_eq!(second.output_tokens, 4);
+        assert_ne!(event_fingerprint(&first), event_fingerprint(&second));
+    }
+
+    #[test]
+    fn selects_weekly_secondary_and_ignores_short_only_limits() {
+        let weekly = parse_jsonl_line(
+            r#"{"timestamp":1735689600,"model":"gpt-5.6-sol","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":37,"window_minutes":300,"resets_at":1735707600},"secondary":{"used_percent":6,"window_minutes":10080,"resets_at":1736294400},"plan_type":"plus"}}}"#,
+        )
+        .expect("weekly event");
+        assert_eq!(weekly.quota_used_percent, Some(6.0));
+        assert_eq!(weekly.quota_window_minutes, Some(10_080.0));
+        assert_eq!(weekly.quota_reset_at_ms, Some(1_736_294_400_000));
+
+        let short = parse_jsonl_line(
+            r#"{"timestamp":1735689600,"model":"gpt-5.6-sol","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":37,"window_minutes":300,"resets_at":1735707600}}}}"#,
+        )
+        .expect("short event");
+        assert_eq!(short.quota_used_percent, None);
+        assert_eq!(short.quota_window_minutes, None);
     }
 }

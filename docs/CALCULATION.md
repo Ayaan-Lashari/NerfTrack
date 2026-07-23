@@ -6,7 +6,9 @@ The quote is an estimate of the observed eligible Codex cost scaled to a complet
 weekly API equivalent = settled eligible cost delta / settled quota percentage delta × 100
 ```
 
-The formula is evaluated only when the interval is complete, monotonic, source-stable, attributable, priced, and finite. Unknown provider evidence, missing pricing, stale quota, 100% pinning, zero/negative deltas, low usage, and incomplete boundaries produce pending or rejected diagnostics.
+The live graph evaluates the formula from official Codex token records within the current quota window. It requires finite embedded family pricing and a positive weekly quota observation; missing provider evidence, pricing, or quota data remains pending rather than becoming a fabricated zero. Quote points are reduced to one observation per 30-minute bucket.
+
+Current Codex model variants use the embedded price for their compatible GPT-5 family. This keeps desktop monitoring local and functional when a new Codex variant appears before a model-specific catalog entry; values remain estimates rather than billing statements.
 
 Defaults are algorithm inputs, not OpenAI policy facts. They are centralized in `estimator.rs` and the active algorithm version is stored with each quote:
 

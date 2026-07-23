@@ -120,6 +120,46 @@ pub fn price_event(event: &UsageEvent, snapshot: &PricingSnapshot) -> Result<f64
     Ok(cost)
 }
 
+pub fn embedded_codex_snapshot(events: &[UsageEvent], observed_at_ms: i64) -> PricingSnapshot {
+    let prices = events
+        .iter()
+        .filter_map(|event| {
+            let model = normalize_model_id(&event.model);
+            codex_family_price(&model).map(|price| (model, price))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let serialized = serde_json::to_string(&prices).unwrap_or_default();
+    PricingSnapshot {
+        source: "embedded Codex family pricing".into(),
+        version: Some("2026-07".into()),
+        etag: None,
+        observed_at_ms,
+        sha256: snapshot_hash(&serialized),
+        prices,
+    }
+}
+
+fn codex_family_price(model: &str) -> Option<Price> {
+    let (input_per_million, cached_input_per_million, output_per_million) = if model
+        .starts_with("gpt-5.4")
+        || model.starts_with("gpt-5.5")
+        || model.starts_with("gpt-5.6")
+    {
+        (2.5, 0.25, 15.0)
+    } else if model.starts_with("gpt-5.2") || model.starts_with("gpt-5.3") {
+        (1.75, 0.175, 14.0)
+    } else if model == "gpt-5" || model.starts_with("gpt-5-") || model.starts_with("gpt-5.1") {
+        (1.25, 0.125, 10.0)
+    } else {
+        return None;
+    };
+    Some(Price {
+        input_per_million,
+        cached_input_per_million,
+        output_per_million,
+    })
+}
+
 pub fn snapshot_hash(serialized_pricing: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(serialized_pricing.as_bytes());
@@ -253,5 +293,13 @@ mod tests {
             Some(1_000),
             1_000 + PRICING_REFRESH_INTERVAL_MS
         ));
+    }
+
+    #[test]
+    fn prices_current_codex_family_without_model_specific_code() {
+        let mut usage = event("gpt-5.6-sol");
+        usage.authenticated_official_codex = true;
+        let snapshot = embedded_codex_snapshot(&[usage.clone()], 1);
+        assert!(price_event(&usage, &snapshot).is_ok());
     }
 }

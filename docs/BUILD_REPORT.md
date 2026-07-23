@@ -70,23 +70,13 @@ release steps documented in `docs/RELEASE.md`.
 
 ## Known implementation boundaries
 
-The production boundary is intentionally explicit. The live UI currently uses
-deterministic fixtures when the browser is opened outside Tauri, while the
-Tauri commands provide the typed integration seam and Rust startup
-reconciliation foundation. The following work remains before calling the
-collector a fully live monitor:
+The browser-only review build still uses deterministic fixtures. Native Tauri
+builds periodically reconcile discovered or manually selected Codex JSONL
+sources, price official GPT-5-family usage locally, persist embedded weekly
+quota observations, and expose live current/history DTOs.
 
-- wire the App Server supervisor’s stdio JSON-RPC read loop and account/quota
-  observation into the application lifecycle for CLI mode;
-- connect desktop-app account/quota observations when the desktop data source
-  exposes them;
-- connect notify-driven checkpoint updates, periodic reconciliation, pricing
-  refresh, and the serialized estimator writer worker to `AppState`;
-- persist live quota epochs, settled display quotes, trend decisions, and
-  five-minute heartbeats from the running monitor;
-- expand synthetic coverage to the complete specification matrix, including
-  every UI empty/error state and cross-platform packaging runs.
-
-These boundaries are not represented as fabricated numeric zeroes: the UI
-retains fixture data only for the review shell and the Rust diagnostics/state
-model distinguishes pending, unsupported, disconnected, and incomplete data.
+The CLI App Server supervisor remains available as a primitive but is not
+required when JSONL records already contain the Codex weekly quota observation.
+Remote pricing refresh, account switching boundaries, and trend classification
+remain future work; missing inputs stay pending rather than becoming fabricated
+zeroes.

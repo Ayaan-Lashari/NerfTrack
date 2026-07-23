@@ -59,11 +59,16 @@ impl AppState {
             .map_err(|_| "database writer is unavailable".to_string())?;
         let previous = database.load_checkpoint_states()?;
         let collection = collector::scan_codex_home_with_state(&home, &previous)?;
-        database.persist_collection(&collection, None, None)?;
+        let observed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default();
+        let pricing = pricing::embedded_codex_snapshot(&collection.events, observed_at_ms);
+        database.persist_collection(&collection, None, Some(&pricing))?;
         Ok(())
     }
 
-    fn discover_status(&self) -> AppStatus {
+    fn discover_status(&self, reconciliation_failed: bool) -> AppStatus {
         let home_override = self
             .codex_home_override
             .lock()
@@ -106,33 +111,48 @@ impl AppState {
         };
         let app_server = discovery::app_server_status_for_mode(binary.is_some(), gui_mode);
         let configured = home.is_some() && (binary.is_some() || gui_mode);
+        let database = self.database.lock().ok();
+        let diagnostics = database
+            .as_ref()
+            .and_then(|database| database.diagnostics().ok());
+        let quota = database
+            .as_ref()
+            .and_then(|database| database.latest_quota_observation().ok())
+            .flatten();
+        let total_events = diagnostics
+            .as_ref()
+            .map(|summary| summary.total_events)
+            .unwrap_or_default();
+        let diagnostics_failed = diagnostics.is_none();
+        let collection_failed = reconciliation_failed || diagnostics_failed;
+        let (state, label, connection_quality, data_quality) =
+            collection_status(configured, collection_failed, total_events);
+        let mode = if gui_mode { "Desktop Mode" } else { "CLI Mode" };
+        let detail = if !configured {
+            "Local Mode".into()
+        } else if collection_failed {
+            format!("{mode} · unable to read local data")
+        } else if total_events > 0 {
+            format!(
+                "{mode} · {total_events} usage event{} observed",
+                if total_events == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("{mode} · waiting for usage")
+        };
         AppStatus {
-            state: if configured {
-                AppStatusState::Detecting
-            } else {
-                AppStatusState::NeedsSetup
-            },
-            label: if configured {
-                "Detecting"
-            } else {
-                "Needs setup"
-            }
-            .into(),
-            detail: if configured {
-                if gui_mode {
-                    "Desktop Mode · reading local data"
-                } else {
-                    "CLI Mode · checking App Server"
-                }
-            } else {
-                "Local Mode"
-            }
-            .into(),
+            state,
+            label: label.into(),
+            detail,
             integration_mode,
-            account_state: AccountState::Unknown,
-            connection_quality: ConnectionQuality::Unknown,
-            plan: None,
-            reset_at: None,
+            account_state: if quota.is_some() {
+                AccountState::Authenticated
+            } else {
+                AccountState::Unknown
+            },
+            connection_quality,
+            plan: quota.as_ref().and_then(|quota| quota.plan.clone()),
+            reset_at: quota.as_ref().and_then(|quota| quota.reset_at_ms),
             last_updated_at: Some(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -142,9 +162,46 @@ impl AppState {
             codex_home,
             codex_executable,
             app_server,
-            data_quality: DataQuality::Unknown,
+            data_quality,
         }
     }
+}
+
+fn collection_status(
+    configured: bool,
+    failed: bool,
+    total_events: i64,
+) -> (AppStatusState, &'static str, ConnectionQuality, DataQuality) {
+    if !configured {
+        return (
+            AppStatusState::NeedsSetup,
+            "Needs setup",
+            ConnectionQuality::Offline,
+            DataQuality::Unknown,
+        );
+    }
+    if failed {
+        return (
+            AppStatusState::Error,
+            "Unavailable",
+            ConnectionQuality::Offline,
+            DataQuality::Interrupted,
+        );
+    }
+    if total_events > 0 {
+        return (
+            AppStatusState::Connected,
+            "Connected",
+            ConnectionQuality::Good,
+            DataQuality::Complete,
+        );
+    }
+    (
+        AppStatusState::Settling,
+        "Waiting for usage",
+        ConnectionQuality::Good,
+        DataQuality::Partial,
+    )
 }
 
 fn parse_range(value: &str) -> Result<Range, String> {
@@ -169,7 +226,10 @@ fn get_current_quote(state: State<'_, AppState>) -> Result<Option<models::Curren
 
 #[tauri::command]
 fn get_current_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
-    Ok(state.discover_status())
+    // ponytail: polling scans all source names; replace with a file watcher if large histories
+    // make the configured refresh interval measurably slow.
+    let reconciliation_failed = state.reconcile().is_err();
+    Ok(state.discover_status(reconciliation_failed))
 }
 
 #[tauri::command]
@@ -215,8 +275,8 @@ fn get_diagnostics_summary(
 
 #[tauri::command]
 fn retry_detection(state: State<'_, AppState>) -> Result<AppStatus, String> {
-    state.reconcile()?;
-    Ok(state.discover_status())
+    let reconciliation_failed = state.reconcile().is_err();
+    Ok(state.discover_status(reconciliation_failed))
 }
 
 #[tauri::command]
@@ -337,5 +397,25 @@ mod tests {
     fn parses_public_ranges() {
         assert!(matches!(parse_range("1W"), Ok(Range::W1)));
         assert!(parse_range("all").is_err());
+    }
+
+    #[test]
+    fn collection_status_reflects_real_scan_results() {
+        assert!(matches!(
+            collection_status(false, false, 0).0,
+            AppStatusState::NeedsSetup
+        ));
+        assert!(matches!(
+            collection_status(true, false, 0).0,
+            AppStatusState::Settling
+        ));
+        assert!(matches!(
+            collection_status(true, false, 1).0,
+            AppStatusState::Connected
+        ));
+        assert!(matches!(
+            collection_status(true, true, 1).0,
+            AppStatusState::Error
+        ));
     }
 }

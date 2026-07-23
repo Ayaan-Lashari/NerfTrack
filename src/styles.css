@@ -347,54 +347,68 @@ p {
   position: relative;
   width: 100%;
 }
-.chart-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 0;
-  overflow: visible;
-  position: relative;
-  z-index: 2;
-}
-.chart-legend {
-  display: none;
-}
 .scrub-readout {
+  --scrub-x: 50%;
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  left: clamp(76px, var(--scrub-x), calc(100% - 76px));
   display: flex;
   gap: 8px;
   align-items: center;
-  padding: 7px 10px;
+  min-height: 32px;
+  padding: 6px 10px;
   color: var(--muted-strong);
   font-size: 13px;
-  background: rgba(16, 21, 27, 0.95);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  transform: translateY(24px);
+  white-space: nowrap;
+  background: rgba(22, 28, 35, 0.96);
+  border: 1px solid rgba(150, 164, 176, 0.28);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  transform: translateX(-50%);
+  pointer-events: none;
 }
 .scrub-readout strong {
   color: var(--text);
   font-weight: 650;
 }
 .chart-canvas-wrap {
+  position: relative;
   width: 100%;
   overflow: visible;
+}
+.chart-empty {
+  position: absolute;
+  inset: 46% 0 auto;
+  color: #78828c;
+  text-align: center;
+  font-size: 14px;
+  pointer-events: none;
 }
 .chart-canvas {
   display: block;
   width: 100%;
   height: clamp(330px, 31vw, 405px);
   overflow: visible;
-  cursor: crosshair;
+  cursor: ew-resize;
   touch-action: none;
+  user-select: none;
 }
 .chart-grid {
-  stroke: rgba(117, 132, 143, 0.18);
-  stroke-width: 0.75;
-  stroke-dasharray: 3 3;
+  stroke: rgba(137, 151, 162, 0.16);
+  stroke-width: 0.7;
+}
+.chart-grid-vertical {
+  stroke: rgba(137, 151, 162, 0.12);
+}
+.chart-baseline {
+  stroke: rgba(184, 196, 203, 0.34);
+  stroke-width: 0.8;
+  stroke-dasharray: 2 2;
 }
 .chart-axis {
-  stroke: rgba(177, 190, 200, 0.45);
-  stroke-width: 0.75;
+  stroke: rgba(177, 190, 200, 0.38);
+  stroke-width: 0.8;
 }
 .chart-area {
   fill: url(#usage-area);
@@ -402,7 +416,9 @@ p {
 .chart-line {
   fill: none;
   stroke: var(--green);
-  stroke-width: 1.55;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
   vector-effect: non-scaling-stroke;
 }
 .chart-y-label,
@@ -432,14 +448,18 @@ p {
   font-size: 12px;
 }
 .chart-crosshair line {
-  stroke: rgba(230, 238, 239, 0.7);
-  stroke-width: 0.8;
-  stroke-dasharray: 4 3;
+  stroke: rgba(224, 232, 235, 0.7);
+  stroke-width: 0.9;
+  stroke-dasharray: 3 3;
+}
+.chart-crosshair .chart-crosshair-horizontal {
+  stroke: rgba(224, 232, 235, 0.28);
+  stroke-dasharray: 2 3;
 }
 .chart-crosshair circle {
-  fill: #07100a;
+  fill: var(--bg);
   stroke: var(--green);
-  stroke-width: 1.4;
+  stroke-width: 2;
 }
 .chart-crosshair circle + circle {
   fill: var(--green);

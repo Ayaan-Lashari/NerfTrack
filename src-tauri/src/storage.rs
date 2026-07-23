@@ -20,6 +20,12 @@ pub struct Database {
     connection: Connection,
 }
 
+pub struct LatestQuotaObservation {
+    pub used_percent: f64,
+    pub reset_at_ms: Option<i64>,
+    pub plan: Option<String>,
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -119,6 +125,10 @@ impl Database {
     }
 
     fn migrate(&mut self) -> Result<(), String> {
+        let previous_version = self
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap_or_default();
         if self
             .connection
             .execute_batch(
@@ -237,13 +247,32 @@ impl Database {
                 updated_at_ms INTEGER NOT NULL
             );
             INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (1, strftime('%s','now') * 1000);
-            PRAGMA user_version=1;
             COMMIT;",
             )
             .is_err()
         {
             let _ = self.connection.execute_batch("ROLLBACK;");
             return Err("database migration failed".into());
+        }
+        if previous_version < 3 {
+            self.connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                    DELETE FROM source_checkpoints;
+                    DELETE FROM usage_events;
+                    DELETE FROM pricing_snapshots;
+                    DELETE FROM quota_snapshots;
+                    DELETE FROM epochs;
+                    DELETE FROM measurements;
+                    DELETE FROM quotes;
+                    DELETE FROM chart_heartbeats;
+                    DELETE FROM diagnostics;
+                    INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (2, strftime('%s','now') * 1000);
+                    INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (3, strftime('%s','now') * 1000);
+                    PRAGMA user_version=3;
+                    COMMIT;",
+                )
+                .map_err(|_| "database live-data migration failed".to_string())?;
         }
         if self.load_settings().is_err() {
             self.save_settings(&AppSettings::default())?;
@@ -349,7 +378,7 @@ impl Database {
             .connection
             .transaction()
             .map_err(|_| "unable to start collection transaction".to_string())?;
-        if let Some(snapshot) = pricing_snapshot {
+        if let Some(snapshot) = pricing_snapshot.filter(|_| !collection.events.is_empty()) {
             transaction
                 .execute(
                     "INSERT INTO pricing_snapshots (source, observed_at_ms, version, etag, sha256, is_current) VALUES (?1, ?2, ?3, ?4, ?5, 1)",
@@ -370,6 +399,9 @@ impl Database {
             if Self::persist_event(&transaction, event, account_key, pricing_snapshot)? {
                 inserted += 1;
             }
+        }
+        if inserted > 0 {
+            Self::rebuild_quotes(&transaction)?;
         }
         if collection.stats.partial_line_retries > 0 {
             add_diagnostic(
@@ -398,9 +430,8 @@ impl Database {
         pricing_snapshot: Option<&PricingSnapshot>,
     ) -> Result<bool, String> {
         let eligibility = classify_provider_eligibility(event);
-        let account_eligible =
-            account_key.is_some() && matches!(eligibility, Eligibility::Eligible);
-        let (pricing_status, cost_usd): (&str, Option<f64>) = if !account_eligible {
+        let eligible = matches!(eligibility, Eligibility::Eligible);
+        let (pricing_status, cost_usd): (&str, Option<f64>) = if !eligible {
             match eligibility {
                 Eligibility::Rejected(_) => ("rejected", None),
                 Eligibility::Eligible | Eligibility::Pending(_) => ("pending", None),
@@ -416,13 +447,119 @@ impl Database {
         let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO usage_events (fingerprint, account_key, timestamp_ms, model_id, input_tokens, cached_input_tokens, output_tokens, eligible, pricing_status, cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![event_fingerprint(event), account_key, event.timestamp_ms, normalize_model_id(&event.model), event.input_tokens as i64, event.cached_input_tokens as i64, event.output_tokens as i64, i64::from(account_eligible && cost_usd.is_some()), pricing_status, cost_usd],
+                params![event_fingerprint(event), account_key, event.timestamp_ms, normalize_model_id(&event.model), event.input_tokens as i64, event.cached_input_tokens as i64, event.output_tokens as i64, i64::from(eligible && cost_usd.is_some()), pricing_status, cost_usd],
             )
             .map_err(|_| "unable to persist usage event".to_string())?;
+        if inserted == 1 {
+            if let (Some(used_percent), Some(reset_at_ms), Some(duration_minutes)) = (
+                event.quota_used_percent,
+                event.quota_reset_at_ms,
+                event.quota_window_minutes,
+            ) {
+                if used_percent.is_finite()
+                    && (0.0..=100.0).contains(&used_percent)
+                    && duration_minutes.is_finite()
+                    && duration_minutes > 0.0
+                {
+                    transaction
+                        .execute(
+                            "INSERT INTO quota_snapshots (account_key, observed_at_ms, reset_at_ms, duration_minutes, limit_id, plan, used_percent, connection_quality) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'good')",
+                            params![account_key, event.timestamp_ms, reset_at_ms, duration_minutes, event.quota_limit_id, event.plan, used_percent],
+                        )
+                        .map_err(|_| "unable to persist quota snapshot".to_string())?;
+                }
+            }
+        }
         if inserted == 1 && pricing_status != "priced" {
             add_diagnostic(transaction, pricing_status, 1)?;
         }
         Ok(inserted == 1)
+    }
+
+    fn rebuild_quotes(transaction: &rusqlite::Transaction<'_>) -> Result<(), String> {
+        transaction
+            .execute_batch(
+                "DELETE FROM quotes;
+                WITH latest_quota AS (
+                    SELECT quota.*
+                    FROM quota_snapshots quota
+                    JOIN (
+                        SELECT MAX(id) AS id
+                        FROM quota_snapshots
+                        WHERE used_percent > 0 AND reset_at_ms IS NOT NULL
+                        GROUP BY observed_at_ms / 1800000
+                    ) selected ON selected.id = quota.id
+                ),
+                totals AS (
+                    SELECT
+                        quota.id,
+                        SUM(event.cost_usd) AS observed_cost
+                    FROM latest_quota quota
+                    JOIN usage_events event
+                      ON event.pricing_status = 'priced'
+                     AND event.timestamp_ms <= quota.observed_at_ms
+                     AND event.timestamp_ms >= quota.reset_at_ms - CAST(quota.duration_minutes * 60000 AS INTEGER)
+                    GROUP BY quota.id
+                )
+                INSERT INTO quotes (
+                    timestamp_ms,
+                    value_usd,
+                    raw_value_usd,
+                    observed_cost_usd,
+                    weekly_used_percent,
+                    dominant_model,
+                    confidence,
+                    status,
+                    is_finalized,
+                    algorithm_version
+                )
+                SELECT
+                    quota.observed_at_ms,
+                    totals.observed_cost / (quota.used_percent / 100.0),
+                    totals.observed_cost / (quota.used_percent / 100.0),
+                    totals.observed_cost,
+                    quota.used_percent,
+                    (
+                        SELECT event.model_id
+                        FROM usage_events event
+                        WHERE event.pricing_status = 'priced'
+                          AND event.timestamp_ms <= quota.observed_at_ms
+                          AND event.timestamp_ms >= quota.reset_at_ms - CAST(quota.duration_minutes * 60000 AS INTEGER)
+                        GROUP BY event.model_id
+                        ORDER BY SUM(event.cost_usd) DESC
+                        LIMIT 1
+                    ),
+                    CASE
+                        WHEN quota.used_percent >= 5 THEN 'high'
+                        WHEN quota.used_percent >= 3 THEN 'medium'
+                        ELSE 'low'
+                    END,
+                    'valid',
+                    1,
+                    'nerfify-estimator-v1'
+                FROM latest_quota quota
+                JOIN totals ON totals.id = quota.id
+                WHERE totals.observed_cost > 0
+                ORDER BY quota.observed_at_ms;",
+            )
+            .map_err(|_| "unable to rebuild live quotes".to_string())
+    }
+
+    pub fn latest_quota_observation(&self) -> Result<Option<LatestQuotaObservation>, String> {
+        self.connection
+            .query_row(
+                "SELECT used_percent, reset_at_ms, plan FROM quota_snapshots ORDER BY observed_at_ms DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(LatestQuotaObservation {
+                        used_percent: row.get(0)?,
+                        reset_at_ms: row.get(1)?,
+                        plan: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| "unable to read current quota".to_string())
     }
 
     pub fn latest_quote(&self) -> Result<Option<CurrentQuote>, String> {
@@ -700,7 +837,9 @@ pub fn hash_account_key(salt: &[u8], identity: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::CollectionSummary;
     use crate::models::AdvancedSettings;
+    use crate::pricing::embedded_codex_snapshot;
 
     #[test]
     fn account_key_is_salted_and_non_reversible() {
@@ -714,5 +853,70 @@ mod tests {
     #[test]
     fn settings_validate_defaults() {
         assert!(AdvancedSettings::default().validate().is_ok());
+    }
+
+    #[test]
+    fn live_collection_produces_current_quote_and_history() {
+        let path = std::env::temp_dir().join(format!(
+            "nerfify-live-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut database = Database {
+            path: path.clone(),
+            connection: open_connection(&path).expect("temporary database"),
+        };
+        database.migrate().expect("schema");
+        let reset_at_ms = now_ms() + 86_400_000;
+        let events = vec![
+            UsageEvent {
+                timestamp_ms: now_ms() - 60_000,
+                model: "gpt-5.6-sol".into(),
+                input_tokens: 1_000_000,
+                output_tokens: 100_000,
+                authenticated_official_codex: true,
+                quota_used_percent: Some(10.0),
+                quota_reset_at_ms: Some(reset_at_ms),
+                quota_window_minutes: Some(10_080.0),
+                quota_limit_id: Some("codex".into()),
+                ..UsageEvent::default()
+            },
+            UsageEvent {
+                timestamp_ms: now_ms(),
+                model: "gpt-5.6-sol".into(),
+                input_tokens: 100_000,
+                output_tokens: 10_000,
+                authenticated_official_codex: true,
+                quota_used_percent: Some(11.0),
+                quota_reset_at_ms: Some(reset_at_ms),
+                quota_window_minutes: Some(10_080.0),
+                quota_limit_id: Some("codex".into()),
+                ..UsageEvent::default()
+            },
+        ];
+        let pricing = embedded_codex_snapshot(&events, now_ms());
+        database
+            .persist_collection(
+                &CollectionSummary {
+                    events,
+                    ..CollectionSummary::default()
+                },
+                None,
+                Some(&pricing),
+            )
+            .expect("persist live data");
+        let quote = database
+            .latest_quote()
+            .expect("quote")
+            .expect("current quote");
+        assert!(quote.value_usd.is_some_and(|value| value > 0.0));
+        assert_eq!(quote.weekly_used_percent, Some(11.0));
+        assert!(!database
+            .history(Range::W1)
+            .expect("history")
+            .points
+            .is_empty());
+        drop(database);
+        let _ = fs::remove_file(path);
     }
 }
