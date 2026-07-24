@@ -341,7 +341,7 @@ impl Database {
             let _ = self.connection.execute_batch("ROLLBACK;");
             return Err("database migration failed".into());
         }
-        if previous_version < 4 {
+        if previous_version < 5 {
             self.connection
                 .execute_batch(
                     "BEGIN IMMEDIATE;
@@ -357,7 +357,8 @@ impl Database {
                     INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (2, strftime('%s','now') * 1000);
                     INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (3, strftime('%s','now') * 1000);
                     INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (4, strftime('%s','now') * 1000);
-                    PRAGMA user_version=4;
+                    INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (5, strftime('%s','now') * 1000);
+                    PRAGMA user_version=5;
                     COMMIT;",
                 )
                 .map_err(|_| "database live-data migration failed".to_string())?;
@@ -1193,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v4_discards_misparsed_usage_for_reimport() {
+    fn migration_v5_discards_stale_pricing_for_reimport() {
         let path = std::env::temp_dir().join(format!(
             "nerfify-parser-migration-{}-{}.db",
             std::process::id(),
@@ -1247,7 +1248,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("schema version"),
-            4
+            5
         );
         let hot_path_indexes: i64 = database
             .connection

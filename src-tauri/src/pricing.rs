@@ -32,6 +32,59 @@ pub enum Eligibility {
 
 pub const OFFICIAL_CODEX_ALLOWLIST: &[&str] = &["gpt-5-codex", "gpt-5-codex-mini", "codex-1"];
 pub const PRICING_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
+const LONG_CONTEXT_THRESHOLD_TOKENS: u64 = 272_000;
+
+#[derive(Clone, Copy)]
+struct EmbeddedRate {
+    model: &'static str,
+    input: f64,
+    cached_input: f64,
+    output: f64,
+    long_context: bool,
+}
+
+const fn rate(
+    model: &'static str,
+    input: f64,
+    cached_input: f64,
+    output: f64,
+    long_context: bool,
+) -> EmbeddedRate {
+    EmbeddedRate {
+        model,
+        input,
+        cached_input,
+        output,
+        long_context,
+    }
+}
+
+// Standard API-equivalent text-token prices per million tokens. Exact model
+// names prevent a mini, nano, or pro tier from inheriting its parent rate.
+const EMBEDDED_CODEX_RATES: &[EmbeddedRate] = &[
+    rate("gpt-5.6-sol", 5.0, 0.5, 30.0, true),
+    rate("gpt-5.6-terra", 2.5, 0.25, 15.0, true),
+    rate("gpt-5.6-luna", 1.0, 0.1, 6.0, true),
+    rate("gpt-5.6", 5.0, 0.5, 30.0, true),
+    rate("gpt-5.5-pro", 30.0, 30.0, 180.0, true),
+    rate("gpt-5.5", 5.0, 0.5, 30.0, true),
+    rate("gpt-5.4-pro", 30.0, 30.0, 180.0, true),
+    rate("gpt-5.4-mini", 0.75, 0.075, 4.5, false),
+    rate("gpt-5.4-nano", 0.2, 0.02, 1.25, false),
+    rate("gpt-5.4", 2.5, 0.25, 15.0, true),
+    rate("gpt-5.3-codex", 1.75, 0.175, 14.0, false),
+    rate("gpt-5.2-codex", 1.75, 0.175, 14.0, false),
+    rate("gpt-5.2", 1.75, 0.175, 14.0, false),
+    rate("gpt-5.1-codex-mini", 0.25, 0.025, 2.0, false),
+    rate("gpt-5.1-codex-max", 1.25, 0.125, 10.0, false),
+    rate("gpt-5.1-codex", 1.25, 0.125, 10.0, false),
+    rate("gpt-5.1", 1.25, 0.125, 10.0, false),
+    rate("gpt-5-codex", 1.25, 0.125, 10.0, false),
+    rate("gpt-5-mini", 0.25, 0.025, 2.0, false),
+    rate("gpt-5-nano", 0.05, 0.005, 0.4, false),
+    rate("gpt-5", 1.25, 0.125, 10.0, false),
+    rate("codex-mini-latest", 1.5, 0.375, 6.0, false),
+];
 
 pub fn should_refresh_pricing(last_observed_at_ms: Option<i64>, now_ms: i64) -> bool {
     last_observed_at_ms
@@ -105,12 +158,16 @@ pub fn price_event(event: &UsageEvent, snapshot: &PricingSnapshot) -> Result<f64
         .ok_or_else(|| "missing pricing snapshot".to_string())?;
     let cached_input = event.cached_input_tokens.min(event.input_tokens);
     let uncached_input = event.input_tokens.saturating_sub(cached_input);
-    let mut cost = (uncached_input as f64 * price.input_per_million / 1_000_000.0)
-        + (cached_input as f64 * price.cached_input_per_million / 1_000_000.0)
-        + (event.output_tokens as f64 * price.output_per_million / 1_000_000.0);
-    if event.long_context {
-        cost *= 1.0 + event.long_context_multiplier;
-    }
+    let inferred_long_context = embedded_rate(&model).is_some_and(|rate| {
+        rate.long_context && event.input_tokens > LONG_CONTEXT_THRESHOLD_TOKENS
+    });
+    let long_context = event.long_context || inferred_long_context;
+    let input_multiplier = if long_context { 2.0 } else { 1.0 };
+    let output_multiplier = if long_context { 1.5 } else { 1.0 };
+    let mut cost = ((uncached_input as f64 * price.input_per_million / 1_000_000.0)
+        + (cached_input as f64 * price.cached_input_per_million / 1_000_000.0))
+        * input_multiplier
+        + (event.output_tokens as f64 * price.output_per_million / 1_000_000.0) * output_multiplier;
     if event.fast_mode {
         cost *= event.fast_mode_multiplier;
     }
@@ -130,8 +187,8 @@ pub fn embedded_codex_snapshot(events: &[UsageEvent], observed_at_ms: i64) -> Pr
         .collect::<std::collections::BTreeMap<_, _>>();
     let serialized = serde_json::to_string(&prices).unwrap_or_default();
     PricingSnapshot {
-        source: "embedded Codex family pricing".into(),
-        version: Some("2026-07".into()),
+        source: "embedded OpenAI model pricing".into(),
+        version: Some("2026-07-exact".into()),
         etag: None,
         observed_at_ms,
         sha256: snapshot_hash(&serialized),
@@ -140,28 +197,36 @@ pub fn embedded_codex_snapshot(events: &[UsageEvent], observed_at_ms: i64) -> Pr
 }
 
 fn codex_family_price(model: &str) -> Option<Price> {
-    let (input_per_million, cached_input_per_million, output_per_million) =
-        if model.starts_with("gpt-5.6-sol") {
-            (5.0, 0.5, 30.0)
-        } else if model.starts_with("gpt-5.6-luna") {
-            (1.0, 0.1, 6.0)
-        } else if model.starts_with("gpt-5.4")
-            || model.starts_with("gpt-5.5")
-            || model.starts_with("gpt-5.6")
-        {
-            (2.5, 0.25, 15.0)
-        } else if model.starts_with("gpt-5.2") || model.starts_with("gpt-5.3") {
-            (1.75, 0.175, 14.0)
-        } else if model == "gpt-5" || model.starts_with("gpt-5-") || model.starts_with("gpt-5.1") {
-            (1.25, 0.125, 10.0)
-        } else {
-            return None;
-        };
+    let rate = embedded_rate(model)?;
     Some(Price {
-        input_per_million,
-        cached_input_per_million,
-        output_per_million,
+        input_per_million: rate.input,
+        cached_input_per_million: rate.cached_input,
+        output_per_million: rate.output,
     })
+}
+
+fn embedded_rate(model: &str) -> Option<EmbeddedRate> {
+    EMBEDDED_CODEX_RATES
+        .iter()
+        .copied()
+        .find(|rate| model_matches_rate(model, rate.model))
+}
+
+fn model_matches_rate(model: &str, canonical: &str) -> bool {
+    if model == canonical {
+        return true;
+    }
+    let Some(snapshot) = model.strip_prefix(canonical) else {
+        return false;
+    };
+    let bytes = snapshot.as_bytes();
+    bytes.len() == 11
+        && bytes[0] == b'-'
+        && bytes[1..5].iter().all(u8::is_ascii_digit)
+        && bytes[5] == b'-'
+        && bytes[6..8].iter().all(u8::is_ascii_digit)
+        && bytes[8] == b'-'
+        && bytes[9..11].iter().all(u8::is_ascii_digit)
 }
 
 pub fn snapshot_hash(serialized_pricing: &str) -> String {
@@ -302,9 +367,9 @@ mod tests {
     #[test]
     fn prices_current_codex_tiers_at_their_distinct_rates() {
         for (model, expected) in [
-            ("gpt-5.6-sol", 7.1),
-            ("gpt-5.6-terra", 3.55),
-            ("gpt-5.6-luna", 1.42),
+            ("gpt-5.6-sol", 12.7),
+            ("gpt-5.6-terra", 6.35),
+            ("gpt-5.6-luna", 2.54),
         ] {
             let mut usage = event(model);
             usage.authenticated_official_codex = true;
@@ -312,5 +377,51 @@ mod tests {
             let cost = price_event(&usage, &snapshot).expect("cost");
             assert!((cost - expected).abs() < f64::EPSILON);
         }
+    }
+
+    #[test]
+    fn exact_model_rates_do_not_inherit_parent_tiers() {
+        for (model, expected) in [
+            ("gpt-5.5", (5.0, 0.5, 30.0)),
+            ("gpt-5.4", (2.5, 0.25, 15.0)),
+            ("gpt-5.4-mini", (0.75, 0.075, 4.5)),
+            ("gpt-5.4-nano", (0.2, 0.02, 1.25)),
+            ("gpt-5.1-codex-mini", (0.25, 0.025, 2.0)),
+            ("gpt-5-mini", (0.25, 0.025, 2.0)),
+            ("gpt-5-nano", (0.05, 0.005, 0.4)),
+            ("codex-mini-latest", (1.5, 0.375, 6.0)),
+        ] {
+            let price = codex_family_price(model).expect("supported model");
+            assert_eq!(
+                (
+                    price.input_per_million,
+                    price.cached_input_per_million,
+                    price.output_per_million
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn official_date_snapshots_use_their_exact_model_rate() {
+        let mini = codex_family_price("gpt-5.4-mini-2026-03-17").expect("mini snapshot");
+        assert_eq!(mini.input_per_million, 0.75);
+        assert!(codex_family_price("gpt-5.4-mini-preview").is_none());
+    }
+
+    #[test]
+    fn long_context_uses_distinct_input_and_output_multipliers() {
+        let mut usage = event("gpt-5.6-sol");
+        usage.authenticated_official_codex = true;
+        let snapshot = embedded_codex_snapshot(&[usage.clone()], 1);
+        let long_cost = price_event(&usage, &snapshot).expect("long-context cost");
+        assert!((long_cost - 12.7).abs() < f64::EPSILON);
+
+        usage.input_tokens = LONG_CONTEXT_THRESHOLD_TOKENS;
+        usage.cached_input_tokens = 0;
+        usage.output_tokens = 100_000;
+        let base_cost = price_event(&usage, &snapshot).expect("base cost");
+        assert!((base_cost - 4.36).abs() < f64::EPSILON);
     }
 }
