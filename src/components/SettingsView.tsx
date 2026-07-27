@@ -46,6 +46,7 @@ const advancedRows: Array<{
   },
 ];
 
+// harn:assume visible-estimator-version ref=settings-version-label scope=function
 export function SettingsView({
   settings,
   onChange,
@@ -182,7 +183,7 @@ export function SettingsView({
           <span className="settings-kicker">V1 defaults</span>
           <strong>English · USD · dark appearance</strong>
         </div>
-        <span className="algorithm-badge">Token estimator v2 · local API-equivalent pricing</span>
+        <span className="algorithm-badge">Token estimator v3 · local API-equivalent pricing</span>
       </div>
       <section className="panel data-management-panel" aria-labelledby="data-management-heading">
         <div className="panel-heading">
