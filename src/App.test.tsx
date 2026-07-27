@@ -6,9 +6,11 @@ import App from './App';
 describe('Nerfify app shell', () => {
   it('renders the dashboard reference surface with a non-zero quote', async () => {
     render(<App />);
-    expect(await screen.findByText('Codex Weekly API Equivalent')).toBeInTheDocument();
-    expect(screen.getByText('$371.28')).toBeInTheDocument();
+    expect(await screen.findByText('Codex Weekly API-equivalent Estimator')).toBeInTheDocument();
+    expect(screen.getAllByText('≈$371').length).toBeGreaterThan(0);
     expect(screen.getByText('Weekly Used')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Refresh data' })).toBeInTheDocument();
+    expect(screen.getByText(/Live ·/)).toBeInTheDocument();
   });
 
   it('switches to setup and changes a monitoring control', async () => {
@@ -19,6 +21,31 @@ describe('Nerfify app shell', () => {
     const refreshSelect = screen.getByLabelText('Refresh interval');
     await user.selectOptions(refreshSelect, '20');
     expect(refreshSelect).toHaveValue('20');
+  });
+
+  it('shows an in-app confirmation before resetting local data', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Reset all data' }));
+
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('Reset all local data?');
+    expect(screen.getByRole('button', { name: 'Confirm reset' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
+  it('edits and validates a local custom pricing override', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Add override' }));
+    expect(screen.getByLabelText('Model ID 1')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Save pricing' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('Each override needs a model ID.');
+    await user.type(screen.getByLabelText('Model ID 1'), 'local-codex');
+    await user.click(screen.getByRole('button', { name: 'Save pricing' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('navigates to diagnostics without leaking sensitive fields', async () => {
@@ -32,7 +59,7 @@ describe('Nerfify app shell', () => {
   it('shows the dollar and percentage difference across a held drag', async () => {
     render(<App />);
     const chart = await screen.findByRole('img', {
-      name: /Estimated weekly API equivalent/,
+      name: /Estimated weekly API-equivalent value/,
     });
     vi.spyOn(chart, 'getBoundingClientRect').mockReturnValue({
       left: 0,
@@ -58,12 +85,12 @@ describe('Nerfify app shell', () => {
     const user = userEvent.setup();
     render(<App />);
     const chart = await screen.findByRole('img', {
-      name: /Estimated weekly API equivalent/,
+      name: /Estimated weekly API-equivalent value/,
     });
 
     await user.click(screen.getByRole('tab', { name: '1M' }));
 
     expect(screen.getByText('Past Month')).toBeInTheDocument();
-    expect(screen.getByRole('img', { name: /Estimated weekly API equivalent/ })).toBe(chart);
+    expect(screen.getByRole('img', { name: /Estimated weekly API-equivalent value/ })).toBe(chart);
   });
 });

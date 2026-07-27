@@ -1,5 +1,4 @@
 import type {
-  AdvancedSettings,
   Annotation,
   AppSettings,
   AppStatus,
@@ -31,6 +30,10 @@ export const getAnnotations = () => invokeOr<Annotation[]>('get_annotations', de
 
 export const resetAnnotations = () => invokeOr<void>('reset_annotations', undefined);
 
+export const resetAllData = () => invokeOr<void>('reset_all_data', undefined);
+
+export const restoreGraphData = () => invokeOr<void>('restore_graph_data', undefined);
+
 export const getDiagnosticsSummary = () =>
   invokeOr<DiagnosticsSummary>('get_diagnostics_summary', demoDiagnostics);
 
@@ -53,7 +56,7 @@ export const selectCodexExecutable = () =>
 
 export const getSettings = () => invokeOr<AppSettings>('get_settings', demoSettings);
 
-export const updateSettings = (settings: AdvancedSettings) =>
-  invokeOr<AppSettings>('update_settings', { ...demoSettings, ...settings }, { settings });
+export const updateSettings = (settings: AppSettings) =>
+  invokeOr<AppSettings>('update_settings', settings, { settings });
 
 export { defaultAdvancedSettings };

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
-  AdvancedSettings,
   AppSettings,
+  CustomPriceOverride,
   AppStatus,
   CurrentQuote,
   HistoryPoint,
@@ -23,7 +23,9 @@ import {
   getDiagnosticsSummary,
   getHistory,
   getSettings,
+  resetAllData,
   retryDetection,
+  restoreGraphData,
   resetAnnotations,
   selectCodexExecutable,
   selectCodexHome,
@@ -45,6 +47,10 @@ function formatUsd(value: number | null) {
   return value === null ? 'Not available' : `$${value.toFixed(2)}`;
 }
 
+function formatEstimatedUsd(value: number | null) {
+  return value === null ? 'Not available' : `≈$${Math.round(value).toLocaleString('en-US')}`;
+}
+
 function formatSignedUsd(value: number | null) {
   if (value === null) return '—';
   return `${value < 0 ? '−' : '+'}$${Math.abs(value).toFixed(2)}`;
@@ -54,14 +60,40 @@ function formatPercent(value: number | null) {
   return value === null ? '—' : `${value < 0 ? '−' : '+'}${Math.abs(value).toFixed(2)}%`;
 }
 
-function formatReset(status: AppStatus) {
+function hasStableEstimate(quote: CurrentQuote | null) {
+  return (
+    quote?.status === 'valid' && (quote.confidence === 'medium' || quote.confidence === 'high')
+  );
+}
+
+function formatCoverage(value: number | null | undefined) {
+  if (value === null || value === undefined) return 'unknown coverage';
+  return `${value.toFixed(value % 1 === 0 ? 0 : 1)} percentage-point coverage`;
+}
+
+function calibrationNote(quote: CurrentQuote | null) {
+  if (!quote || quote.estimatedWeeklyValueUsd === null) {
+    return (
+      quote?.note ?? 'Waiting for a positive weekly-usage change paired with local token cost.'
+    );
+  }
+  const observations = quote.validObservationCount.toLocaleString('en-US');
+  return `Early projection ${formatEstimatedUsd(quote.estimatedWeeklyValueUsd)} from ${observations} valid observation${
+    quote.validObservationCount === 1 ? '' : 's'
+  } and ${formatCoverage(quote.percentageCoverage)}. Waiting for more movement before calling it stable.`;
+}
+
+function formatReset(status: AppStatus, now: number) {
   if (!status.resetAt) return 'Pending';
-  const fallback = status.resetAt === demoStatus.resetAt;
-  if (fallback) return '2d 7h';
-  const remaining = status.resetAt - Date.now();
+  const remaining = status.resetAt - now;
   if (remaining <= 0) return 'Reset observed';
-  const hours = Math.floor(remaining / 3_600_000);
-  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+  const minutes = Math.max(1, Math.floor(remaining / 60_000));
+  const days = Math.floor(minutes / 1_440);
+  const hours = Math.floor((minutes % 1_440) / 60);
+  const remainderMinutes = minutes % 60;
+  if (days > 0) return `${days}d ${hours}h ${remainderMinutes}m`;
+  if (hours > 0) return `${hours}h ${remainderMinutes}m`;
+  return `${remainderMinutes}m`;
 }
 
 function formatResetDate(timestamp: number | null) {
@@ -79,6 +111,44 @@ function HeaderIcon() {
     <div className="hero-icon">
       <Icon name="terminal" size={33} strokeWidth={1.6} />
     </div>
+  );
+}
+
+function useLiveNow() {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return now;
+}
+
+function ResetMetric({ status }: { status: AppStatus }) {
+  const now = useLiveNow();
+  return (
+    <MetricCard
+      icon="clock"
+      iconTone="blue"
+      label="Resets In"
+      value={formatReset(status, now)}
+      detail={formatResetDate(status.resetAt)}
+    />
+  );
+}
+
+function LiveRefreshStatus() {
+  const now = useLiveNow();
+  return (
+    <span className="refresh-status" aria-live="off">
+      <i />
+      Live ·{' '}
+      {new Date(now).toLocaleTimeString('en-US', {
+        hour: 'numeric',
+        minute: '2-digit',
+        second: '2-digit',
+      })}
+      {' · data 10s'}
+    </span>
   );
 }
 
@@ -107,6 +177,8 @@ function HomeView({
   annotations,
   range,
   reducedMotion,
+  isRefreshing,
+  onRefresh,
   onRangeChange,
   onResetAnnotations,
 }: {
@@ -116,6 +188,8 @@ function HomeView({
   annotations: Annotation[];
   range: Range;
   reducedMotion: boolean;
+  isRefreshing: boolean;
+  onRefresh: () => void;
   onRangeChange: (range: Range) => void;
   onResetAnnotations: () => void;
 }) {
@@ -123,8 +197,15 @@ function HomeView({
     point: HistoryPoint;
     anchor: HistoryPoint | null;
   } | null>(null);
-  const displayValue = scrubbed?.point.valueUsd ?? quote?.valueUsd ?? null;
-  const comparisonValue = scrubbed?.anchor?.valueUsd ?? history.statistics.baselineValueUsd ?? null;
+  const displayValue =
+    scrubbed?.point.estimatedWeeklyValueUsd ?? quote?.estimatedWeeklyValueUsd ?? null;
+  const stableEstimate = hasStableEstimate(quote) && !scrubbed;
+  const comparisonValue =
+    stableEstimate || scrubbed
+      ? (scrubbed?.anchor?.estimatedWeeklyValueUsd ??
+        history.statistics.baselineEstimatedWeeklyValueUsd ??
+        null)
+      : null;
   const displayChange =
     displayValue !== null && comparisonValue !== null ? displayValue - comparisonValue : null;
   const displayPercent =
@@ -138,7 +219,7 @@ function HomeView({
           hour: range === '1D' ? 'numeric' : undefined,
           minute: range === '1D' ? '2-digit' : undefined,
         })
-      : history.statistics.baselineValueUsd === null
+      : history.statistics.baselineEstimatedWeeklyValueUsd === null
         ? `${rangeLabels[range]} unavailable`
         : rangeLabels[range];
   const isEmpty = displayValue === null || !quote || quote.status === 'empty';
@@ -153,12 +234,25 @@ function HomeView({
         <div className="hero-title-wrap">
           <HeaderIcon />
           <div>
-            <h1>Codex Weekly API Equivalent</h1>
-            <p>Estimated value of a full weekly Codex allowance</p>
+            <h1>Codex Weekly API-equivalent Estimator</h1>
+            <p>
+              {stableEstimate
+                ? 'Stable estimate from cumulative local usage and verified model rates'
+                : 'Calibrating from cumulative local usage and verified model rates'}
+            </p>
           </div>
         </div>
         <div className="hero-controls">
           <RangeSelector range={range} onChange={selectRange} />
+          <button
+            className={`refresh-button ${isRefreshing ? 'is-refreshing' : ''}`}
+            aria-label="Refresh data"
+            title="Refresh data"
+            disabled={isRefreshing}
+            onClick={onRefresh}
+          >
+            <Icon name="refresh" size={19} />
+          </button>
           <button
             className="more-button"
             aria-label="More chart options"
@@ -169,18 +263,18 @@ function HomeView({
         </div>
       </header>
       <div className="quote-heading">
-        <strong className={isEmpty ? 'empty-value' : ''}>{formatUsd(displayValue)}</strong>
-        {!isEmpty && (
+        <strong className={isEmpty || (!stableEstimate && !scrubbed) ? 'empty-value' : ''}>
+          {stableEstimate || scrubbed ? formatEstimatedUsd(displayValue) : 'Calibrating'}
+        </strong>
+        {!isEmpty && (stableEstimate || scrubbed) && (
           <p className={displayChange !== null && displayChange < 0 ? 'negative' : 'positive'}>
             {formatSignedUsd(displayChange)}{' '}
             {displayPercent !== null ? `(${formatPercent(displayPercent)})` : ''}{' '}
             <span>{comparisonLabel}</span>
           </p>
         )}
-        {isEmpty && (
-          <p className="muted-state">
-            A quote appears after a complete, settled cost and quota interval.
-          </p>
+        {(isEmpty || (!stableEstimate && !scrubbed)) && (
+          <p className="muted-state">{calibrationNote(quote)}</p>
         )}
       </div>
       <div className="chart-panel">
@@ -189,8 +283,8 @@ function HomeView({
           annotations={annotations}
           range={range}
           reducedMotion={reducedMotion}
-          changeUsd={history.statistics.deltaUsd}
-          baselineValueUsd={history.statistics.baselineValueUsd}
+          changeValueUsd={history.statistics.deltaValueUsd}
+          baselineEstimatedWeeklyValueUsd={history.statistics.baselineEstimatedWeeklyValueUsd}
           onScrub={(point, anchor) => setScrubbed(point ? { point, anchor } : null)}
         />
         <div className="chart-actions">
@@ -209,6 +303,17 @@ function HomeView({
         <MetricCard
           icon="chart"
           iconTone="green"
+          label={hasStableEstimate(quote) ? 'Stable Weekly API Value' : 'Early Weekly API Value'}
+          value={formatEstimatedUsd(quote?.estimatedWeeklyValueUsd ?? null)}
+          detail={
+            hasStableEstimate(quote)
+              ? 'cumulative-window estimate'
+              : `${quote?.confidence ?? 'no'} confidence · ${formatCoverage(quote?.percentageCoverage)}`
+          }
+        />
+        <MetricCard
+          icon="chart"
+          iconTone="lime"
           label="Weekly Used"
           value={
             quote?.weeklyUsedPercent === null || quote?.weeklyUsedPercent === undefined
@@ -219,43 +324,38 @@ function HomeView({
         >
           <UsageRing value={quote?.weeklyUsedPercent ?? null} />
         </MetricCard>
+        <ResetMetric status={status} />
         <MetricCard
-          icon="clock"
-          iconTone="blue"
-          label="Resets In"
-          value={formatReset(status)}
-          detail={formatResetDate(status.resetAt)}
-        />
-        <MetricCard
-          icon="heart"
+          icon="activity"
           iconTone="purple"
-          label="Observed Local Cost"
+          label="Observed Token Cost"
           value={formatUsd(quote?.observedCostUsd ?? null)}
-          detail="This Week"
+          detail="this weekly window"
         />
         <MetricCard
           icon="shield"
-          iconTone="lime"
-          label="Status"
+          iconTone="blue"
+          label="Confidence"
           value={
             quote?.status === 'valid'
-              ? 'Valid'
+              ? quote.confidence
               : quote?.status === 'pending'
-                ? 'Settling'
+                ? 'Pending'
                 : 'Unavailable'
           }
-          detail={status.detail}
+          detail={
+            quote?.validObservationCount
+              ? `${quote.validObservationCount} valid observations`
+              : 'Need paired deltas'
+          }
         />
       </div>
       <footer className="app-footer">
         <span>
           <Icon name="info" size={16} />
-          Values are estimates based on observed local usage and may differ from actual API pricing.
+          Uses cumulative weekly usage and verified API rates; short-term spikes are filtered.
         </span>
-        <span className="refresh-status">
-          <i />
-          Auto-refresh: 10s
-        </span>
+        <LiveRefreshStatus />
       </footer>
     </section>
   );
@@ -275,11 +375,13 @@ export default function App() {
   const [diagnostics, setDiagnostics] = useState<DiagnosticsSummary | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [loadError, setLoadError] = useState(false);
 
   const refresh = useCallback(async () => {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
+    setIsRefreshing(true);
     try {
       const historyRanges = ranges.every((item) => historyCache.current[item])
         ? [activeRange.current]
@@ -321,6 +423,7 @@ export default function App() {
       setLoadError(true);
     } finally {
       setIsLoading(false);
+      setIsRefreshing(false);
       refreshInFlight.current = false;
     }
   }, []);
@@ -347,24 +450,44 @@ export default function App() {
     const nextSettings = { ...settings, [key]: value };
     setSettings(nextSettings);
     if (key in nextSettings) {
-      const advanced: AdvancedSettings = {
-        refreshIntervalSeconds: nextSettings.refreshIntervalSeconds,
-        reconciliationIntervalHours: nextSettings.reconciliationIntervalHours,
-        monitoringGapMinutes: nextSettings.monitoringGapMinutes,
-        settlementWindowSeconds: nextSettings.settlementWindowSeconds,
-        minimumQuotaMovementPoints: nextSettings.minimumQuotaMovementPoints,
-        minimumEligibleCostUsd: nextSettings.minimumEligibleCostUsd,
-        minimumEvents: nextSettings.minimumEvents,
-        lowUsageQuarantinePercent: nextSettings.lowUsageQuarantinePercent,
-        reducedMotion: nextSettings.reducedMotion,
-      };
       try {
-        await updateSettings(advanced);
+        await updateSettings(nextSettings);
       } catch {
         setSettings(settings);
         setLoadError(true);
       }
     }
+  };
+
+  const handleCustomPricingChange = async (customPricing: CustomPriceOverride[]) => {
+    if (!settings) return;
+    const nextSettings = { ...settings, customPricing };
+    setSettings(nextSettings);
+    try {
+      await updateSettings(nextSettings);
+      await refresh();
+    } catch {
+      setSettings(settings);
+      setLoadError(true);
+      throw new Error('save failed');
+    }
+  };
+
+  const handleResetAllData = async () => {
+    await resetAllData();
+    historyCache.current = {};
+    setHistories({});
+    setQuote(null);
+    setAnnotations([]);
+    setDiagnostics(null);
+    await refresh();
+  };
+
+  const handleRestoreGraphData = async () => {
+    await restoreGraphData();
+    historyCache.current = {};
+    setHistories({});
+    await refresh();
   };
 
   const runDetection = async () => {
@@ -414,9 +537,9 @@ export default function App() {
         points: [],
         statistics: {
           range,
-          baselineValueUsd: null,
-          currentValueUsd: null,
-          deltaUsd: null,
+          baselineEstimatedWeeklyValueUsd: null,
+          currentEstimatedWeeklyValueUsd: null,
+          deltaValueUsd: null,
           deltaPercent: null,
           pointCount: 0,
           partial: true,
@@ -429,17 +552,13 @@ export default function App() {
     refreshIntervalSeconds: 10,
     reconciliationIntervalHours: 1,
     monitoringGapMinutes: 5,
-    settlementWindowSeconds: 60,
-    minimumQuotaMovementPoints: 3,
-    minimumEligibleCostUsd: 0.25,
-    minimumEvents: 2,
-    lowUsageQuarantinePercent: 3,
     reducedMotion: false,
     appearance: 'dark' as const,
     currency: 'USD' as const,
     localOnly: true as const,
     telemetry: false as const,
     autoUpdater: false as const,
+    customPricing: [],
   };
 
   const renderPage = () => {
@@ -488,7 +607,15 @@ export default function App() {
           <HistoryView history={displayHistory} range={range} onRangeChange={handleRangeChange} />
         );
       case 'settings':
-        return <SettingsView settings={displaySettings} onChange={handleSettingChange} />;
+        return (
+          <SettingsView
+            settings={displaySettings}
+            onChange={handleSettingChange}
+            onCustomPricingChange={handleCustomPricingChange}
+            onResetAllData={handleResetAllData}
+            onRestoreGraphData={handleRestoreGraphData}
+          />
+        );
       default:
         return (
           <HomeView
@@ -498,6 +625,8 @@ export default function App() {
             annotations={annotations}
             range={range}
             reducedMotion={displaySettings.reducedMotion}
+            isRefreshing={isRefreshing}
+            onRefresh={() => void refresh()}
             onRangeChange={handleRangeChange}
             onResetAnnotations={async () => {
               try {

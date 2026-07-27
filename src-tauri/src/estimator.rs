@@ -1,223 +1,181 @@
-use crate::models::ALGORITHM_VERSION;
+//! Local token accounting and weekly API-equivalent estimation. This module never
+//! translates Codex credits: the dollar amount is calculated from token counts.
 
-#[derive(Debug, Clone, Copy)]
-pub struct Thresholds {
-    pub refresh_seconds: u64,
-    pub monitoring_gap_minutes: u64,
-    pub settlement_seconds: u64,
-    pub hard_settlement_seconds: u64,
-    pub minimum_decimal_quota_points: f64,
-    pub minimum_whole_quota_points: f64,
-    pub minimum_eligible_cost_usd: f64,
-    pub minimum_events: u64,
-    pub low_usage_quarantine_percent: f64,
-}
+pub const MEDIAN_SAMPLE_COUNT: usize = 7;
+pub const MATERIAL_USAGE_DECREASE_PERCENT: f64 = 0.01;
 
-impl Default for Thresholds {
-    fn default() -> Self {
-        Self {
-            refresh_seconds: 10,
-            monitoring_gap_minutes: 5,
-            settlement_seconds: 60,
-            hard_settlement_seconds: 120,
-            minimum_decimal_quota_points: 0.5,
-            minimum_whole_quota_points: 3.0,
-            minimum_eligible_cost_usd: 0.25,
-            minimum_events: 2,
-            low_usage_quarantine_percent: 3.0,
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenInterval {
+    pub previous_cost_usd: f64,
+    pub current_cost_usd: f64,
+    pub previous_used_percent: f64,
+    pub current_used_percent: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MeasurementDecision {
     Valid {
-        quote_usd: f64,
-        confidence: Confidence,
+        cost_delta_usd: f64,
+        percent_delta: f64,
+        estimated_weekly_value_usd: f64,
     },
     Pending(String),
     Rejected(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Confidence {
-    High,
-    Medium,
-    Low,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct SettlementInput {
-    pub cost_delta_usd: f64,
-    pub quota_delta_points: f64,
-    pub events: u64,
-    pub decimal_quota: bool,
-    pub sources_unchanged_for_seconds: u64,
-    pub monotonic: bool,
-    pub complete: bool,
-    pub low_usage_percent: f64,
-}
-
-pub fn settle_interval(input: SettlementInput, thresholds: Thresholds) -> MeasurementDecision {
-    if !input.complete {
-        return MeasurementDecision::Pending("incomplete-data boundary".into());
+pub fn measure_interval(input: TokenInterval) -> MeasurementDecision {
+    if [
+        input.previous_cost_usd,
+        input.current_cost_usd,
+        input.previous_used_percent,
+        input.current_used_percent,
+    ]
+    .iter()
+    .any(|value| !value.is_finite())
+    {
+        return MeasurementDecision::Rejected(
+            "non-finite token cost or weekly usage observation".into(),
+        );
     }
-    if !input.monotonic {
-        return MeasurementDecision::Rejected("quota or cost movement was not monotonic".into());
+    let cost_delta_usd = input.current_cost_usd - input.previous_cost_usd;
+    let percent_delta = input.current_used_percent - input.previous_used_percent;
+    if percent_delta < -MATERIAL_USAGE_DECREASE_PERCENT {
+        return MeasurementDecision::Rejected(
+            "weekly usage decreased; the interval crosses a reset or correction".into(),
+        );
     }
-    if !input.cost_delta_usd.is_finite() || !input.quota_delta_points.is_finite() {
-        return MeasurementDecision::Rejected("non-finite measurement".into());
+    if cost_delta_usd <= 0.0 || percent_delta <= 0.0 {
+        return MeasurementDecision::Pending(
+            "waiting for a positive paired token-cost and weekly-usage change".into(),
+        );
     }
-    if input.cost_delta_usd <= 0.0 {
-        return MeasurementDecision::Rejected("zero or negative eligible cost delta".into());
+    let estimated_weekly_value_usd = cost_delta_usd / (percent_delta / 100.0);
+    if !estimated_weekly_value_usd.is_finite() || estimated_weekly_value_usd <= 0.0 {
+        return MeasurementDecision::Rejected("token-derived weekly estimate is non-finite".into());
     }
-    if input.quota_delta_points <= 0.0 {
-        return MeasurementDecision::Rejected("zero or negative quota delta".into());
-    }
-    if input.low_usage_percent <= thresholds.low_usage_quarantine_percent {
-        return MeasurementDecision::Pending("low-usage quarantine".into());
-    }
-    let minimum_quota = if input.decimal_quota {
-        thresholds.minimum_decimal_quota_points
-    } else {
-        thresholds.minimum_whole_quota_points
-    };
-    if input.quota_delta_points < minimum_quota {
-        return MeasurementDecision::Pending("quota movement below estimator threshold".into());
-    }
-    if input.cost_delta_usd < thresholds.minimum_eligible_cost_usd {
-        return MeasurementDecision::Pending("eligible cost below estimator threshold".into());
-    }
-    if input.events < thresholds.minimum_events {
-        return MeasurementDecision::Pending("not enough eligible events".into());
-    }
-    if input.sources_unchanged_for_seconds < thresholds.settlement_seconds {
-        return MeasurementDecision::Pending("waiting for source settlement".into());
-    }
-    let quote_usd = input.cost_delta_usd / (input.quota_delta_points / 100.0);
-    if !quote_usd.is_finite() || quote_usd <= 0.0 {
-        return MeasurementDecision::Rejected("non-finite quote result".into());
-    }
-    let confidence = if input.quota_delta_points >= 5.0 {
-        Confidence::High
-    } else {
-        Confidence::Medium
-    };
     MeasurementDecision::Valid {
-        quote_usd,
-        confidence,
+        cost_delta_usd,
+        percent_delta,
+        estimated_weekly_value_usd,
     }
 }
 
-pub fn workload_comparable(
-    dominant_model_same: bool,
-    cache_share_delta_points: f64,
-    fast_share_delta_points: f64,
-    long_context_share_delta_points: f64,
-) -> bool {
-    dominant_model_same
-        && cache_share_delta_points.abs() <= 15.0
-        && fast_share_delta_points.abs() <= 10.0
-        && long_context_share_delta_points.abs() <= 10.0
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TrendState {
-    Stable,
-    Watching,
-    PossibleReduction,
-    LikelyReduction,
-    SustainedTrend,
-}
-
-pub fn classify_trend(
-    comparable_declines: &[f64],
-    reset_boundaries_spanned: u64,
-    persisted_across_boundaries: bool,
-) -> TrendState {
-    let declines = comparable_declines
+pub fn median_recent(values: &[f64], sample_count: usize) -> Option<f64> {
+    let mut recent = values
         .iter()
-        .filter(|decline| **decline <= -10.0)
-        .count();
-    let likely = comparable_declines
-        .iter()
-        .filter(|decline| **decline <= -15.0)
-        .count();
-    if persisted_across_boundaries && reset_boundaries_spanned >= 2 && likely >= 5 {
-        return TrendState::SustainedTrend;
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .rev()
+        .take(sample_count.max(1))
+        .collect::<Vec<_>>();
+    if recent.is_empty() {
+        return None;
     }
-    if reset_boundaries_spanned >= 2 && likely >= 5 {
-        return TrendState::LikelyReduction;
-    }
-    if declines >= 5 && likely >= 5 {
-        return TrendState::LikelyReduction;
-    }
-    if declines >= 3 {
-        return TrendState::PossibleReduction;
-    }
-    if declines >= 1 {
-        return TrendState::Watching;
-    }
-    TrendState::Stable
+    recent.sort_by(f64::total_cmp);
+    Some(recent[recent.len() / 2])
 }
 
-pub fn algorithm_version() -> &'static str {
-    ALGORITHM_VERSION
+pub fn relative_median_deviation(values: &[f64], sample_count: usize) -> Option<f64> {
+    let median = median_recent(values, sample_count)?;
+    let mut deviations = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .rev()
+        .take(sample_count.max(1))
+        .map(|value| (value - median).abs())
+        .collect::<Vec<_>>();
+    if deviations.is_empty() {
+        return None;
+    }
+    deviations.sort_by(f64::total_cmp);
+    Some(deviations[deviations.len() / 2] / median)
+}
+
+pub fn confidence(
+    valid_observation_count: usize,
+    percentage_coverage: f64,
+    relative_deviation: f64,
+) -> &'static str {
+    if valid_observation_count >= 5 && percentage_coverage >= 20.0 && relative_deviation <= 0.10 {
+        "high"
+    } else if valid_observation_count >= 2
+        && percentage_coverage >= 5.0
+        && relative_deviation <= 0.25
+    {
+        "medium"
+    } else if valid_observation_count >= 1 {
+        "low"
+    } else {
+        "none"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    fn interval(
+        previous_cost_usd: f64,
+        current_cost_usd: f64,
+        previous_used_percent: f64,
+        current_used_percent: f64,
+    ) -> TokenInterval {
+        TokenInterval {
+            previous_cost_usd,
+            current_cost_usd,
+            previous_used_percent,
+            current_used_percent,
+        }
+    }
     #[test]
-    fn waits_for_settlement_and_then_quotes() {
-        let thresholds = Thresholds::default();
+    fn positive_token_cost_delta_projects_a_week() {
+        let MeasurementDecision::Valid {
+            cost_delta_usd,
+            estimated_weekly_value_usd,
+            ..
+        } = measure_interval(interval(1.0, 1.42, 42.0, 43.0))
+        else {
+            panic!("expected valid");
+        };
+        assert!((cost_delta_usd - 0.42).abs() < 1e-10);
+        assert!((estimated_weekly_value_usd - 42.0).abs() < 1e-10);
+    }
+    #[test]
+    fn decimal_percentage_changes_are_supported() {
+        let MeasurementDecision::Valid {
+            estimated_weekly_value_usd,
+            ..
+        } = measure_interval(interval(1.0, 1.21, 12.25, 12.75))
+        else {
+            panic!("expected valid");
+        };
+        assert!((estimated_weekly_value_usd - 42.0).abs() < 1e-10);
+    }
+    #[test]
+    fn missing_positive_pair_is_pending() {
         assert!(matches!(
-            settle_interval(
-                SettlementInput {
-                    cost_delta_usd: 1.0,
-                    quota_delta_points: 1.0,
-                    events: 2,
-                    decimal_quota: true,
-                    sources_unchanged_for_seconds: 59,
-                    monotonic: true,
-                    complete: true,
-                    low_usage_percent: 20.0
-                },
-                thresholds
-            ),
+            measure_interval(interval(1.0, 1.0, 1.0, 2.0)),
             MeasurementDecision::Pending(_)
         ));
-        assert!(
-            matches!(settle_interval(SettlementInput { cost_delta_usd: 1.0, quota_delta_points: 1.0, events: 2, decimal_quota: true, sources_unchanged_for_seconds: 60, monotonic: true, complete: true, low_usage_percent: 20.0 }, thresholds), MeasurementDecision::Valid { quote_usd, .. } if (quote_usd - 100.0).abs() < f64::EPSILON)
-        );
     }
-
     #[test]
-    fn rejects_low_usage_without_fabricating_zero() {
-        let decision = settle_interval(
-            SettlementInput {
-                cost_delta_usd: 4.0,
-                quota_delta_points: 10.0,
-                events: 10,
-                decimal_quota: true,
-                sources_unchanged_for_seconds: 120,
-                monotonic: true,
-                complete: true,
-                low_usage_percent: 3.0,
-            },
-            Thresholds::default(),
-        );
+    fn usage_decrease_is_rejected() {
+        assert!(matches!(
+            measure_interval(interval(1.0, 2.0, 42.0, 41.0)),
+            MeasurementDecision::Rejected(_)
+        ));
+    }
+    #[test]
+    fn median_resists_an_outlier() {
         assert_eq!(
-            decision,
-            MeasurementDecision::Pending("low-usage quarantine".into())
+            median_recent(&[42.0, 41.0, 43.0, 4200.0, 40.0], MEDIAN_SAMPLE_COUNT),
+            Some(42.0)
         );
     }
-
     #[test]
-    fn compares_workloads_with_centralized_limits() {
-        assert!(workload_comparable(true, 15.0, 10.0, 10.0));
-        assert!(!workload_comparable(true, 15.1, 10.0, 10.0));
-        assert!(!workload_comparable(false, 0.0, 0.0, 0.0));
+    fn deviation_prevents_noisy_samples_from_claiming_high_confidence() {
+        let noisy = [40.0, 90.0, 20.0, 75.0, 45.0];
+        let deviation = relative_median_deviation(&noisy, MEDIAN_SAMPLE_COUNT).unwrap();
+        assert_eq!(confidence(noisy.len(), 25.0, deviation), "low");
     }
 }

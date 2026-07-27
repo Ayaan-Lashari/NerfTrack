@@ -1,35 +1,31 @@
-# Calculation and algorithm defaults
+# Token-based weekly API-equivalent estimator
 
-The quote is an estimate of the observed eligible Codex cost scaled to a complete allowance:
+Nerfify estimates what observed local Codex activity would cost through the OpenAI API. It does not read, infer, convert, or display Codex credits, and it is not a ChatGPT bill.
 
-```text
-weekly API equivalent = settled eligible cost delta / settled quota percentage delta × 100
-```
-
-The live graph evaluates the formula between consecutive official Codex observations for the same normalized weekly reset. It requires finite embedded family pricing, monotonic quota movement, settled sources, and the configured minimum movement, cost, event count, and low-usage thresholds. Quote points are reduced to one observation per 30-minute bucket. The first 100% observation may close an interval; later cost at the same saturated reset cannot create or inflate another quote.
-
-Current Codex model variants use embedded official prices, including distinct Sol, Terra, and Luna rates. Unknown GPT-5.6 variants fall back to the Terra rate so desktop monitoring remains local while values remain estimates rather than billing statements.
-
-Defaults are algorithm inputs, not OpenAI policy facts. They are centralized in `estimator.rs` and the active algorithm version is stored with each quote:
-
-- refresh: 10 seconds;
-- reconciliation: 1 hour;
-- monitoring gap: 5 minutes;
-- settlement: 60 seconds, hard limit 120 seconds;
-- decimal quota movement: at least 0.5 percentage points;
-- whole-number quota movement: at least 3 points, with 5 points high confidence;
-- eligible cost: at least $0.25;
-- eligible events: at least 2;
-- low-usage quarantine: at or below 3%.
-
-Display and graph values are cumulative weighted estimates within each normalized weekly reset:
+For each JSONL token event, Nerfify prices uncached input, cached input, and output at USD-per-million-token rates. When the log exposes reasoning tokens, they are treated as an output detail—not an additional billed token count—and are used only if a total output count is absent. A positive cost delta is paired only with a positive weekly `used_percent` delta in the same account/limit/reset window:
 
 ```text
-weighted weekly equivalent = sum(settled eligible cost) / sum(settled quota percentage movement) × 100
+cost_delta_usd = current_token_cost_usd - previous_token_cost_usd
+percent_delta = current_weekly_used_percent - previous_weekly_used_percent
+estimated_weekly_api_equivalent_usd = cost_delta_usd / (percent_delta / 100)
 ```
 
-All priced models contribute to the same weighted value, including newly named models supplied by an authenticated official pricing source. Unknown-price usage stays pending rather than being assigned a guessed price. No model names, dollar values, or machine paths are hardwired into the aggregation.
+The visible value is the bounded median of the latest seven valid interval estimates. Raw interval cost, percentage deltas, and estimates stay local for audit. Zero or negative cost movement, no percentage movement, unknown pricing, or a reset boundary is pending/rejected rather than converted into an estimate.
 
-Repeated unchanged quota heartbeats are discarded, while small consecutive movements accumulate until they meet the configured threshold. This prevents polling from postponing settlement and avoids losing several real one-point movements. Nerfify still refreshes on the configured interval and only adds a new value after the configured settlement window.
+## Pricing and overrides
 
-A range baseline must be at or before the requested cutoff and no more than half a range older than that cutoff. If the requested period lacks a baseline, Nerfify returns no change instead of relabeling a shorter interval as the full range. The chart uses the full selected time axis and breaks its path at weekly reset boundaries so missing time is not drawn as continuous data.
+Built-in rates were verified on 2026-07-24 from OpenAI API model pages:
+
+- [GPT-5.3-Codex](https://developers.openai.com/api/docs/models/gpt-5.3-codex): $1.75 input, $0.175 cached input, $14 output per 1M tokens.
+- [GPT-5.2-Codex](https://developers.openai.com/api/docs/models/gpt-5.2-codex): $1.75 input, $0.175 cached input, $14 output per 1M tokens.
+- [codex-mini-latest](https://developers.openai.com/api/docs/models/codex-mini-latest): $1.50 input, $0.375 cached input, $6 output per 1M tokens.
+
+The built-in text catalog also covers the currently documented GPT-5.6/5.5/5.4/5.x, GPT-4.1, GPT-4o, o1, o3, o3-mini, and o4-mini text model IDs using the [official model catalog](https://developers.openai.com/api/docs/models/all) and [model comparison](https://developers.openai.com/api/docs/models/compare) rates verified on that date. Token logs do not identify audio/image modality tokens, cache writes, or tool-call units, so those non-text charges are intentionally unavailable rather than fabricated.
+
+User-provided model overrides are local-only and take precedence over verified built-ins. Each needs a nonempty model ID and finite non-negative input, cached-input, and output rates; an optional alias maps a local model label to the override. A model without a verified rate and override is conspicuously pending with a diagnostic: Nerfify never guesses a rate or sends model/token data to obtain one.
+
+## Windows, reset safety, and migration
+
+Only 10,080-minute weekly limits are used. Windows are separated by account, limit ID, and reset identity; a changed reset timestamp, material usage decline, or scheduled boundary starts a new window. The first point is a baseline, not a reset annotation. Out-of-order events are rebuilt in timestamp order and cannot form cross-window intervals.
+
+Schema migration 7 preserves raw usage events, quota observations, accounts, and checkpoints, but invalidates incompatible derived estimates, measurements, and charts. Algorithm version: `nerfify-token-api-equivalent-v2`. All processing and override storage is local; prompts, raw JSONL, credentials, account identifiers, and complete paths are not returned.

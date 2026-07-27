@@ -7,8 +7,8 @@ interface UsageChartProps {
   annotations: Annotation[];
   range: Range;
   reducedMotion: boolean;
-  changeUsd?: number | null;
-  baselineValueUsd?: number | null;
+  changeValueUsd?: number | null;
+  baselineEstimatedWeeklyValueUsd?: number | null;
   onScrub?: (point: HistoryPoint | null, anchor: HistoryPoint | null) => void;
 }
 
@@ -43,6 +43,14 @@ function formatDate(timestamp: number, range: Range) {
 
 function formatUsd(value: number | null) {
   return value === null ? '—' : `$${value.toFixed(2)}`;
+}
+
+function compactAnnotationLabel(label: string) {
+  return label
+    .replace(/^Weekly window · /, '')
+    .replace(/_/g, ' ')
+    .replace('reported reset changed', 'reset changed')
+    .replace('usage decreased', 'usage drop');
 }
 
 function nearestPoint(points: HistoryPoint[], timestamp: number) {
@@ -92,12 +100,17 @@ function interpolatePoint(points: HistoryPoint[], timestamp: number): HistoryPoi
 
   return {
     timestamp,
-    valueUsd: interpolateNullable(left.valueUsd, right.valueUsd, ratio),
-    rawValueUsd: interpolateNullable(left.rawValueUsd, right.rawValueUsd, ratio),
+    estimatedWeeklyValueUsd: interpolateNullable(
+      left.estimatedWeeklyValueUsd,
+      right.estimatedWeeklyValueUsd,
+      ratio,
+    ),
+    observedCostUsd: interpolateNullable(left.observedCostUsd, right.observedCostUsd, ratio),
     weeklyUsedPercent: interpolateNullable(left.weeklyUsedPercent, right.weeklyUsedPercent, ratio),
+    resetAt: nearest.resetAt,
+    resetReason: nearest.resetReason,
     isFinalized: left.isFinalized && right.isFinalized,
     isHeartbeat: nearest.isHeartbeat,
-    dominantModel: nearest.dominantModel,
     epoch: nearest.epoch,
   };
 }
@@ -107,8 +120,8 @@ export function UsageChart({
   annotations,
   range,
   reducedMotion,
-  changeUsd = null,
-  baselineValueUsd = null,
+  changeValueUsd = null,
+  baselineEstimatedWeeklyValueUsd = null,
   onScrub,
 }: UsageChartProps) {
   const svgRef = useRef<SVGSVGElement>(null);
@@ -126,11 +139,11 @@ export function UsageChart({
 
   const values = useMemo(() => {
     const result = points
-      .map((point) => point.valueUsd)
+      .map((point) => point.estimatedWeeklyValueUsd)
       .filter((value): value is number => value !== null);
-    if (baselineValueUsd !== null) result.push(baselineValueUsd);
+    if (baselineEstimatedWeeklyValueUsd !== null) result.push(baselineEstimatedWeeklyValueUsd);
     return result;
-  }, [baselineValueUsd, points]);
+  }, [baselineEstimatedWeeklyValueUsd, points]);
   const bounds = useMemo(() => {
     if (!values.length) return { min: 0, max: 1 };
     const minValue = Math.min(...values);
@@ -148,16 +161,17 @@ export function UsageChart({
         plotLeft +
         ((point.timestamp - rangeStart) / rangeDurationMs[range]) * (plotRight - plotLeft),
       y:
-        point.valueUsd === null
+        point.estimatedWeeklyValueUsd === null
           ? plotBottom
-          : plotTop + ((bounds.max - point.valueUsd) / valueRange) * (plotBottom - plotTop),
+          : plotTop +
+            ((bounds.max - point.estimatedWeeklyValueUsd) / valueRange) * (plotBottom - plotTop),
     }));
   }, [bounds.max, bounds.min, points, range, rangeStart]);
 
   const segments = useMemo(() => {
     const result: { x: number; y: number }[][] = [];
     points.forEach((point, index) => {
-      if (point.valueUsd === null) return;
+      if (point.estimatedWeeklyValueUsd === null) return;
       if (index === 0 || points[index - 1].epoch !== point.epoch) result.push([]);
       result.at(-1)?.push(coordinates[index]);
     });
@@ -185,6 +199,26 @@ export function UsageChart({
       return `${line} L ${segment.at(-1)?.x ?? plotRight} ${plotBottom} L ${segment[0].x} ${plotBottom} Z`;
     })
     .join(' ');
+  const visibleAnnotations = useMemo(() => {
+    let previousX = -Infinity;
+    let lane = 0;
+    return annotations
+      .map((annotation) => {
+        const ratio = (annotation.timestamp - rangeStart) / rangeDurationMs[range];
+        if (ratio < 0 || ratio > 1) return null;
+        const x = plotLeft + ratio * (plotRight - plotLeft);
+        lane = x - previousX < 146 ? (lane + 1) % 3 : 0;
+        previousX = x;
+        return {
+          annotation,
+          x,
+          lane,
+          label: compactAnnotationLabel(annotation.label),
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null)
+      .slice(-10);
+  }, [annotations, range, rangeStart]);
   const selected = selection?.point ?? null;
   const selectedCoordinate = selection?.coordinate ?? null;
   const anchorCoordinate = useMemo(() => {
@@ -195,27 +229,30 @@ export function UsageChart({
         plotLeft +
         ((anchorPoint.timestamp - rangeStart) / rangeDurationMs[range]) * (plotRight - plotLeft),
       y:
-        anchorPoint.valueUsd === null
+        anchorPoint.estimatedWeeklyValueUsd === null
           ? plotBottom
-          : plotTop + ((bounds.max - anchorPoint.valueUsd) / valueRange) * (plotBottom - plotTop),
+          : plotTop +
+            ((bounds.max - anchorPoint.estimatedWeeklyValueUsd) / valueRange) *
+              (plotBottom - plotTop),
     };
   }, [anchorPoint, bounds.max, bounds.min, points.length, range, rangeStart]);
   const baselineCoordinate =
-    baselineValueUsd === null
+    baselineEstimatedWeeklyValueUsd === null
       ? null
       : {
           y:
             plotTop +
-            ((bounds.max - baselineValueUsd) / Math.max(bounds.max - bounds.min, 1)) *
+            ((bounds.max - baselineEstimatedWeeklyValueUsd) /
+              Math.max(bounds.max - bounds.min, 1)) *
               (plotBottom - plotTop),
         };
   const dragChange =
-    anchorPoint?.valueUsd != null &&
-    selected?.valueUsd != null &&
+    anchorPoint?.estimatedWeeklyValueUsd != null &&
+    selected?.estimatedWeeklyValueUsd != null &&
     (selection?.source === 'held' || selection?.source === 'locked')
-      ? selected.valueUsd - anchorPoint.valueUsd
+      ? selected.estimatedWeeklyValueUsd - anchorPoint.estimatedWeeklyValueUsd
       : null;
-  const isNegative = (dragChange ?? changeUsd ?? 0) < 0;
+  const isNegative = (dragChange ?? changeValueUsd ?? 0) < 0;
   const chartColor = isNegative ? '#ff5d73' : '#5cf07a';
 
   const selectPoint = (index: number) => {
@@ -242,9 +279,10 @@ export function UsageChart({
     if (!point) return null;
     const valueRange = Math.max(bounds.max - bounds.min, 1);
     const y =
-      point.valueUsd === null
+      point.estimatedWeeklyValueUsd === null
         ? plotBottom
-        : plotTop + ((bounds.max - point.valueUsd) / valueRange) * (plotBottom - plotTop);
+        : plotTop +
+          ((bounds.max - point.estimatedWeeklyValueUsd) / valueRange) * (plotBottom - plotTop);
     setSelection({
       point,
       coordinate: { x: plotLeft + ratio * (plotRight - plotLeft), y },
@@ -310,6 +348,10 @@ export function UsageChart({
       }`}
       style={{ '--chart-color': chartColor } as React.CSSProperties}
     >
+      <div className="chart-value-label">
+        <span>Estimated weekly API-equivalent value</span>
+        <small>USD · local token-derived estimate</small>
+      </div>
       <div className="chart-canvas-wrap">
         {selected && selectedCoordinate && (
           <div
@@ -322,7 +364,8 @@ export function UsageChart({
           >
             <Icon name="calendar" size={14} />
             <span>{formatDate(selected.timestamp, range)}</span>
-            <strong>{formatUsd(selected.valueUsd)}</strong>
+            <strong>{formatUsd(selected.estimatedWeeklyValueUsd)}</strong>
+            <small>Observed: {formatUsd(selected.observedCostUsd)}</small>
           </div>
         )}
         {!points.length && <div className="chart-empty">Waiting for weekly observations</div>}
@@ -331,7 +374,7 @@ export function UsageChart({
           className={`chart-canvas ${isDragging.current ? 'is-scrubbing' : ''}`}
           viewBox={`0 0 ${chartWidth} ${chartHeight}`}
           role="img"
-          aria-label="Estimated weekly API equivalent history chart. Use arrow keys to move between points."
+          aria-label="Estimated weekly API-equivalent value history chart. Use arrow keys to move between points."
           aria-grabbed={isDragging.current}
           tabIndex={0}
           onPointerDown={(event) => {
@@ -434,18 +477,18 @@ export function UsageChart({
                 r="3"
               />
             ))}
-          {annotations.map((annotation) => {
-            const ratio = (annotation.timestamp - rangeStart) / rangeDurationMs[range];
-            if (ratio < 0 || ratio > 1) return null;
-            const x = plotLeft + ratio * (plotRight - plotLeft);
+          {visibleAnnotations.map(({ annotation, x, lane, label }) => {
+            const markerY = 20 + lane * 30;
+            const labelX = Math.max(4, Math.min(x - 64, plotRight - 132));
             return (
               <g key={annotation.id} className="chart-annotation">
-                <line x1={x} x2={x} y1={20} y2={plotBottom} />
-                <circle cx={x} cy={20} r={4.4} />
-                <g transform={`translate(${Math.max(4, Math.min(x - 50, plotRight - 112))}, -4)`}>
-                  <rect width="112" height="30" rx="7" />
-                  <text x="56" y="19" textAnchor="middle">
-                    {annotation.label}
+                <title>{annotation.label}</title>
+                <line x1={x} x2={x} y1={markerY} y2={plotBottom} />
+                <circle cx={x} cy={markerY} r={4.4} />
+                <g transform={`translate(${labelX}, ${markerY - 15})`}>
+                  <rect width="132" height="28" rx="7" />
+                  <text x="66" y="18" textAnchor="middle">
+                    {label}
                   </text>
                 </g>
               </g>
@@ -492,7 +535,7 @@ export function UsageChart({
             const y = plotTop + (index / 4) * (plotBottom - plotTop);
             return (
               <text key={`y-${index}`} className="chart-y-label" x="963" y={y + 4}>
-                {Math.round(value)}
+                ${Math.round(value)}
               </text>
             );
           })}

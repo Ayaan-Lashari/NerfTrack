@@ -4,9 +4,9 @@ import { Icon } from './Icons';
 export function DiagnosticsView({ diagnostics }: { diagnostics: DiagnosticsSummary }) {
   const rows = [
     ['Events observed', diagnostics.totalEvents.toLocaleString(), 'activity'],
-    ['Priced events', diagnostics.pricedEvents.toLocaleString(), 'check'],
-    ['Pending pricing', diagnostics.pendingEvents.toLocaleString(), 'clock'],
-    ['Rejected events', diagnostics.rejectedEvents.toLocaleString(), 'alert'],
+    ['Priced token events', diagnostics.pricedEvents.toLocaleString(), 'check'],
+    ['Pricing pending', diagnostics.pendingEvents.toLocaleString(), 'clock'],
+    ['Rejected observations', diagnostics.rejectedEvents.toLocaleString(), 'alert'],
     ['Partial-line retries', diagnostics.partialLineRetries.toLocaleString(), 'refresh'],
     ['Monitoring gaps', diagnostics.monitoringGaps.toLocaleString(), 'history'],
   ] as const;
@@ -63,7 +63,8 @@ export function DiagnosticsView({ diagnostics }: { diagnostics: DiagnosticsSumma
             Diagnostics never include prompts, account identifiers, or full local paths.
           </strong>
           <span>
-            Use this page to identify data-quality interruptions before relying on a quote.
+            Use this page to identify unpriced models, reset boundaries, and
+            data-quality interruptions before relying on an estimate.
           </span>
         </div>
       </div>

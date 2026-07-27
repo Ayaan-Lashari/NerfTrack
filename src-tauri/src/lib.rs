@@ -6,7 +6,6 @@ pub mod discovery;
 pub mod estimator;
 pub mod models;
 pub mod parser;
-pub mod pricing;
 pub mod storage;
 
 use std::path::PathBuf;
@@ -23,6 +22,7 @@ pub struct AppState {
     pub database: Mutex<storage::Database>,
     codex_home_override: Mutex<Option<PathBuf>>,
     codex_binary_override: Mutex<Option<PathBuf>>,
+    collection_paused: Mutex<bool>,
 }
 
 impl AppState {
@@ -31,12 +31,20 @@ impl AppState {
             database: Mutex::new(storage::Database::open()?),
             codex_home_override: Mutex::new(None),
             codex_binary_override: Mutex::new(None),
+            collection_paused: Mutex::new(false),
         };
         let _ = state.reconcile();
         Ok(state)
     }
 
     fn reconcile(&self) -> Result<(), String> {
+        if *self
+            .collection_paused
+            .lock()
+            .map_err(|_| "collection state is unavailable".to_string())?
+        {
+            return Ok(());
+        }
         let home_override = self
             .codex_home_override
             .lock()
@@ -59,12 +67,66 @@ impl AppState {
             .map_err(|_| "database writer is unavailable".to_string())?;
         let previous = database.load_checkpoint_states()?;
         let collection = collector::scan_codex_home_with_state(&home, &previous)?;
-        let observed_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as i64)
-            .unwrap_or_default();
-        let pricing = pricing::embedded_codex_snapshot(&collection.events, observed_at_ms);
-        database.persist_collection(&collection, None, Some(&pricing))?;
+        database.persist_collection::<()>(&collection, None, None)?;
+        Ok(())
+    }
+
+    fn pause_collection(&self) -> Result<(), String> {
+        *self
+            .collection_paused
+            .lock()
+            .map_err(|_| "collection state is unavailable".to_string())? = true;
+        Ok(())
+    }
+
+    fn resume_collection(&self) -> Result<(), String> {
+        *self
+            .collection_paused
+            .lock()
+            .map_err(|_| "collection state is unavailable".to_string())? = false;
+        Ok(())
+    }
+
+    fn baseline_collection_at_current_end(&self) -> Result<(), String> {
+        let home_override = self
+            .codex_home_override
+            .lock()
+            .map_err(|_| "discovery state is unavailable".to_string())?
+            .clone();
+        let binary_override = self
+            .codex_binary_override
+            .lock()
+            .map_err(|_| "discovery state is unavailable".to_string())?
+            .clone();
+        let (binary, _) = discovery::discover_codex_binary(binary_override.as_deref());
+        let Some(home) =
+            discovery::discover_codex_home_for_mode(home_override.as_deref(), binary.is_none()).0
+        else {
+            return Ok(());
+        };
+        let collection = collector::scan_codex_home_with_state(&home, &Default::default())?;
+        let baseline_events = collection
+            .events
+            .iter()
+            .filter(|event| {
+                event.quota_used_percent.is_some()
+                    && event
+                        .quota_window_minutes
+                        .is_some_and(|minutes| (minutes - 10_080.0).abs() <= 240.0)
+            })
+            .max_by_key(|event| event.timestamp_ms)
+            .cloned()
+            .into_iter()
+            .collect();
+        let checkpoints_only = collector::CollectionSummary {
+            events: baseline_events,
+            checkpoints: collection.checkpoints,
+            ..Default::default()
+        };
+        self.database
+            .lock()
+            .map_err(|_| "database writer is unavailable".to_string())?
+            .persist_collection::<()>(&checkpoints_only, None, None)?;
         Ok(())
     }
 
@@ -265,6 +327,29 @@ fn reset_annotations(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn reset_all_data(state: State<'_, AppState>) -> Result<(), String> {
+    state.pause_collection()?;
+    let result = state
+        .database
+        .lock()
+        .map_err(|_| "database writer is unavailable".to_string())?
+        .reset_all_data();
+    if let Err(error) = result {
+        let _ = state.resume_collection();
+        return Err(error);
+    }
+    let baseline_result = state.baseline_collection_at_current_end();
+    let resume_result = state.resume_collection();
+    baseline_result.and(resume_result)
+}
+
+#[tauri::command]
+fn restore_graph_data(state: State<'_, AppState>) -> Result<(), String> {
+    state.resume_collection()?;
+    state.reconcile()
+}
+
+#[tauri::command]
 async fn get_diagnostics_summary(
     state: State<'_, AppState>,
 ) -> Result<models::DiagnosticsSummary, String> {
@@ -356,18 +441,16 @@ async fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String>
 #[tauri::command]
 fn update_settings(
     state: State<'_, AppState>,
-    settings: models::AdvancedSettings,
+    settings: AppSettings,
 ) -> Result<AppSettings, String> {
     settings.validate()?;
     let mut database = state
         .database
         .lock()
         .map_err(|_| "database writer is unavailable".to_string())?;
-    let mut current = database.load_settings()?;
-    current.advanced = settings;
-    database.save_settings(&current)?;
+    database.save_settings(&settings)?;
     database.rebuild_quotes()?;
-    Ok(current)
+    Ok(settings)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -381,6 +464,8 @@ pub fn run() {
             get_history,
             get_annotations,
             reset_annotations,
+            reset_all_data,
+            restore_graph_data,
             get_diagnostics_summary,
             retry_detection,
             select_codex_home,

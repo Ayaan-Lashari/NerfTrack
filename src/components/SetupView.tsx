@@ -43,30 +43,6 @@ const settingsRows: Array<{
     options: [10, 20, 30],
     suffix: ' seconds',
   },
-  {
-    key: 'settlementWindowSeconds',
-    icon: 'clock',
-    title: 'Settlement window',
-    description: 'Time to wait for Codex usage to settle before recording.',
-    options: [60, 90, 120],
-    suffix: ' seconds',
-  },
-  {
-    key: 'minimumQuotaMovementPoints',
-    icon: 'trend',
-    title: 'Minimum movement',
-    description: 'Ignore changes below this threshold.',
-    options: [1, 3, 5],
-    suffix: '%',
-  },
-  {
-    key: 'lowUsageQuarantinePercent',
-    icon: 'shield',
-    title: 'Low-usage quarantine',
-    description: 'Ignore very small weeks below this threshold.',
-    options: [1, 3, 5],
-    suffix: '%',
-  },
 ];
 
 export function SetupView({
@@ -86,8 +62,8 @@ export function SetupView({
         <h1>Set up Nerfify</h1>
         <p>
           {guiMode
-            ? 'Connect local Codex desktop data to begin tracking your weekly API equivalent.'
-            : 'Connect local Codex data from the desktop app or CLI to begin tracking your weekly API equivalent.'}
+            ? 'Connect local Codex desktop data to estimate weekly API-equivalent value from tokens.'
+            : 'Connect local Codex data from the desktop app or CLI to estimate weekly API-equivalent value from tokens.'}
         </p>
       </header>
       <div className="discovery-grid">

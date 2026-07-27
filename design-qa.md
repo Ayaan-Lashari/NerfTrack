@@ -1,8 +1,8 @@
 # Design QA
 
-- Source visual truth: `/var/folders/m2/r8bvqn691ps3zh9yhzytr7yc0000gr/T/TemporaryItems/NSIRD_screencaptureui_cKKfNu/Screenshot 2026-07-23 at 2.56.01 PM.png`
-- Implementation screenshot: `/Users/MAK/Desktop/Nerfify/design-qa-implementation-final.png`
-- Focused comparison: `/Users/MAK/Desktop/Nerfify/design-qa-comparison-final.png`
+- Source visual truth: `design-reference/dashboard-reference.png`
+- Implementation screenshot: `design-qa-implementation-final.png`
+- Focused comparison: `design-qa-comparison-final.png`
 - Browser viewport: 1280 × 720 CSS pixels
 - Source pixels: 821 × 263
 - Implementation pixels: 1280 × 720 at device scale factor 1

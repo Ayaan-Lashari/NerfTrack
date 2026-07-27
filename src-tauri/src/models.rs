@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const ALGORITHM_VERSION: &str = "nerfify-estimator-v3";
+pub const ALGORITHM_VERSION: &str = "nerfify-token-api-equivalent-v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -134,7 +134,7 @@ pub struct AppStatus {
     pub data_quality: DataQuality,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuoteStatus {
     Valid,
@@ -156,16 +156,20 @@ pub enum Confidence {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CurrentQuote {
-    pub value_usd: Option<f64>,
-    pub change_usd: Option<f64>,
+    pub estimated_weekly_value_usd: Option<f64>,
+    pub change_value_usd: Option<f64>,
     pub change_percent: Option<f64>,
     pub observed_cost_usd: Option<f64>,
     pub weekly_used_percent: Option<f64>,
     pub reset_at: Option<i64>,
+    pub reset_reason: Option<String>,
     pub status: QuoteStatus,
-    pub dominant_model: Option<String>,
     pub algorithm_version: String,
     pub confidence: Confidence,
+    pub valid_observation_count: u64,
+    pub percentage_coverage: Option<f64>,
+    pub pricing_source: Option<String>,
+    pub model_status: Option<String>,
     pub note: Option<String>,
 }
 
@@ -173,12 +177,13 @@ pub struct CurrentQuote {
 #[serde(rename_all = "camelCase")]
 pub struct HistoryPoint {
     pub timestamp: i64,
-    pub value_usd: Option<f64>,
-    pub raw_value_usd: Option<f64>,
+    pub estimated_weekly_value_usd: Option<f64>,
+    pub observed_cost_usd: Option<f64>,
     pub weekly_used_percent: Option<f64>,
+    pub reset_at: Option<i64>,
+    pub reset_reason: Option<String>,
     pub is_finalized: bool,
     pub is_heartbeat: bool,
-    pub dominant_model: Option<String>,
     pub epoch: Option<i64>,
 }
 
@@ -186,9 +191,9 @@ pub struct HistoryPoint {
 #[serde(rename_all = "camelCase")]
 pub struct RangeStatistics {
     pub range: Range,
-    pub baseline_value_usd: Option<f64>,
-    pub current_value_usd: Option<f64>,
-    pub delta_usd: Option<f64>,
+    pub baseline_estimated_weekly_value_usd: Option<f64>,
+    pub current_estimated_weekly_value_usd: Option<f64>,
+    pub delta_value_usd: Option<f64>,
     pub delta_percent: Option<f64>,
     pub point_count: usize,
     pub partial: bool,
@@ -248,11 +253,6 @@ pub struct AdvancedSettings {
     pub refresh_interval_seconds: u64,
     pub reconciliation_interval_hours: u64,
     pub monitoring_gap_minutes: u64,
-    pub settlement_window_seconds: u64,
-    pub minimum_quota_movement_points: f64,
-    pub minimum_eligible_cost_usd: f64,
-    pub minimum_events: u64,
-    pub low_usage_quarantine_percent: f64,
     pub reduced_motion: bool,
 }
 
@@ -262,11 +262,6 @@ impl Default for AdvancedSettings {
             refresh_interval_seconds: 10,
             reconciliation_interval_hours: 1,
             monitoring_gap_minutes: 5,
-            settlement_window_seconds: 60,
-            minimum_quota_movement_points: 3.0,
-            minimum_eligible_cost_usd: 0.25,
-            minimum_events: 2,
-            low_usage_quarantine_percent: 3.0,
             reduced_motion: false,
         }
     }
@@ -283,27 +278,6 @@ impl AdvancedSettings {
         if !(1..=30).contains(&self.monitoring_gap_minutes) {
             return Err("monitoring gap must be between 1 and 30 minutes".into());
         }
-        if !(30..=120).contains(&self.settlement_window_seconds) {
-            return Err("settlement window must be between 30 and 120 seconds".into());
-        }
-        if !self.minimum_quota_movement_points.is_finite()
-            || !(0.5..=25.0).contains(&self.minimum_quota_movement_points)
-        {
-            return Err("minimum quota movement must be between 0.5 and 25 points".into());
-        }
-        if !self.minimum_eligible_cost_usd.is_finite()
-            || !(0.25..=100.0).contains(&self.minimum_eligible_cost_usd)
-        {
-            return Err("minimum eligible cost must be between 0.25 and 100 USD".into());
-        }
-        if !(1..=100).contains(&self.minimum_events) {
-            return Err("minimum events must be between 1 and 100".into());
-        }
-        if !self.low_usage_quarantine_percent.is_finite()
-            || !(0.0..=25.0).contains(&self.low_usage_quarantine_percent)
-        {
-            return Err("low-usage quarantine must be between 0 and 25 percent".into());
-        }
         Ok(())
     }
 }
@@ -318,6 +292,37 @@ pub struct AppSettings {
     pub local_only: bool,
     pub telemetry: bool,
     pub auto_updater: bool,
+    #[serde(default)]
+    pub custom_pricing: Vec<CustomPriceOverride>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomPriceOverride {
+    pub model_id: String,
+    #[serde(default)]
+    pub alias: Option<String>,
+    pub input_usd_per_million: f64,
+    pub cached_input_usd_per_million: f64,
+    pub output_usd_per_million: f64,
+}
+
+impl CustomPriceOverride {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model_id.trim().is_empty() {
+            return Err("custom pricing model ID is required".into());
+        }
+        for value in [
+            self.input_usd_per_million,
+            self.cached_input_usd_per_million,
+            self.output_usd_per_million,
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err("custom token prices must be finite non-negative USD amounts".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for AppSettings {
@@ -329,7 +334,18 @@ impl Default for AppSettings {
             local_only: true,
             telemetry: false,
             auto_updater: false,
+            custom_pricing: Vec::new(),
         }
+    }
+}
+
+impl AppSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        self.advanced.validate()?;
+        for price in &self.custom_pricing {
+            price.validate()?;
+        }
+        Ok(())
     }
 }
 

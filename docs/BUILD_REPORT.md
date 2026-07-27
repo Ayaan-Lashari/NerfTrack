@@ -7,12 +7,12 @@ Date: 2026-07-23
 This pass delivers a Tauri 2 desktop scaffold with React, TypeScript, Vite,
 Rust, SQLite, the Nerfify visual shell, reference assets, typed UI DTOs,
 native command boundaries, shared desktop-app/CLI discovery, Rust
-parser/pricing/storage/estimator foundations, documentation, and CI/package
+parser/storage/credit-estimator foundations, documentation, and CI/package
 configuration.
 
 The UI is a browser-reviewable vertical slice with Home, Setup, Diagnostics,
 History, and Settings views. The Rust side includes startup Codex JSONL
-reconciliation with byte-offset checkpoints, provider/pricing classification,
+reconciliation with byte-offset checkpoints and explicit credit-source classification,
 SQLite migrations, account-key hashing, estimator primitives, and App Server
 supervision primitives. Desktop-app and CLI records use the same local
 pipeline; desktop mode does not require a CLI executable or App Server.
@@ -72,13 +72,12 @@ release steps documented in `docs/RELEASE.md`.
 
 The browser-only review build still uses deterministic fixtures. Native Tauri
 builds periodically reconcile discovered or manually selected Codex JSONL
-sources, price official GPT-5-family usage locally, persist embedded weekly
-quota observations, rebuild settled cost/quota-delta intervals, freeze
-saturated epochs, enforce configured estimator thresholds, and expose
-all-model weighted current/history DTOs with reset-aware chart segments.
+sources, persist weekly quota observations and explicit logged-credit fields,
+rebuild positive paired-delta measurements, smooth valid rates with a median,
+and expose reset-aware credit/value history DTOs.
 
 The CLI App Server supervisor remains available as a primitive but is not
 required when JSONL records already contain the Codex weekly quota observation.
-Remote pricing refresh, account switching boundaries, and trend classification
-remain future work; missing inputs stay pending rather than becoming fabricated
-zeroes.
+Provider token pricing and token-cost fallback are intentionally not part of
+this estimator; missing logged-credit inputs stay pending rather than becoming
+fabricated zeroes.

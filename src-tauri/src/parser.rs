@@ -101,6 +101,57 @@ fn finite_f64(value: Option<&Value>) -> Option<f64> {
         .filter(|number| number.is_finite())
 }
 
+fn first_finite_f64(value: &Value, paths: &[&[&str]]) -> Option<f64> {
+    paths
+        .iter()
+        .find_map(|path| finite_f64(nested(value, &[*path])))
+}
+
+fn ignored_legacy_billing_fields(value: &Value, trusted_codex_credit_record: bool) {
+    // These are explicit usage fields only. Token counts and the embedded API
+    // pricing table are deliberately never used to manufacture credits.
+    // A literal field name alone is not enough: it must belong to the official
+    // Codex weekly-limit record that this estimator is allowed to monitor.
+    if !trusted_codex_credit_record {
+        return;
+    }
+    let native = first_finite_f64(
+        value,
+        &[
+            &["credits"],
+            &["credit"],
+            &["usage_credits"],
+            &["usage", "credits"],
+            &["payload", "credits"],
+            &["payload", "usage", "credits"],
+            &["payload", "info", "credits"],
+        ],
+    )
+    .filter(|credits| *credits >= 0.0);
+    if native.is_some() {
+        return;
+    }
+    let logged_charge_usd = first_finite_f64(
+        value,
+        &[
+            &["charge_usd"],
+            &["chargeUsd"],
+            &["usage_charge_usd"],
+            &["usageChargeUsd"],
+            &["cost_usd"],
+            &["costUSD"],
+            &["usage", "charge_usd"],
+            &["usage", "cost_usd"],
+            &["payload", "charge_usd"],
+            &["payload", "cost_usd"],
+            &["payload", "usage", "charge_usd"],
+            &["payload", "usage", "cost_usd"],
+        ],
+    )
+    .filter(|charge| *charge >= 0.0);
+    let _ = logged_charge_usd;
+}
+
 fn weekly_rate_limit(rate_limits: Option<&Value>) -> Option<&Value> {
     ["primary", "secondary"]
         .into_iter()
@@ -341,6 +392,11 @@ pub fn parse_jsonl_line_with_state(
     let quota_window_minutes =
         finite_f64(weekly_limit.and_then(|window| window.get("window_minutes")));
     let plan = rate_limits.and_then(|limits| string_at(limits, &[&["plan_type"], &["plan"]]));
+    let trusted_codex_credit_record = quota_limit_id
+        .as_deref()
+        .is_some_and(|limit| limit.eq_ignore_ascii_case("codex"))
+        && quota_window_minutes.is_some_and(|minutes| (minutes - 10_080.0).abs() <= 240.0);
+    ignored_legacy_billing_fields(&value, trusted_codex_credit_record);
     let authenticated_official_codex = value
         .get("authenticated_codex")
         .and_then(Value::as_bool)
@@ -436,6 +492,15 @@ pub fn event_fingerprint(event: &UsageEvent) -> String {
     digest.update(event.cached_input_tokens.to_le_bytes());
     digest.update(event.output_tokens.to_le_bytes());
     digest.update(event.reasoning_tokens.to_le_bytes());
+    digest.update(event.quota_used_percent.unwrap_or_default().to_le_bytes());
+    digest.update(event.quota_reset_at_ms.unwrap_or_default().to_le_bytes());
+    digest.update(
+        event
+            .quota_limit_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     format!("fingerprint:{:x}", digest.finalize())
 }
 
@@ -634,5 +699,14 @@ mod tests {
         .expect("short event");
         assert_eq!(short.quota_used_percent, None);
         assert_eq!(short.quota_window_minutes, None);
+    }
+
+    #[test]
+    fn ignores_legacy_billing_fields_and_keeps_tokens() {
+        let event = parse_jsonl_line(
+            r#"{"timestamp":1735689600,"model":"gpt-5-codex","credits":0.42,"usage":{"input_tokens":10,"output_tokens":4},"rate_limits":{"limit_id":"codex","primary":{"used_percent":42,"window_minutes":10080,"resets_at":1736294400}}}"#,
+        )
+        .expect("event");
+        assert_eq!(event.input_tokens, 10);
     }
 }

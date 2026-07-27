@@ -16,7 +16,7 @@ export function HistoryView({ history, range, onRangeChange }: HistoryViewProps)
       <header className="page-heading history-heading">
         <div>
           <h1>History</h1>
-          <p>Finalized quotes and workload-comparable observations.</p>
+          <p>Finalized full-week API-equivalent estimates from valid paired token observations.</p>
         </div>
         <div className="range-tabs compact-tabs">
           {ranges.map((item) => (
@@ -34,23 +34,23 @@ export function HistoryView({ history, range, onRangeChange }: HistoryViewProps)
         <div>
           <span>Current</span>
           <strong>
-            {history.statistics.currentValueUsd === null
+            {history.statistics.currentEstimatedWeeklyValueUsd === null
               ? '—'
-              : `$${history.statistics.currentValueUsd.toFixed(2)}`}
+              : `$${history.statistics.currentEstimatedWeeklyValueUsd.toFixed(2)}`}
           </strong>
         </div>
         <div>
           <span>Range change</span>
           <strong
             className={
-              history.statistics.deltaUsd !== null && history.statistics.deltaUsd < 0
+              history.statistics.deltaValueUsd !== null && history.statistics.deltaValueUsd < 0
                 ? 'negative'
                 : ''
             }
           >
-            {history.statistics.deltaUsd === null
+            {history.statistics.deltaValueUsd === null
               ? '—'
-              : `${history.statistics.deltaUsd < 0 ? '−' : '+'}$${Math.abs(history.statistics.deltaUsd).toFixed(2)}`}
+              : `${history.statistics.deltaValueUsd < 0 ? '−' : '+'}$${Math.abs(history.statistics.deltaValueUsd).toFixed(2)}`}
           </strong>
         </div>
         <div>
@@ -73,9 +73,10 @@ export function HistoryView({ history, range, onRangeChange }: HistoryViewProps)
         <div className="history-table" role="table" aria-label="Recent observations">
           <div className="history-table-row history-table-header" role="row">
             <span>Date</span>
-            <span>Estimated value</span>
+            <span>Estimated weekly value</span>
+            <span>Observed token cost</span>
             <span>Weekly usage</span>
-            <span>Model</span>
+            <span>Reset window</span>
             <span>Status</span>
           </div>
           {recent.map((point) => (
@@ -88,11 +89,16 @@ export function HistoryView({ history, range, onRangeChange }: HistoryViewProps)
                   minute: '2-digit',
                 })}
               </span>
-              <strong>{point.valueUsd === null ? '—' : `$${point.valueUsd.toFixed(2)}`}</strong>
+              <strong>
+                {point.estimatedWeeklyValueUsd === null
+                  ? '—'
+                  : `$${point.estimatedWeeklyValueUsd.toFixed(2)}`}
+              </strong>
+              <span>{point.observedCostUsd === null ? '—' : `$${point.observedCostUsd.toFixed(2)}`}</span>
               <span>
                 {point.weeklyUsedPercent === null ? '—' : `${Math.round(point.weeklyUsedPercent)}%`}
               </span>
-              <code>{point.dominantModel ?? 'unknown'}</code>
+              <span>{point.resetReason?.replaceAll('_', ' ') ?? 'weekly window'}</span>
               <span className={`table-status ${point.isFinalized ? 'finalized' : 'settling'}`}>
                 {point.isFinalized ? 'Finalized' : 'Settling'}
               </span>
@@ -103,8 +109,8 @@ export function HistoryView({ history, range, onRangeChange }: HistoryViewProps)
       <div className="pre-nerfify-note">
         <Icon name="info" size={18} />
         <span>
-          <strong>Pre-Nerfify usage history</strong> may be available for cost totals, but
-          weekly-value quotes begin only with a reliable paired cost and quota measurement.
+          <strong>Pending observations are omitted</strong> from the graph until a positive
+          token-cost delta is paired with a positive weekly-usage delta.
         </span>
       </div>
     </section>

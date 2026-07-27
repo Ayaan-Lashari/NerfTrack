@@ -11,13 +11,13 @@ The implementation carries forward the following reference decisions:
 - near-black desktop canvas with a quiet graphite navigation rail;
 - green accent for active navigation, connected/valid state, chart stroke, and
   primary action;
-- large weekly equivalent quote with compact range controls above the chart;
+- large estimated full-week value with compact range controls above the chart;
 - responsive SVG area chart with reset annotation, keyboard scrubbing, crosshair
   state, and reduced-motion support;
-- four metric cards for allowance use, reset timing, observed local cost, and
-  connection/validity status;
+- metric cards for weekly usage, observed credits, reset timing, estimated
+  credits, and confidence;
 - setup cards for Codex data folder, executable, provider/model context, and
-  monitoring thresholds;
+  refresh monitoring;
 - iconography implemented as local SVG components rather than emoji or a chart
   dependency.
 

@@ -3,18 +3,202 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::collector::{CollectionSummary, PersistedCheckpoint};
 use crate::models::{
-    AdvancedSettings, Annotation, AnnotationKind, AppSettings, Confidence, CurrentQuote,
-    DiagnosticReason, DiagnosticsSummary, HistoryPoint, HistoryResponse, QuoteStatus, Range,
-    RangeStatistics, ALGORITHM_VERSION,
+    Annotation, AnnotationKind, AppSettings, Confidence, CurrentQuote, DiagnosticReason,
+    DiagnosticsSummary, HistoryPoint, HistoryResponse, QuoteStatus, Range, RangeStatistics,
+    ALGORITHM_VERSION,
 };
 use crate::parser::{event_fingerprint, UsageEvent};
-use crate::pricing::{
-    classify_provider_eligibility, normalize_model_id, price_event, Eligibility, PricingSnapshot,
-};
+
+const WEEKLY_WINDOW_MINUTES: f64 = 10_080.0;
+const WEEKLY_WINDOW_TOLERANCE_MINUTES: f64 = 240.0;
+
+#[derive(Clone, Copy)]
+struct ApiPrice {
+    input: f64,
+    cached_input: f64,
+    output: f64,
+}
+
+// Verified 2026-07-24 from OpenAI's model catalog and individual model pages;
+// see docs/CALCULATION.md for the source links. Rates are USD / 1M text tokens.
+fn official_price(model: &str) -> Option<ApiPrice> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "gpt-5.6" | "gpt-5.6-sol" | "chat-latest" => Some(ApiPrice {
+            input: 5.0,
+            cached_input: 0.5,
+            output: 30.0,
+        }),
+        "gpt-5.6-terra" | "gpt-5.4" => Some(ApiPrice {
+            input: 2.5,
+            cached_input: 0.25,
+            output: 15.0,
+        }),
+        "gpt-5.6-luna" => Some(ApiPrice {
+            input: 1.0,
+            cached_input: 0.1,
+            output: 6.0,
+        }),
+        "gpt-5.5" => Some(ApiPrice {
+            input: 5.0,
+            cached_input: 0.5,
+            output: 30.0,
+        }),
+        "gpt-5.5-pro" | "gpt-5.4-pro" => Some(ApiPrice {
+            input: 30.0,
+            cached_input: 0.0,
+            output: 180.0,
+        }),
+        "gpt-5.4-mini" => Some(ApiPrice {
+            input: 0.75,
+            cached_input: 0.075,
+            output: 4.5,
+        }),
+        "gpt-5.4-nano" => Some(ApiPrice {
+            input: 0.2,
+            cached_input: 0.02,
+            output: 1.25,
+        }),
+        "gpt-5.3-codex" | "gpt-5.2-codex" => Some(ApiPrice {
+            input: 1.75,
+            cached_input: 0.175,
+            output: 14.0,
+        }),
+        "gpt-5" | "gpt-5-codex" | "gpt-5.1-codex" | "gpt-5.1-codex-max" | "gpt-5-chat-latest" => {
+            Some(ApiPrice {
+                input: 1.25,
+                cached_input: 0.125,
+                output: 10.0,
+            })
+        }
+        "gpt-5.1-codex-mini" | "gpt-5-mini" => Some(ApiPrice {
+            input: 0.25,
+            cached_input: 0.025,
+            output: 2.0,
+        }),
+        "gpt-5-nano" => Some(ApiPrice {
+            input: 0.05,
+            cached_input: 0.005,
+            output: 0.4,
+        }),
+        "codex-mini-latest" => Some(ApiPrice {
+            input: 1.50,
+            cached_input: 0.375,
+            output: 6.0,
+        }),
+        "gpt-4.1" => Some(ApiPrice {
+            input: 2.0,
+            cached_input: 0.5,
+            output: 8.0,
+        }),
+        "gpt-4.1-mini" => Some(ApiPrice {
+            input: 0.4,
+            cached_input: 0.1,
+            output: 1.6,
+        }),
+        "gpt-4.1-nano" => Some(ApiPrice {
+            input: 0.1,
+            cached_input: 0.025,
+            output: 0.4,
+        }),
+        "gpt-4o" => Some(ApiPrice {
+            input: 2.5,
+            cached_input: 1.25,
+            output: 10.0,
+        }),
+        "gpt-4o-mini" => Some(ApiPrice {
+            input: 0.15,
+            cached_input: 0.075,
+            output: 0.6,
+        }),
+        "o1" => Some(ApiPrice {
+            input: 15.0,
+            cached_input: 7.5,
+            output: 60.0,
+        }),
+        "o3" => Some(ApiPrice {
+            input: 2.0,
+            cached_input: 0.5,
+            output: 8.0,
+        }),
+        "o3-mini" | "o4-mini" => Some(ApiPrice {
+            input: 1.1,
+            cached_input: 0.275,
+            output: 4.4,
+        }),
+        _ => None,
+    }
+}
+
+fn event_cost(event: &UsageEvent, settings: &AppSettings) -> Result<(f64, &'static str), String> {
+    let model = event.model.trim().to_ascii_lowercase().replace('/', "-");
+    let custom = settings.custom_pricing.iter().find(|override_price| {
+        override_price.model_id.trim().eq_ignore_ascii_case(&model)
+            || override_price
+                .alias
+                .as_deref()
+                .is_some_and(|alias| alias.trim().eq_ignore_ascii_case(&model))
+    });
+    let (price, source) = if let Some(price) = custom {
+        (
+            ApiPrice {
+                input: price.input_usd_per_million,
+                cached_input: price.cached_input_usd_per_million,
+                output: price.output_usd_per_million,
+            },
+            "custom",
+        )
+    } else if let Some(price) = official_price(&model) {
+        (price, "official")
+    } else {
+        return Err(format!(
+            "unknown API price for model {model}; add a local custom price override"
+        ));
+    };
+    // Official GPT-5.4/5.5/5.6 long-context rules apply 2x input and 1.5x output
+    // above 272K input tokens. Cache-write token counts are not present in Codex JSONL,
+    // so they remain pending in the cached-input bucket instead of being guessed.
+    let long_context = event.long_context || event.input_tokens > 272_000;
+    let documented_long_context = model.starts_with("gpt-5.4")
+        || model.starts_with("gpt-5.5")
+        || model.starts_with("gpt-5.6");
+    let multiplier_input = if long_context && documented_long_context {
+        2.0
+    } else {
+        1.0
+    };
+    let multiplier_output = if long_context && documented_long_context {
+        1.5
+    } else {
+        1.0
+    };
+    // `input_tokens` includes cached input and `reasoning_tokens` is an output
+    // detail in Codex/Responses records. Charge each physical token once.
+    let uncached_input = event.input_tokens.saturating_sub(event.cached_input_tokens);
+    let billed_output = if event.output_tokens > 0 {
+        event.output_tokens
+    } else {
+        event.reasoning_tokens
+    };
+    let cost = (uncached_input as f64 * price.input * multiplier_input
+        + event.cached_input_tokens as f64 * price.cached_input
+        + billed_output as f64 * price.output * multiplier_output)
+        / 1_000_000.0;
+    if cost.is_finite() && cost >= 0.0 {
+        Ok((cost, source))
+    } else {
+        Err("non-finite token-derived API cost".into())
+    }
+}
+
+#[derive(Clone)]
+struct StoredUsageForPricing {
+    fingerprint: String,
+    event: UsageEvent,
+}
 
 pub struct Database {
     pub path: PathBuf,
@@ -22,34 +206,38 @@ pub struct Database {
 }
 
 pub struct LatestQuotaObservation {
+    pub account_key: Option<String>,
+    pub limit_id: Option<String>,
+    pub observed_at_ms: i64,
     pub used_percent: f64,
     pub reset_at_ms: Option<i64>,
     pub plan: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuotaPoint {
     account_key: Option<String>,
     limit_id: Option<String>,
     observed_at_ms: i64,
-    reset_at_ms: i64,
+    reset_at_ms: Option<i64>,
     used_percent: f64,
 }
 
-struct WeightedQuote {
-    point: HistoryPoint,
-    epoch: i64,
-    observed_cost_usd: f64,
+#[derive(Clone)]
+struct WindowGroup {
+    account_key: Option<String>,
+    limit_id: Option<String>,
+    reset_at_ms: Option<i64>,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    reset_reason: String,
+    points: Vec<QuotaPoint>,
 }
 
-type EpochKey = (Option<String>, Option<String>, i64);
-
-#[derive(Default)]
-struct EpochAggregate {
-    cost_usd: f64,
-    quota_points: f64,
-    model: Option<String>,
-    mixed: bool,
+#[derive(Clone)]
+struct StoredPoint {
+    point: HistoryPoint,
+    window_id: i64,
 }
 
 fn now_ms() -> i64 {
@@ -59,50 +247,14 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-fn comparison_baseline(quotes: &[WeightedQuote], cutoff_ms: i64, tolerance_ms: i64) -> Option<f64> {
-    let candidate = quotes
-        .iter()
-        .rev()
-        .find(|quote| quote.point.timestamp <= cutoff_ms)?;
-    (cutoff_ms - candidate.point.timestamp <= tolerance_ms)
-        .then_some(candidate.point.value_usd)
-        .flatten()
-}
-
-fn graph_points(
-    quotes: &[WeightedQuote],
-    since_ms: i64,
-    current_epoch: Option<i64>,
-    keep_current_detail: bool,
-) -> Vec<HistoryPoint> {
-    let mut completed = HashMap::new();
-    let mut current = Vec::new();
-    for quote in quotes
-        .iter()
-        .filter(|quote| quote.point.timestamp >= since_ms)
-    {
-        if keep_current_detail && Some(quote.epoch) == current_epoch {
-            current.push(quote.point.clone());
-        } else {
-            completed.insert(quote.epoch, quote.point.clone());
-        }
-    }
-    let mut points = completed.into_values().chain(current).collect::<Vec<_>>();
-    points.sort_by_key(|point| point.timestamp);
-    for point in &mut points {
-        point.epoch = None;
-    }
-    points
-}
-
 fn empty_history(range: Range) -> HistoryResponse {
     HistoryResponse {
         bucket: range.bucket().into(),
         statistics: RangeStatistics {
             range,
-            baseline_value_usd: None,
-            current_value_usd: None,
-            delta_usd: None,
+            baseline_estimated_weekly_value_usd: None,
+            current_estimated_weekly_value_usd: None,
+            delta_value_usd: None,
             delta_percent: None,
             point_count: 0,
             partial: true,
@@ -116,8 +268,11 @@ pub fn data_directory() -> PathBuf {
         return PathBuf::from(path);
     }
     #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join("Library/Application Support/Nerfify");
+    if let Some(home) = crate::discovery::home_dir() {
+        return home
+            .join("Library")
+            .join("Application Support")
+            .join("Nerfify");
     }
     #[cfg(target_os = "windows")]
     if let Some(app_data) = std::env::var_os("APPDATA") {
@@ -128,8 +283,8 @@ pub fn data_directory() -> PathBuf {
         return PathBuf::from(data_home).join("Nerfify");
     }
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/share/Nerfify");
+    if let Some(home) = crate::discovery::home_dir() {
+        return home.join(".local").join("share").join("Nerfify");
     }
     PathBuf::from(".nerfify")
 }
@@ -144,20 +299,20 @@ fn open_connection(path: &Path) -> rusqlite::Result<Connection> {
 
 fn preserve_database_files(path: &Path) -> Result<(), String> {
     let recovery = path.with_file_name(format!("nerfify.recovery-{}.db", now_ms()));
+    let base_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("nerfify.db");
     for suffix in ["", "-wal", "-shm"] {
-        let source = if suffix.is_empty() {
-            path.to_path_buf()
-        } else {
-            PathBuf::from(format!("{}{}", path.display(), suffix))
-        };
+        let source = path.with_file_name(format!("{base_name}{suffix}"));
         if !source.exists() {
             continue;
         }
-        let target = if suffix.is_empty() {
-            recovery.clone()
-        } else {
-            PathBuf::from(format!("{}{}", recovery.display(), suffix))
-        };
+        let recovery_name = recovery
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("nerfify.recovery.db");
+        let target = recovery.with_file_name(format!("{recovery_name}{suffix}"));
         fs::rename(&source, &target).map_err(|_| {
             "database is corrupt and recovery copy could not be created".to_string()
         })?;
@@ -208,150 +363,168 @@ impl Database {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap_or_default();
-        if self
-            .connection
+        self.connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON;
-            BEGIN IMMEDIATE;
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                applied_at_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS accounts (
-                account_key TEXT PRIMARY KEY,
-                plan TEXT,
-                created_at_ms INTEGER NOT NULL,
-                last_seen_at_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS source_checkpoints (
-                source_key TEXT PRIMARY KEY,
-                byte_offset INTEGER NOT NULL DEFAULT 0,
-                parser_state_json TEXT NOT NULL DEFAULT '{}',
-                source_active INTEGER NOT NULL DEFAULT 1,
-                updated_at_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS usage_events (
-                fingerprint TEXT PRIMARY KEY,
-                account_key TEXT,
-                timestamp_ms INTEGER NOT NULL,
-                model_id TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                cached_input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                eligible INTEGER NOT NULL DEFAULT 0,
-                pricing_status TEXT NOT NULL,
-                cost_usd REAL,
-                FOREIGN KEY(account_key) REFERENCES accounts(account_key)
-            );
-            CREATE TABLE IF NOT EXISTS pricing_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL,
-                observed_at_ms INTEGER NOT NULL,
-                version TEXT,
-                etag TEXT,
-                sha256 TEXT NOT NULL,
-                is_current INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS quota_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_key TEXT,
-                observed_at_ms INTEGER NOT NULL,
-                reset_at_ms INTEGER,
-                duration_minutes REAL,
-                limit_id TEXT,
-                plan TEXT,
-                used_percent REAL,
-                connection_quality TEXT,
-                FOREIGN KEY(account_key) REFERENCES accounts(account_key)
-            );
-            CREATE TABLE IF NOT EXISTS epochs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_key TEXT,
-                plan TEXT,
-                limit_id TEXT,
-                reset_at_ms INTEGER,
-                started_at_ms INTEGER NOT NULL,
-                ended_at_ms INTEGER,
-                boundary_reason TEXT
-            );
-            CREATE TABLE IF NOT EXISTS measurements (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                epoch_id INTEGER,
-                measured_at_ms INTEGER NOT NULL,
-                cost_delta_usd REAL,
-                quota_delta_points REAL,
-                event_count INTEGER,
-                status TEXT NOT NULL,
-                diagnostic_reason TEXT,
-                FOREIGN KEY(epoch_id) REFERENCES epochs(id)
-            );
-            CREATE TABLE IF NOT EXISTS quotes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp_ms INTEGER NOT NULL,
-                value_usd REAL,
-                raw_value_usd REAL,
-                observed_cost_usd REAL,
-                weekly_used_percent REAL,
-                dominant_model TEXT,
-                confidence TEXT NOT NULL,
-                status TEXT NOT NULL,
-                is_finalized INTEGER NOT NULL DEFAULT 1,
-                algorithm_version TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS annotations (
-                id TEXT PRIMARY KEY,
-                timestamp_ms INTEGER NOT NULL,
-                label TEXT NOT NULL,
-                kind TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS chart_heartbeats (
-                timestamp_ms INTEGER PRIMARY KEY,
-                value_usd REAL,
-                weekly_used_percent REAL
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value_json TEXT NOT NULL,
-                updated_at_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS app_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                started_at_ms INTEGER NOT NULL,
-                ended_at_ms INTEGER,
-                version TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS diagnostics (
-                reason TEXT PRIMARY KEY,
-                count INTEGER NOT NULL DEFAULT 0,
-                updated_at_ms INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_usage_events_account_pricing_time
-                ON usage_events(account_key, pricing_status, timestamp_ms);
-            CREATE INDEX IF NOT EXISTS idx_quota_snapshots_account_limit_time
-                ON quota_snapshots(account_key, limit_id, observed_at_ms, id);
-            CREATE INDEX IF NOT EXISTS idx_quota_snapshots_time
-                ON quota_snapshots(observed_at_ms, id);
-            CREATE INDEX IF NOT EXISTS idx_quotes_algorithm_time
-                ON quotes(algorithm_version, timestamp_ms);
-            INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (1, strftime('%s','now') * 1000);
-            COMMIT;",
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS accounts (
+                    account_key TEXT PRIMARY KEY,
+                    plan TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    last_seen_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS source_checkpoints (
+                    source_key TEXT PRIMARY KEY,
+                    byte_offset INTEGER NOT NULL DEFAULT 0,
+                    parser_state_json TEXT NOT NULL DEFAULT '{}',
+                    source_active INTEGER NOT NULL DEFAULT 1,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS usage_events (
+                    fingerprint TEXT PRIMARY KEY,
+                    account_key TEXT,
+                    timestamp_ms INTEGER NOT NULL,
+                    model_id TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL,
+                    cached_input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    eligible INTEGER NOT NULL DEFAULT 0,
+                    pricing_status TEXT NOT NULL DEFAULT 'not_applicable',
+                    cost_usd REAL,
+                    credits REAL,
+                    logged_charge_usd REAL,
+                    credit_source TEXT NOT NULL DEFAULT 'unavailable',
+                    credit_status TEXT NOT NULL DEFAULT 'pending',
+                    quota_reset_at_ms INTEGER,
+                    quota_limit_id TEXT,
+                    FOREIGN KEY(account_key) REFERENCES accounts(account_key)
+                );
+                CREATE TABLE IF NOT EXISTS pricing_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    observed_at_ms INTEGER NOT NULL,
+                    version TEXT,
+                    etag TEXT,
+                    sha256 TEXT NOT NULL,
+                    is_current INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS quota_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_key TEXT,
+                    observed_at_ms INTEGER NOT NULL,
+                    reset_at_ms INTEGER,
+                    duration_minutes REAL,
+                    limit_id TEXT,
+                    plan TEXT,
+                    used_percent REAL,
+                    connection_quality TEXT,
+                    FOREIGN KEY(account_key) REFERENCES accounts(account_key)
+                );
+                CREATE TABLE IF NOT EXISTS epochs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_key TEXT,
+                    plan TEXT,
+                    limit_id TEXT,
+                    reset_at_ms INTEGER,
+                    started_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    boundary_reason TEXT,
+                    reset_reason TEXT NOT NULL DEFAULT 'uncertain_reset'
+                );
+                CREATE TABLE IF NOT EXISTS measurements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    epoch_id INTEGER,
+                    measured_at_ms INTEGER NOT NULL,
+                    cost_delta_usd REAL,
+                    quota_delta_points REAL,
+                    event_count INTEGER,
+                    status TEXT NOT NULL,
+                    diagnostic_reason TEXT,
+                    previous_observed_at_ms INTEGER,
+                    credits_delta REAL,
+                    percent_delta REAL,
+                    credits_per_1_percent REAL,
+                    estimated_weekly_credits REAL,
+                    estimated_weekly_value_usd REAL,
+                    FOREIGN KEY(epoch_id) REFERENCES epochs(id)
+                );
+                CREATE TABLE IF NOT EXISTS quotes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_ms INTEGER NOT NULL,
+                    value_usd REAL,
+                    raw_value_usd REAL,
+                    observed_cost_usd REAL,
+                    weekly_used_percent REAL,
+                    dominant_model TEXT,
+                    confidence TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    is_finalized INTEGER NOT NULL DEFAULT 1,
+                    algorithm_version TEXT NOT NULL,
+                    estimated_weekly_credits REAL,
+                    estimated_weekly_value_usd REAL,
+                    credits_observed_this_window REAL,
+                    percentage_coverage REAL,
+                    valid_observation_count INTEGER NOT NULL DEFAULT 0,
+                    window_id INTEGER,
+                    window_start_ms INTEGER,
+                    window_end_ms INTEGER,
+                    reported_reset_at_ms INTEGER,
+                    reset_reason TEXT,
+                    credit_source TEXT
+                );
+                CREATE TABLE IF NOT EXISTS annotations (
+                    id TEXT PRIMARY KEY,
+                    timestamp_ms INTEGER NOT NULL,
+                    label TEXT NOT NULL,
+                    kind TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS chart_heartbeats (
+                    timestamp_ms INTEGER PRIMARY KEY,
+                    value_usd REAL,
+                    weekly_used_percent REAL
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS app_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    version TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS diagnostics (
+                    reason TEXT PRIMARY KEY,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_usage_events_credit_time
+                    ON usage_events(account_key, credit_status, timestamp_ms);
+                CREATE INDEX IF NOT EXISTS idx_quota_snapshots_account_limit_time
+                    ON quota_snapshots(account_key, limit_id, observed_at_ms, id);
+                CREATE INDEX IF NOT EXISTS idx_quota_snapshots_time
+                    ON quota_snapshots(observed_at_ms, id);
+                CREATE INDEX IF NOT EXISTS idx_quotes_algorithm_time
+                    ON quotes(algorithm_version, timestamp_ms);
+                INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms)
+                    VALUES (1, strftime('%s','now') * 1000);
+                COMMIT;",
             )
-            .is_err()
-        {
-            let _ = self.connection.execute_batch("ROLLBACK;");
-            return Err("database migration failed".into());
-        }
+            .map_err(|_| "database schema migration failed".to_string())?;
+
         if previous_version < 5 {
             self.connection
                 .execute_batch(
                     "BEGIN IMMEDIATE;
-                    DELETE FROM source_checkpoints;
-                    DELETE FROM usage_events;
                     DELETE FROM pricing_snapshots;
-                    DELETE FROM quota_snapshots;
-                    DELETE FROM epochs;
-                    DELETE FROM measurements;
                     DELETE FROM quotes;
+                    DELETE FROM measurements;
+                    DELETE FROM epochs;
                     DELETE FROM chart_heartbeats;
                     DELETE FROM diagnostics;
                     INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (2, strftime('%s','now') * 1000);
@@ -363,10 +536,104 @@ impl Database {
                 )
                 .map_err(|_| "database live-data migration failed".to_string())?;
         }
+
+        if previous_version < 6 {
+            for (table, column, definition) in [
+                ("usage_events", "credits", "REAL"),
+                ("usage_events", "logged_charge_usd", "REAL"),
+                (
+                    "usage_events",
+                    "credit_source",
+                    "TEXT NOT NULL DEFAULT 'unavailable'",
+                ),
+                (
+                    "usage_events",
+                    "credit_status",
+                    "TEXT NOT NULL DEFAULT 'pending'",
+                ),
+                ("usage_events", "quota_reset_at_ms", "INTEGER"),
+                ("usage_events", "quota_limit_id", "TEXT"),
+                (
+                    "epochs",
+                    "reset_reason",
+                    "TEXT NOT NULL DEFAULT 'uncertain_reset'",
+                ),
+                ("measurements", "previous_observed_at_ms", "INTEGER"),
+                ("measurements", "credits_delta", "REAL"),
+                ("measurements", "percent_delta", "REAL"),
+                ("measurements", "credits_per_1_percent", "REAL"),
+                ("measurements", "estimated_weekly_credits", "REAL"),
+                ("measurements", "estimated_weekly_value_usd", "REAL"),
+                ("quotes", "estimated_weekly_credits", "REAL"),
+                ("quotes", "estimated_weekly_value_usd", "REAL"),
+                ("quotes", "credits_observed_this_window", "REAL"),
+                ("quotes", "percentage_coverage", "REAL"),
+                (
+                    "quotes",
+                    "valid_observation_count",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+                ("quotes", "window_id", "INTEGER"),
+                ("quotes", "window_start_ms", "INTEGER"),
+                ("quotes", "window_end_ms", "INTEGER"),
+                ("quotes", "reported_reset_at_ms", "INTEGER"),
+                ("quotes", "reset_reason", "TEXT"),
+                ("quotes", "credit_source", "TEXT"),
+            ] {
+                if !self.column_exists(table, column)? {
+                    self.connection
+                        .execute(
+                            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                            [],
+                        )
+                        .map_err(|_| format!("unable to migrate {table}.{column}"))?;
+                }
+            }
+            self.connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                    DELETE FROM pricing_snapshots;
+                    DELETE FROM quotes;
+                    DELETE FROM measurements;
+                    DELETE FROM epochs;
+                    DELETE FROM chart_heartbeats;
+                    DELETE FROM diagnostics;
+                    INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (6, strftime('%s','now') * 1000);
+                    PRAGMA user_version=6;
+                    COMMIT;",
+                )
+                .map_err(|error| format!("credit estimator migration failed: {error}"))?;
+        }
+        if previous_version < 7 {
+            self.connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 DELETE FROM quotes;
+                 DELETE FROM measurements;
+                 DELETE FROM epochs;
+                 DELETE FROM chart_heartbeats;
+                 DELETE FROM diagnostics;
+                 UPDATE usage_events SET cost_usd=NULL, pricing_status='pending', eligible=0;
+                 INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (7, strftime('%s','now') * 1000);
+                 PRAGMA user_version=7;
+                 COMMIT;",
+            ).map_err(|error| format!("token estimator migration failed: {error}"))?;
+        }
         if self.load_settings().is_err() {
             self.save_settings(&AppSettings::default())?;
         }
         Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool, String> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|_| "unable to inspect database schema".to_string())?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|_| "unable to inspect database schema".to_string())?;
+        let exists = columns.filter_map(Result::ok).any(|name| name == column);
+        Ok(exists)
     }
 
     fn restrict_file_permissions(&self) {
@@ -417,14 +684,22 @@ impl Database {
     }
 
     pub fn save_settings(&mut self, settings: &AppSettings) -> Result<(), String> {
-        settings.advanced.validate()?;
+        settings.validate()?;
         let json = serde_json::to_string(settings)
             .map_err(|_| "unable to serialize settings".to_string())?;
-        self.connection.execute("INSERT INTO settings (key, value_json, updated_at_ms) VALUES ('app', ?1, ?2) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at_ms=excluded.updated_at_ms", params![json, now_ms()]).map_err(|_| "unable to save settings".to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO settings (key, value_json, updated_at_ms)
+                 VALUES ('app', ?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,
+                 updated_at_ms=excluded.updated_at_ms",
+                params![json, now_ms()],
+            )
+            .map_err(|_| "unable to save settings".to_string())?;
         Ok(())
     }
 
-    pub fn load_checkpoints(&self) -> Result<std::collections::HashMap<String, u64>, String> {
+    pub fn load_checkpoints(&self) -> Result<HashMap<String, u64>, String> {
         Ok(self
             .load_checkpoint_states()?
             .into_iter()
@@ -432,9 +707,7 @@ impl Database {
             .collect())
     }
 
-    pub fn load_checkpoint_states(
-        &self,
-    ) -> Result<std::collections::HashMap<String, PersistedCheckpoint>, String> {
+    pub fn load_checkpoint_states(&self) -> Result<HashMap<String, PersistedCheckpoint>, String> {
         let mut statement = self
             .connection
             .prepare("SELECT source_key, byte_offset, parser_state_json FROM source_checkpoints")
@@ -443,12 +716,11 @@ impl Database {
             .query_map([], |row| {
                 let key: String = row.get(0)?;
                 let offset: i64 = row.get(1)?;
-                let parser_state_json: String = row.get(2)?;
                 Ok((
                     key,
                     PersistedCheckpoint {
                         byte_offset: offset.max(0) as u64,
-                        parser_state_json,
+                        parser_state_json: row.get(2)?,
                     },
                 ))
             })
@@ -457,40 +729,45 @@ impl Database {
             .collect()
     }
 
-    pub fn persist_collection(
+    pub fn persist_collection<P>(
         &mut self,
         collection: &CollectionSummary,
         account_key: Option<&str>,
-        pricing_snapshot: Option<&PricingSnapshot>,
+        _unused_pricing_snapshot: Option<&P>,
     ) -> Result<usize, String> {
-        let settings = self.load_settings()?.advanced;
+        let settings = self.load_settings()?;
         let transaction = self
             .connection
             .transaction()
             .map_err(|_| "unable to start collection transaction".to_string())?;
-        if let Some(snapshot) = pricing_snapshot.filter(|_| !collection.events.is_empty()) {
-            transaction
-                .execute(
-                    "INSERT INTO pricing_snapshots (source, observed_at_ms, version, etag, sha256, is_current) VALUES (?1, ?2, ?3, ?4, ?5, 1)",
-                    params![snapshot.source, snapshot.observed_at_ms, snapshot.version, snapshot.etag, snapshot.sha256],
-                )
-                .map_err(|_| "unable to persist pricing snapshot".to_string())?;
-        }
         for checkpoint in &collection.checkpoints {
             transaction
                 .execute(
-                    "INSERT INTO source_checkpoints (source_key, byte_offset, parser_state_json, source_active, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(source_key) DO UPDATE SET byte_offset=excluded.byte_offset, parser_state_json=excluded.parser_state_json, source_active=excluded.source_active, updated_at_ms=excluded.updated_at_ms",
-                    params![checkpoint.source_key, checkpoint.byte_offset as i64, checkpoint.parser_state_json, i64::from(checkpoint.source_active), now_ms()],
+                    "INSERT INTO source_checkpoints (
+                        source_key, byte_offset, parser_state_json, source_active, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(source_key) DO UPDATE SET
+                        byte_offset=excluded.byte_offset,
+                        parser_state_json=excluded.parser_state_json,
+                        source_active=excluded.source_active,
+                        updated_at_ms=excluded.updated_at_ms",
+                    params![
+                        checkpoint.source_key,
+                        checkpoint.byte_offset as i64,
+                        checkpoint.parser_state_json,
+                        i64::from(checkpoint.source_active),
+                        now_ms()
+                    ],
                 )
                 .map_err(|_| "unable to persist source checkpoint".to_string())?;
         }
         let mut inserted = 0;
         for event in &collection.events {
-            if Self::persist_event(&transaction, event, account_key, pricing_snapshot)? {
+            if Self::persist_event(&transaction, event, account_key, &settings)? {
                 inserted += 1;
             }
         }
-        Self::rebuild_quotes_in_transaction(&transaction, &settings)?;
+        Self::rebuild_quotes_in_transaction(&transaction)?;
         if collection.stats.partial_line_retries > 0 {
             add_diagnostic(
                 &transaction,
@@ -512,512 +789,906 @@ impl Database {
     }
 
     fn persist_event(
-        transaction: &rusqlite::Transaction<'_>,
+        transaction: &Transaction<'_>,
         event: &UsageEvent,
         account_key: Option<&str>,
-        pricing_snapshot: Option<&PricingSnapshot>,
+        settings: &AppSettings,
     ) -> Result<bool, String> {
-        let eligibility = classify_provider_eligibility(event);
-        let eligible = matches!(eligibility, Eligibility::Eligible);
-        let (pricing_status, cost_usd): (&str, Option<f64>) = if !eligible {
-            match eligibility {
-                Eligibility::Rejected(_) => ("rejected", None),
-                Eligibility::Eligible | Eligibility::Pending(_) => ("pending", None),
+        let pricing = event_cost(event, settings);
+        let (cost_usd, pricing_status, eligible) = match pricing {
+            Ok((cost, source)) => (Some(cost), source, 1_i64),
+            Err(reason) => {
+                add_diagnostic(transaction, &reason, 1)?;
+                (None, "pending", 0_i64)
             }
-        } else if let Some(snapshot) = pricing_snapshot {
-            match price_event(event, snapshot) {
-                Ok(cost) => ("priced", Some(cost)),
-                Err(_) => ("pending", None),
-            }
-        } else {
-            ("pending", None)
         };
         let inserted = transaction
             .execute(
-                "INSERT OR IGNORE INTO usage_events (fingerprint, account_key, timestamp_ms, model_id, input_tokens, cached_input_tokens, output_tokens, eligible, pricing_status, cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![event_fingerprint(event), account_key, event.timestamp_ms, normalize_model_id(&event.model), event.input_tokens as i64, event.cached_input_tokens as i64, event.output_tokens as i64, i64::from(eligible && cost_usd.is_some()), pricing_status, cost_usd],
+                "INSERT OR IGNORE INTO usage_events (
+                    fingerprint, account_key, timestamp_ms, model_id, input_tokens,
+                    cached_input_tokens, output_tokens, eligible, pricing_status, cost_usd,
+                    quota_reset_at_ms, quota_limit_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12)",
+                params![
+                    event_fingerprint(event),
+                    account_key,
+                    event.timestamp_ms,
+                    event.model.trim().to_ascii_lowercase().replace('/', "-"),
+                    event.input_tokens as i64,
+                    event.cached_input_tokens as i64,
+                    event.output_tokens as i64,
+                    eligible,
+                    pricing_status,
+                    cost_usd,
+                    event.quota_reset_at_ms,
+                    event.quota_limit_id,
+                ],
             )
             .map_err(|_| "unable to persist usage event".to_string())?;
         if inserted == 1 {
-            if let (Some(used_percent), Some(reset_at_ms), Some(duration_minutes)) = (
-                event.quota_used_percent,
-                event.quota_reset_at_ms,
-                event.quota_window_minutes,
-            ) {
+            if let (Some(used_percent), Some(duration_minutes)) =
+                (event.quota_used_percent, event.quota_window_minutes)
+            {
                 if used_percent.is_finite()
                     && (0.0..=100.0).contains(&used_percent)
                     && duration_minutes.is_finite()
-                    && duration_minutes > 0.0
+                    && (duration_minutes - WEEKLY_WINDOW_MINUTES).abs()
+                        <= WEEKLY_WINDOW_TOLERANCE_MINUTES
                 {
                     transaction
                         .execute(
-                            "INSERT INTO quota_snapshots (account_key, observed_at_ms, reset_at_ms, duration_minutes, limit_id, plan, used_percent, connection_quality) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'good')",
-                            params![account_key, event.timestamp_ms, reset_at_ms, duration_minutes, event.quota_limit_id, event.plan, used_percent],
+                            "INSERT INTO quota_snapshots (
+                                account_key, observed_at_ms, reset_at_ms, duration_minutes,
+                                limit_id, plan, used_percent, connection_quality
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'good')",
+                            params![
+                                account_key,
+                                event.timestamp_ms,
+                                event.quota_reset_at_ms,
+                                duration_minutes,
+                                event.quota_limit_id,
+                                event.plan,
+                                used_percent
+                            ],
                         )
-                        .map_err(|_| "unable to persist quota snapshot".to_string())?;
+                        .map_err(|_| "unable to persist weekly observation".to_string())?;
                 }
             }
-        }
-        if inserted == 1 && pricing_status != "priced" {
-            add_diagnostic(transaction, pricing_status, 1)?;
         }
         Ok(inserted == 1)
     }
 
     pub fn rebuild_quotes(&mut self) -> Result<(), String> {
-        let settings = self.load_settings()?.advanced;
+        let settings = self.load_settings()?;
         let transaction = self
             .connection
             .transaction()
-            .map_err(|_| "unable to start quote rebuild".to_string())?;
-        Self::rebuild_quotes_in_transaction(&transaction, &settings)?;
+            .map_err(|_| "unable to start token estimate rebuild".to_string())?;
+        Self::reprice_usage_events(&transaction, &settings)?;
+        Self::rebuild_quotes_in_transaction(&transaction)?;
         transaction
             .commit()
-            .map_err(|_| "unable to commit quote rebuild".to_string())
+            .map_err(|_| "unable to commit token estimate rebuild".to_string())
     }
 
-    fn rebuild_quotes_in_transaction(
-        transaction: &rusqlite::Transaction<'_>,
-        settings: &AdvancedSettings,
+    fn reprice_usage_events(
+        transaction: &Transaction<'_>,
+        settings: &AppSettings,
     ) -> Result<(), String> {
-        let quota_points = {
+        let rows = {
             let mut statement = transaction
                 .prepare(
-                    "WITH observed AS (
-                         SELECT quota.*,
-                                LAG(used_percent) OVER (
-                                    PARTITION BY account_key, limit_id
-                                    ORDER BY observed_at_ms, id
-                                ) AS previous_used_percent,
-                                LAG(reset_at_ms) OVER (
-                                    PARTITION BY account_key, limit_id
-                                    ORDER BY observed_at_ms, id
-                                ) AS previous_reset_at_ms
-                         FROM quota_snapshots quota
-                         WHERE used_percent > 0
-                           AND reset_at_ms IS NOT NULL
-                           AND ABS(duration_minutes - 10080.0) <= 240.0
-                     )
-                     SELECT account_key, limit_id, observed_at_ms, reset_at_ms, used_percent
-                     FROM observed
-                     WHERE previous_used_percent IS NULL
-                        OR used_percent<>previous_used_percent
-                        OR reset_at_ms<>previous_reset_at_ms
-                     ORDER BY observed_at_ms",
+                    "SELECT fingerprint, model_id, input_tokens, cached_input_tokens, output_tokens
+                     FROM usage_events",
                 )
-                .map_err(|_| "unable to read weekly quota observations".to_string())?;
+                .map_err(|_| "unable to read imported usage for repricing".to_string())?;
             let rows = statement
                 .query_map([], |row| {
-                    Ok(QuotaPoint {
-                        account_key: row.get(0)?,
-                        limit_id: row.get(1)?,
-                        observed_at_ms: row.get(2)?,
-                        reset_at_ms: row.get(3)?,
-                        used_percent: row.get(4)?,
+                    Ok(StoredUsageForPricing {
+                        fingerprint: row.get(0)?,
+                        event: UsageEvent {
+                            model: row.get(1)?,
+                            input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                            cached_input_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                            output_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                            ..UsageEvent::default()
+                        },
                     })
                 })
-                .map_err(|_| "unable to read weekly quota observations".to_string())?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|_| "unable to decode weekly quota observations".to_string())?
+                .map_err(|_| "unable to read imported usage for repricing".to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| "unable to decode imported usage for repricing".to_string())?;
+            rows
         };
-
-        transaction
-            .execute("DELETE FROM quotes", [])
-            .map_err(|_| "unable to clear stale quotes".to_string())?;
-
-        let thresholds = crate::estimator::Thresholds {
-            refresh_seconds: settings.refresh_interval_seconds,
-            monitoring_gap_minutes: settings.monitoring_gap_minutes,
-            settlement_seconds: settings.settlement_window_seconds,
-            hard_settlement_seconds: settings.settlement_window_seconds,
-            minimum_decimal_quota_points: settings.minimum_quota_movement_points,
-            minimum_whole_quota_points: settings.minimum_quota_movement_points,
-            minimum_eligible_cost_usd: settings.minimum_eligible_cost_usd,
-            minimum_events: settings.minimum_events,
-            low_usage_quarantine_percent: settings.low_usage_quarantine_percent,
-        };
-        let rebuilt_at_ms = now_ms();
-        let mut previous_by_epoch: HashMap<EpochKey, QuotaPoint> = HashMap::new();
-
-        for current in quota_points {
-            let epoch_key = (
-                current.account_key.clone(),
-                current.limit_id.clone(),
-                (current.reset_at_ms + 30_000).div_euclid(60_000),
-            );
-            let Some(previous) = previous_by_epoch.get(&epoch_key).cloned() else {
-                previous_by_epoch.insert(epoch_key, current);
-                continue;
-            };
-            if previous.used_percent >= 100.0 || current.used_percent <= previous.used_percent {
-                continue;
+        for row in rows {
+            match event_cost(&row.event, settings) {
+                Ok((cost, source)) => {
+                    transaction
+                        .execute(
+                            "UPDATE usage_events
+                             SET eligible=1, pricing_status=?2, cost_usd=?3
+                             WHERE fingerprint=?1",
+                            params![row.fingerprint, source, cost],
+                        )
+                        .map_err(|_| "unable to update repriced usage".to_string())?;
+                }
+                Err(_) => {
+                    transaction
+                        .execute(
+                            "UPDATE usage_events
+                             SET eligible=0, pricing_status='pending', cost_usd=NULL
+                             WHERE fingerprint=?1",
+                            params![row.fingerprint],
+                        )
+                        .map_err(|_| "unable to update pending usage price".to_string())?;
+                }
             }
-
-            let (cost_delta_usd, event_count): (f64, i64) = transaction
-                .query_row(
-                    "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*)
-                     FROM usage_events
-                     WHERE pricing_status='priced'
-                       AND timestamp_ms > ?1
-                       AND timestamp_ms <= ?2
-                       AND account_key IS ?3",
-                    params![
-                        previous.observed_at_ms,
-                        current.observed_at_ms,
-                        current.account_key
-                    ],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|_| "unable to measure interval cost".to_string())?;
-            let quota_delta_points = current.used_percent - previous.used_percent;
-            let decimal_quota =
-                current.used_percent.fract() != 0.0 || previous.used_percent.fract() != 0.0;
-            let decision = crate::estimator::settle_interval(
-                crate::estimator::SettlementInput {
-                    cost_delta_usd,
-                    quota_delta_points,
-                    events: event_count.max(0) as u64,
-                    decimal_quota,
-                    sources_unchanged_for_seconds: rebuilt_at_ms
-                        .saturating_sub(current.observed_at_ms)
-                        .max(0) as u64
-                        / 1_000,
-                    monotonic: true,
-                    complete: true,
-                    low_usage_percent: current.used_percent,
-                },
-                thresholds,
-            );
-            let crate::estimator::MeasurementDecision::Valid {
-                quote_usd,
-                confidence,
-            } = decision
-            else {
-                continue;
-            };
-            previous_by_epoch.insert(epoch_key, current.clone());
-            let dominant_model: Option<String> = transaction
-                .query_row(
-                    "SELECT model_id
-                     FROM usage_events
-                     WHERE pricing_status='priced'
-                       AND timestamp_ms > ?1
-                       AND timestamp_ms <= ?2
-                       AND account_key IS ?3
-                     GROUP BY model_id
-                     ORDER BY SUM(cost_usd) DESC
-                     LIMIT 1",
-                    params![
-                        previous.observed_at_ms,
-                        current.observed_at_ms,
-                        current.account_key
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|_| "unable to identify interval model".to_string())?;
-            let confidence = match confidence {
-                crate::estimator::Confidence::High => "high",
-                crate::estimator::Confidence::Medium => "medium",
-                crate::estimator::Confidence::Low => "low",
-            };
-            transaction
-                .execute(
-                    "INSERT INTO quotes (
-                        timestamp_ms, value_usd, raw_value_usd, observed_cost_usd,
-                        weekly_used_percent, dominant_model, confidence, status,
-                        is_finalized, algorithm_version
-                     ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 'valid', 1, ?7)",
-                    params![
-                        current.observed_at_ms,
-                        quote_usd,
-                        cost_delta_usd,
-                        current.used_percent,
-                        dominant_model,
-                        confidence,
-                        ALGORITHM_VERSION
-                    ],
-                )
-                .map_err(|_| "unable to persist settled quote".to_string())?;
         }
         Ok(())
+    }
+
+    fn rebuild_quotes_in_transaction(transaction: &Transaction<'_>) -> Result<(), String> {
+        let observations = Self::weekly_observations(transaction)?;
+        transaction
+            .execute("DELETE FROM quotes", [])
+            .map_err(|_| "unable to clear stale token estimates".to_string())?;
+        transaction
+            .execute("DELETE FROM measurements", [])
+            .map_err(|_| "unable to clear stale token measurements".to_string())?;
+        transaction
+            .execute("DELETE FROM epochs", [])
+            .map_err(|_| "unable to clear stale weekly windows".to_string())?;
+
+        let groups = Self::window_groups(observations);
+        for group in groups {
+            let window_id = transaction
+                .query_row(
+                    "INSERT INTO epochs (
+                        account_key, limit_id, reset_at_ms, started_at_ms, ended_at_ms,
+                        boundary_reason, reset_reason
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                     RETURNING id",
+                    params![
+                        group.account_key,
+                        group.limit_id,
+                        group.reset_at_ms,
+                        group.started_at_ms,
+                        group.ended_at_ms,
+                        group.reset_reason,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|_| "unable to persist weekly window".to_string())?;
+            Self::rebuild_group(transaction, &group, window_id)?;
+        }
+        Ok(())
+    }
+
+    fn weekly_observations(transaction: &Transaction<'_>) -> Result<Vec<QuotaPoint>, String> {
+        let mut statement = transaction
+            .prepare(
+                "SELECT account_key, limit_id, observed_at_ms, reset_at_ms, used_percent
+                 FROM quota_snapshots
+                 WHERE used_percent IS NOT NULL
+                   AND used_percent BETWEEN 0.0 AND 100.0
+                   AND duration_minutes IS NOT NULL
+                   AND ABS(duration_minutes - 10080.0) <= 240.0
+                 ORDER BY observed_at_ms, id",
+            )
+            .map_err(|_| "unable to read weekly observations".to_string())?;
+        let observations = statement
+            .query_map([], |row| {
+                Ok(QuotaPoint {
+                    account_key: row.get(0)?,
+                    limit_id: row.get(1)?,
+                    observed_at_ms: row.get(2)?,
+                    reset_at_ms: row.get(3)?,
+                    used_percent: row.get(4)?,
+                })
+            })
+            .map_err(|_| "unable to read weekly observations".to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| "unable to decode weekly observations".to_string())?;
+        Ok(observations)
+    }
+
+    fn window_groups(observations: Vec<QuotaPoint>) -> Vec<WindowGroup> {
+        let mut groups_by_stream =
+            HashMap::<(Option<String>, Option<String>), Vec<WindowGroup>>::new();
+        for current in observations {
+            let groups = groups_by_stream
+                .entry((current.account_key.clone(), current.limit_id.clone()))
+                .or_default();
+            let new_reason = groups.last().and_then(|group| {
+                let previous = group.points.last()?;
+                if previous.reset_at_ms != current.reset_at_ms {
+                    return Some("reported_reset_changed");
+                }
+                if current.used_percent
+                    < previous.used_percent - crate::estimator::MATERIAL_USAGE_DECREASE_PERCENT
+                {
+                    return Some(
+                        if previous
+                            .reset_at_ms
+                            .is_some_and(|reset| current.observed_at_ms >= reset)
+                        {
+                            "scheduled_reset"
+                        } else {
+                            "usage_decreased"
+                        },
+                    );
+                }
+                None
+            });
+            if let Some(reason) = new_reason {
+                groups.push(WindowGroup {
+                    account_key: current.account_key.clone(),
+                    limit_id: current.limit_id.clone(),
+                    reset_at_ms: current.reset_at_ms,
+                    started_at_ms: current.observed_at_ms,
+                    ended_at_ms: current.observed_at_ms,
+                    reset_reason: reason.into(),
+                    points: vec![current],
+                });
+            } else if let Some(group) = groups.last_mut() {
+                group.ended_at_ms = current.observed_at_ms;
+                group.points.push(current);
+            } else {
+                groups.push(WindowGroup {
+                    account_key: current.account_key.clone(),
+                    limit_id: current.limit_id.clone(),
+                    reset_at_ms: current.reset_at_ms,
+                    started_at_ms: current.observed_at_ms,
+                    ended_at_ms: current.observed_at_ms,
+                    // The first observation is a baseline, not evidence that a
+                    // scheduled reset happened at that instant.
+                    reset_reason: "uncertain_reset".into(),
+                    points: vec![current],
+                });
+            }
+        }
+        let mut groups = groups_by_stream.into_values().flatten().collect::<Vec<_>>();
+        groups.sort_by_key(|group| group.started_at_ms);
+        groups
+    }
+
+    fn rebuild_group(
+        transaction: &Transaction<'_>,
+        group: &WindowGroup,
+        window_id: i64,
+    ) -> Result<(), String> {
+        let first = group
+            .points
+            .first()
+            .expect("window has a first observation");
+        let mut previous = first.clone();
+        let baseline_cost = Self::cost_through(
+            transaction,
+            group,
+            group.started_at_ms,
+            first.observed_at_ms,
+        )?;
+        let mut previous_cost = baseline_cost;
+        let mut rates = Vec::new();
+        for current in group.points.iter().skip(1) {
+            let current_cost = Self::cost_through(
+                transaction,
+                group,
+                group.started_at_ms,
+                current.observed_at_ms,
+            )?;
+            let interval = crate::estimator::TokenInterval {
+                previous_cost_usd: previous_cost,
+                current_cost_usd: current_cost,
+                previous_used_percent: previous.used_percent,
+                current_used_percent: current.used_percent,
+            };
+            let decision = crate::estimator::measure_interval(interval);
+            match decision {
+                crate::estimator::MeasurementDecision::Valid {
+                    cost_delta_usd,
+                    percent_delta,
+                    estimated_weekly_value_usd,
+                } => {
+                    let cumulative_estimate =
+                        match crate::estimator::measure_interval(crate::estimator::TokenInterval {
+                            previous_cost_usd: baseline_cost,
+                            current_cost_usd: current_cost,
+                            previous_used_percent: first.used_percent,
+                            current_used_percent: current.used_percent,
+                        }) {
+                            crate::estimator::MeasurementDecision::Valid {
+                                estimated_weekly_value_usd,
+                                ..
+                            } => estimated_weekly_value_usd,
+                            _ => estimated_weekly_value_usd,
+                        };
+                    rates.push(cumulative_estimate);
+                    let smoothed_value = crate::estimator::median_recent(
+                        &rates,
+                        crate::estimator::MEDIAN_SAMPLE_COUNT,
+                    )
+                    .expect("valid rate");
+                    let coverage = (current.used_percent - first.used_percent).max(0.0);
+                    let relative_deviation = crate::estimator::relative_median_deviation(
+                        &rates,
+                        crate::estimator::MEDIAN_SAMPLE_COUNT,
+                    )
+                    .unwrap_or(f64::INFINITY);
+                    let confidence =
+                        crate::estimator::confidence(rates.len(), coverage, relative_deviation);
+                    let observed_cost = current_cost;
+                    transaction
+                        .execute(
+                            "INSERT INTO measurements (
+                                epoch_id, measured_at_ms, cost_delta_usd, quota_delta_points,
+                                event_count, status, diagnostic_reason, previous_observed_at_ms,
+                                percent_delta, estimated_weekly_value_usd
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, 'valid', NULL, ?6, ?4, ?7)",
+                            params![
+                                window_id,
+                                current.observed_at_ms,
+                                cost_delta_usd,
+                                percent_delta,
+                                Self::priced_event_count(
+                                    transaction,
+                                    group,
+                                    previous.observed_at_ms,
+                                    current.observed_at_ms
+                                )?,
+                                previous.observed_at_ms,
+                                estimated_weekly_value_usd,
+                            ],
+                        )
+                        .map_err(|_| "unable to persist token measurement".to_string())?;
+                    transaction
+                        .execute(
+                            "INSERT INTO quotes (
+                                timestamp_ms, value_usd, raw_value_usd, observed_cost_usd,
+                                weekly_used_percent, dominant_model, confidence, status,
+                                is_finalized, algorithm_version, estimated_weekly_value_usd,
+                                percentage_coverage, valid_observation_count, window_id,
+                                window_start_ms, window_end_ms, reported_reset_at_ms,
+                                reset_reason, credit_source
+                             ) VALUES (?1, ?2, ?2, ?3, ?4, NULL, ?5, 'valid', 1, ?6,
+                                ?2, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                            params![
+                                current.observed_at_ms,
+                                smoothed_value,
+                                observed_cost,
+                                current.used_percent,
+                                confidence,
+                                ALGORITHM_VERSION,
+                                coverage,
+                                rates.len() as i64,
+                                window_id,
+                                group.started_at_ms,
+                                group.ended_at_ms,
+                                group.reset_at_ms,
+                                group.reset_reason,
+                                Self::model_status(
+                                    transaction,
+                                    group,
+                                    group.started_at_ms,
+                                    current.observed_at_ms
+                                )?,
+                            ],
+                        )
+                        .map_err(|_| "unable to persist weekly token estimate".to_string())?;
+                }
+                crate::estimator::MeasurementDecision::Pending(reason) => {
+                    Self::persist_non_valid_measurement(
+                        transaction,
+                        window_id,
+                        &previous,
+                        current,
+                        previous_cost,
+                        current_cost,
+                        group,
+                        "pending",
+                        &reason,
+                    )?;
+                }
+                crate::estimator::MeasurementDecision::Rejected(reason) => {
+                    Self::persist_non_valid_measurement(
+                        transaction,
+                        window_id,
+                        &previous,
+                        current,
+                        previous_cost,
+                        current_cost,
+                        group,
+                        "rejected",
+                        &reason,
+                    )?;
+                }
+            }
+            previous = current.clone();
+            previous_cost = current_cost;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_non_valid_measurement(
+        transaction: &Transaction<'_>,
+        window_id: i64,
+        previous: &QuotaPoint,
+        current: &QuotaPoint,
+        previous_cost: f64,
+        current_cost: f64,
+        group: &WindowGroup,
+        status: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        transaction
+            .execute(
+                "INSERT INTO measurements (
+                    epoch_id, measured_at_ms, cost_delta_usd, quota_delta_points,
+                    event_count, status, diagnostic_reason, previous_observed_at_ms,
+                    percent_delta
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?4)",
+                params![
+                    window_id,
+                    current.observed_at_ms,
+                    current_cost - previous_cost,
+                    current.used_percent - previous.used_percent,
+                    Self::priced_event_count(
+                        transaction,
+                        group,
+                        previous.observed_at_ms,
+                        current.observed_at_ms
+                    )?,
+                    status,
+                    reason,
+                    previous.observed_at_ms,
+                ],
+            )
+            .map_err(|_| "unable to persist pending token measurement".to_string())?;
+        Ok(())
+    }
+
+    fn cost_through(
+        transaction: &Transaction<'_>,
+        group: &WindowGroup,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<f64, String> {
+        let value: f64 = transaction
+            .query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0.0)
+                 FROM usage_events
+                 WHERE eligible=1 AND pricing_status IN ('official', 'custom')
+                   AND timestamp_ms > ?1 AND timestamp_ms <= ?2
+                   AND account_key IS ?3
+                   AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)
+                   AND (quota_reset_at_ms IS ?5 OR quota_reset_at_ms IS NULL)",
+                params![
+                    start_ms,
+                    end_ms,
+                    group.account_key,
+                    group.limit_id,
+                    group.reset_at_ms
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|_| "unable to read token-derived costs".to_string())?;
+        Ok(if value.is_finite() {
+            value.max(0.0)
+        } else {
+            0.0
+        })
+    }
+
+    fn priced_event_count(
+        transaction: &Transaction<'_>,
+        group: &WindowGroup,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<i64, String> {
+        transaction
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE eligible=1 AND pricing_status IN ('official', 'custom')
+                   AND timestamp_ms > ?1 AND timestamp_ms <= ?2
+                   AND account_key IS ?3
+                   AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)
+                   AND (quota_reset_at_ms IS ?5 OR quota_reset_at_ms IS NULL)",
+                params![
+                    start_ms,
+                    end_ms,
+                    group.account_key,
+                    group.limit_id,
+                    group.reset_at_ms
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|_| "unable to count priced token events".to_string())
+    }
+
+    fn model_status(
+        transaction: &Transaction<'_>,
+        group: &WindowGroup,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<String, String> {
+        let mut statement = transaction
+            .prepare(
+                "SELECT DISTINCT pricing_status FROM usage_events
+                 WHERE eligible=1 AND pricing_status IN ('official', 'custom')
+                   AND timestamp_ms > ?1 AND timestamp_ms <= ?2
+                   AND account_key IS ?3
+                   AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)
+                   AND (quota_reset_at_ms IS ?5 OR quota_reset_at_ms IS NULL)
+                 ORDER BY credit_source",
+            )
+            .map_err(|_| "unable to read pricing status".to_string())?;
+        let sources = statement
+            .query_map(
+                params![
+                    start_ms,
+                    end_ms,
+                    group.account_key,
+                    group.limit_id,
+                    group.reset_at_ms
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| "unable to read pricing status".to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| "unable to decode pricing status".to_string())?;
+        Ok(match sources.as_slice() {
+            [] => "pending".into(),
+            [source] => source.clone(),
+            _ => "mixed".into(),
+        })
+    }
+
+    fn stored_points(&self) -> Result<Vec<StoredPoint>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT timestamp_ms, estimated_weekly_value_usd, observed_cost_usd,
+                        weekly_used_percent, reported_reset_at_ms, reset_reason,
+                        is_finalized, window_id
+                 FROM quotes
+                 WHERE algorithm_version=?1 AND status='valid' AND is_finalized=1
+                 ORDER BY timestamp_ms, id",
+            )
+            .map_err(|_| "unable to read token estimate history".to_string())?;
+        let rows = statement
+            .query_map(params![ALGORITHM_VERSION], |row| {
+                let window_id: i64 = row.get(7)?;
+                Ok(StoredPoint {
+                    point: HistoryPoint {
+                        timestamp: row.get(0)?,
+                        estimated_weekly_value_usd: row.get(1)?,
+                        observed_cost_usd: row.get(2)?,
+                        weekly_used_percent: row.get(3)?,
+                        reset_at: row.get(4)?,
+                        reset_reason: row.get(5)?,
+                        is_finalized: row.get::<_, i64>(6)? != 0,
+                        is_heartbeat: false,
+                        epoch: Some(window_id),
+                    },
+                    window_id: row.get(7)?,
+                })
+            })
+            .map_err(|_| "unable to read token estimate history".to_string())?;
+        rows.map(|row| row.map_err(|_| "unable to decode token estimate history".to_string()))
+            .collect()
     }
 
     pub fn latest_quota_observation(&self) -> Result<Option<LatestQuotaObservation>, String> {
         self.connection
             .query_row(
-                "SELECT used_percent, reset_at_ms, plan FROM quota_snapshots ORDER BY observed_at_ms DESC LIMIT 1",
+                "SELECT account_key, limit_id, observed_at_ms, used_percent, reset_at_ms, plan
+                 FROM quota_snapshots
+                 WHERE used_percent IS NOT NULL
+                 ORDER BY observed_at_ms DESC, id DESC LIMIT 1",
                 [],
                 |row| {
                     Ok(LatestQuotaObservation {
-                        used_percent: row.get(0)?,
-                        reset_at_ms: row.get(1)?,
-                        plan: row.get(2)?,
+                        account_key: row.get(0)?,
+                        limit_id: row.get(1)?,
+                        observed_at_ms: row.get(2)?,
+                        used_percent: row.get(3)?,
+                        reset_at_ms: row.get(4)?,
+                        plan: row.get(5)?,
                     })
                 },
             )
             .optional()
-            .map_err(|_| "unable to read current quota".to_string())
+            .map_err(|_| "unable to read current weekly usage".to_string())
     }
 
-    fn weighted_quotes(&self) -> Result<Vec<WeightedQuote>, String> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT quotes.timestamp_ms, quotes.value_usd, quotes.raw_value_usd,
-                        quotes.observed_cost_usd, quotes.weekly_used_percent,
-                        quotes.is_finalized, quotes.dominant_model,
-                        (SELECT (quota.reset_at_ms + 30000) / 60000
-                         FROM quota_snapshots quota
-                         WHERE quota.observed_at_ms=quotes.timestamp_ms
-                           AND quota.reset_at_ms IS NOT NULL
-                           AND ABS(quota.duration_minutes - 10080.0) <= 240.0
-                         ORDER BY quota.id DESC
-                         LIMIT 1)
-                 FROM quotes
-                 WHERE quotes.algorithm_version=?1
-                 ORDER BY quotes.timestamp_ms",
+    fn active_window_id(&self, latest: &LatestQuotaObservation) -> Result<Option<i64>, String> {
+        self.connection
+            .query_row(
+                "SELECT id FROM epochs
+                 WHERE account_key IS ?1 AND limit_id IS ?2 AND reset_at_ms IS ?3
+                   AND started_at_ms <= ?4
+                 ORDER BY started_at_ms DESC, id DESC LIMIT 1",
+                params![
+                    latest.account_key,
+                    latest.limit_id,
+                    latest.reset_at_ms,
+                    latest.observed_at_ms
+                ],
+                |row| row.get(0),
             )
-            .map_err(|_| "unable to read weighted quote history".to_string())?;
-        let rows = statement
-            .query_map(params![ALGORITHM_VERSION], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, f64>(1)?,
-                    row.get::<_, Option<f64>>(2)?,
-                    row.get::<_, f64>(3)?,
-                    row.get::<_, Option<f64>>(4)?,
-                    row.get::<_, i64>(5)? != 0,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                ))
-            })
-            .map_err(|_| "unable to read weighted quote history".to_string())?;
-        let mut aggregate_by_epoch: HashMap<i64, EpochAggregate> = HashMap::new();
-        let mut weighted = Vec::new();
-        for row in rows {
-            let (
-                timestamp,
-                value,
-                raw_value,
-                observed_cost,
-                weekly_used,
-                is_finalized,
-                model,
-                epoch,
-            ) = row.map_err(|_| "unable to decode weighted quote history".to_string())?;
-            let Some(epoch) = epoch else {
-                continue;
-            };
-            if !value.is_finite() || value <= 0.0 || !observed_cost.is_finite() {
-                continue;
-            }
-            let quota_points = observed_cost / value * 100.0;
-            if !quota_points.is_finite() || quota_points <= 0.0 {
-                continue;
-            }
-            let aggregate = aggregate_by_epoch.entry(epoch).or_default();
-            aggregate.cost_usd += observed_cost;
-            aggregate.quota_points += quota_points;
-            if let Some(model) = model {
-                match aggregate.model.as_deref() {
-                    None => aggregate.model = Some(model),
-                    Some(existing) if existing != model => aggregate.mixed = true,
-                    _ => {}
-                }
-            }
-            let display_model = if aggregate.mixed {
-                Some("mixed".to_string())
-            } else {
-                aggregate.model.clone()
-            };
-            weighted.push(WeightedQuote {
-                point: HistoryPoint {
-                    timestamp,
-                    value_usd: Some(aggregate.cost_usd / aggregate.quota_points * 100.0),
-                    raw_value_usd: raw_value,
-                    weekly_used_percent: weekly_used,
-                    is_finalized,
-                    is_heartbeat: false,
-                    dominant_model: display_model,
-                    epoch: Some(epoch),
-                },
-                epoch,
-                observed_cost_usd: aggregate.cost_usd,
-            });
-        }
-        Ok(weighted)
+            .optional()
+            .map_err(|_| "unable to identify active weekly window".to_string())
+    }
+
+    fn active_window_metadata(&self, window_id: i64) -> Result<(i64, Option<i64>, String), String> {
+        self.connection
+            .query_row(
+                "SELECT started_at_ms, reset_at_ms, reset_reason FROM epochs WHERE id=?1",
+                params![window_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|_| "unable to read active weekly window".to_string())
     }
 
     pub fn latest_quote(&self) -> Result<Option<CurrentQuote>, String> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT timestamp_ms, value_usd, observed_cost_usd, weekly_used_percent,
-                        dominant_model, confidence, status
-                 FROM quotes ORDER BY timestamp_ms DESC LIMIT 5",
-            )
-            .map_err(|_| "unable to read current quote".to_string())?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<f64>>(1)?,
-                    row.get::<_, Option<f64>>(2)?,
-                    row.get::<_, Option<f64>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })
-            .map_err(|_| "unable to read current quote".to_string())?;
-        let recent = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|_| "unable to decode current quote".to_string())?;
-        let Some(latest) = recent.first() else {
-            return Ok(None);
+        let latest = self.latest_quota_observation()?;
+        let points = self.stored_points()?;
+        let Some(latest) = latest else {
+            return Ok(points.last().map(|stored| CurrentQuote {
+                estimated_weekly_value_usd: stored.point.estimated_weekly_value_usd,
+                change_value_usd: None,
+                change_percent: None,
+                observed_cost_usd: stored.point.observed_cost_usd,
+                weekly_used_percent: stored.point.weekly_used_percent,
+                reset_at: stored.point.reset_at,
+                reset_reason: stored.point.reset_reason.clone(),
+                status: QuoteStatus::Valid,
+                algorithm_version: ALGORITHM_VERSION.into(),
+                confidence: Confidence::Low,
+                valid_observation_count: 1,
+                percentage_coverage: None,
+                pricing_source: None,
+                model_status: None,
+                note: Some("Estimated from local token usage and API prices.".into()),
+            }));
         };
-        let latest_timestamp = latest.0;
-        let latest_reset_group: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT (reset_at_ms + 30000) / 60000
-                 FROM quota_snapshots
-                 WHERE observed_at_ms=?1
-                   AND reset_at_ms IS NOT NULL
-                   AND ABS(duration_minutes - 10080.0) <= 240.0
-                 ORDER BY id DESC
-                 LIMIT 1",
-                params![latest_timestamp],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|_| "unable to identify current quota epoch".to_string())?;
-        let weighted = self.weighted_quotes()?;
-        let current = latest_reset_group
-            .and_then(|epoch| weighted.iter().rev().find(|quote| quote.epoch == epoch));
-        let current_value = current.and_then(|quote| quote.point.value_usd);
-        let previous_value = current_value.and_then(|_| {
-            comparison_baseline(
-                &weighted,
-                latest_timestamp - Range::W1.duration_ms(),
-                Range::W1.duration_ms() / 2,
-            )
+        let active_window_id = self.active_window_id(&latest)?;
+        let current = active_window_id.and_then(|window_id| {
+            points
+                .iter()
+                .rev()
+                .find(|stored| {
+                    stored.window_id == window_id && stored.point.timestamp <= latest.observed_at_ms
+                })
+                .cloned()
         });
-        let observed_cost_usd = current.map(|quote| quote.observed_cost_usd);
-        let weekly_used_percent = latest.3;
-        let confidence = latest.5.as_str();
-        let status = latest.6.as_str();
-        let reset_at: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT reset_at_ms FROM quota_snapshots ORDER BY observed_at_ms DESC LIMIT 1",
-                [],
-                |row| row.get(0),
+        let (reset_reason, window_start, reset_at) = active_window_id
+            .map(|window_id| self.active_window_metadata(window_id))
+            .transpose()?
+            .map(|(start, reset, reason)| (Some(reason), Some(start), reset))
+            .unwrap_or((None, None, latest.reset_at_ms));
+        let observed_cost = window_start
+            .map(|start| self.sum_window_cost(start, latest.observed_at_ms, &latest))
+            .transpose()?;
+        let (valid_observation_count, percentage_coverage, pricing_source) = active_window_id
+            .map(|window_id| self.window_summary(window_id))
+            .transpose()?
+            .unwrap_or((0, None, None));
+        let previous = current.as_ref().and_then(|item| {
+            points.iter().rev().find(|candidate| {
+                candidate.point.timestamp <= item.point.timestamp - Range::W1.duration_ms()
+            })
+        });
+        let change_value_usd = current
+            .as_ref()
+            .zip(previous)
+            .and_then(|(current, previous)| {
+                current
+                    .point
+                    .estimated_weekly_value_usd
+                    .zip(previous.point.estimated_weekly_value_usd)
+                    .map(|(current, previous)| current - previous)
+            });
+        let change_percent = current
+            .as_ref()
+            .zip(previous)
+            .and_then(|(current, previous)| {
+                current
+                    .point
+                    .estimated_weekly_value_usd
+                    .zip(previous.point.estimated_weekly_value_usd)
+                    .filter(|(_, previous)| *previous != 0.0)
+                    .map(|(current, previous)| ((current - previous) / previous) * 100.0)
+            });
+        let (estimated_weekly_value_usd, confidence, status, note) = if let Some(current) =
+            current.as_ref()
+        {
+            (
+                current.point.estimated_weekly_value_usd,
+                match self
+                    .connection
+                    .query_row(
+                        "SELECT confidence FROM quotes WHERE timestamp_ms=?1 AND window_id=?2
+                             ORDER BY id DESC LIMIT 1",
+                        params![current.point.timestamp, current.window_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|_| "unable to read confidence".to_string())?
+                    .as_deref()
+                {
+                    Some("high") => Confidence::High,
+                    Some("medium") => Confidence::Medium,
+                    Some("low") => Confidence::Low,
+                    _ => Confidence::None,
+                },
+                QuoteStatus::Valid,
+                Some(
+                    "Rolling median of cumulative weekly cost-per-percent estimates; short intervals do not set the headline."
+                        .into(),
+                ),
             )
-            .optional()
-            .map_err(|_| "unable to read current reset time".to_string())?
-            .flatten();
+        } else {
+            (
+                None,
+                Confidence::None,
+                QuoteStatus::Pending,
+                Some(
+                    "Waiting for a positive weekly-usage change paired with local token cost."
+                        .into(),
+                ),
+            )
+        };
         Ok(Some(CurrentQuote {
-            value_usd: current_value,
-            change_usd: current_value
-                .zip(previous_value)
-                .map(|(current, previous)| current - previous),
-            change_percent: current_value
-                .zip(previous_value)
-                .filter(|(_, previous)| *previous != 0.0)
-                .map(|(current, previous)| ((current - previous) / previous) * 100.0),
-            observed_cost_usd,
-            weekly_used_percent,
+            estimated_weekly_value_usd,
+            change_value_usd,
+            change_percent,
+            observed_cost_usd: observed_cost,
+            weekly_used_percent: Some(latest.used_percent),
             reset_at,
-            status: if current_value.is_none() && status == "valid" {
-                QuoteStatus::Pending
-            } else {
-                match status {
-                    "valid" => QuoteStatus::Valid,
-                    "pending" => QuoteStatus::Pending,
-                    "unsupported" => QuoteStatus::Unsupported,
-                    "error" => QuoteStatus::Error,
-                    _ => QuoteStatus::Empty,
-                }
-            },
-            dominant_model: current.and_then(|quote| quote.point.dominant_model.clone()),
+            reset_reason,
+            status,
             algorithm_version: ALGORITHM_VERSION.into(),
-            confidence: match confidence {
-                "high" => Confidence::High,
-                "medium" => Confidence::Medium,
-                "low" => Confidence::Low,
-                _ => Confidence::None,
-            },
-            note: Some("Weighted from every settled priced model in the current weekly quota cycle; unknown-price usage remains pending.".into()),
+            confidence,
+            valid_observation_count,
+            percentage_coverage,
+            pricing_source: pricing_source.clone(),
+            model_status: pricing_source,
+            note,
         }))
     }
 
-    pub fn history(&self, range: Range) -> Result<HistoryResponse, String> {
-        let latest: Option<(i64, Option<i64>)> = self
+    fn sum_window_cost(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        latest: &LatestQuotaObservation,
+    ) -> Result<f64, String> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage_events
+                 WHERE eligible=1 AND pricing_status IN ('official', 'custom') AND timestamp_ms >= ?1 AND timestamp_ms <= ?2
+                   AND account_key IS ?3
+                   AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)
+                   AND (quota_reset_at_ms IS ?5 OR quota_reset_at_ms IS NULL)",
+                params![
+                    start_ms,
+                    end_ms,
+                    latest.account_key,
+                    latest.limit_id,
+                    latest.reset_at_ms
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|_| "unable to read observed token cost".to_string())
+    }
+
+    fn window_summary(&self, window_id: i64) -> Result<(u64, Option<f64>, Option<String>), String> {
+        let (count, coverage): (i64, Option<f64>) = self
             .connection
             .query_row(
-                "SELECT quotes.timestamp_ms,
-                        (SELECT (quota.reset_at_ms + 30000) / 60000
-                         FROM quota_snapshots quota
-                         WHERE quota.observed_at_ms=quotes.timestamp_ms
-                           AND quota.reset_at_ms IS NOT NULL
-                           AND ABS(quota.duration_minutes - 10080.0) <= 240.0
-                         ORDER BY quota.id DESC
-                         LIMIT 1)
-                 FROM quotes
-                 ORDER BY quotes.timestamp_ms DESC
-                 LIMIT 1",
-                [],
+                "SELECT COUNT(*), MAX(estimated_weekly_value_usd * 0 + percent_delta)
+                 FROM measurements WHERE epoch_id=?1 AND status='valid'",
+                params![window_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .map_err(|_| "unable to read measurement summary".to_string())?;
+        let source: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT CASE WHEN COUNT(DISTINCT pricing_status)=1 THEN MAX(pricing_status)
+                             WHEN COUNT(DISTINCT pricing_status)>1 THEN 'mixed' END
+                 FROM usage_events AS event
+                 JOIN epochs AS window ON window.id=?1
+                 WHERE event.eligible=1 AND event.pricing_status IN ('official', 'custom')
+                   AND event.timestamp_ms >= window.started_at_ms
+                   AND event.timestamp_ms <= COALESCE(window.ended_at_ms, window.started_at_ms)
+                   AND event.account_key IS window.account_key
+                   AND (event.quota_limit_id IS window.limit_id OR event.quota_limit_id IS NULL)
+                   AND (event.quota_reset_at_ms IS window.reset_at_ms OR event.quota_reset_at_ms IS NULL)",
+                params![window_id],
+                |row| row.get(0),
+            )
             .optional()
-            .map_err(|_| "unable to identify current quote history".to_string())?;
-        let Some((latest_timestamp, latest_epoch)) = latest else {
+            .map_err(|_| "unable to read measurement source".to_string())?
+            .flatten();
+        let coverage = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(SUM(percent_delta), 0.0) FROM measurements
+                 WHERE epoch_id=?1 AND status='valid'",
+                params![window_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "unable to read percentage coverage".to_string())?
+            .flatten()
+            .or(coverage);
+        Ok((count.max(0) as u64, coverage, source))
+    }
+
+    pub fn history(&self, range: Range) -> Result<HistoryResponse, String> {
+        let latest_timestamp: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT observed_at_ms FROM quota_snapshots
+                 ORDER BY observed_at_ms DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "unable to identify current weekly history".to_string())?;
+        let Some(latest_timestamp) = latest_timestamp else {
             return Ok(empty_history(range));
         };
-        let weighted = self.weighted_quotes()?;
+        let stored = self.stored_points()?;
         let since = latest_timestamp - range.duration_ms();
-        let current = latest_epoch.and_then(|epoch| {
-            weighted
-                .iter()
-                .rev()
-                .find(|quote| quote.epoch == epoch)
-                .and_then(|quote| quote.point.value_usd)
-        });
-        let baseline =
-            current.and_then(|_| comparison_baseline(&weighted, since, range.duration_ms() / 2));
-        let points = graph_points(
-            &weighted,
-            since,
-            latest_epoch,
-            matches!(range, Range::D1 | Range::W1),
-        );
-        let delta = current
+        let points = stored
+            .iter()
+            .filter(|stored| {
+                stored.point.timestamp >= since && stored.point.timestamp <= latest_timestamp
+            })
+            .map(|stored| stored.point.clone())
+            .collect::<Vec<_>>();
+        let baseline = stored
+            .iter()
+            .rev()
+            .find(|stored| stored.point.timestamp <= since)
+            .and_then(|stored| stored.point.estimated_weekly_value_usd)
+            .or_else(|| {
+                points
+                    .first()
+                    .and_then(|point| point.estimated_weekly_value_usd)
+            });
+        let active_window = self
+            .latest_quota_observation()?
+            .and_then(|latest| self.active_window_id(&latest).ok().flatten());
+        let current = active_window
+            .and_then(|window_id| {
+                stored
+                    .iter()
+                    .rev()
+                    .find(|stored| stored.window_id == window_id)
+            })
+            .and_then(|stored| stored.point.estimated_weekly_value_usd);
+        let delta_value_usd = current
             .zip(baseline)
             .map(|(current, baseline)| current - baseline);
         let delta_percent = current
             .zip(baseline)
             .filter(|(_, baseline)| *baseline != 0.0)
             .map(|(current, baseline)| ((current - baseline) / baseline) * 100.0);
-        let tolerance_ms = match &range {
-            Range::D1 => 30 * 60 * 1_000,
-            Range::W1 => 60 * 60 * 1_000,
-            Range::M1 => 4 * 60 * 60 * 1_000,
-            Range::M3 | Range::M6 => 8 * 60 * 60 * 1_000,
-        };
-        let partial = points
-            .first()
-            .map_or(true, |point| point.timestamp > since + tolerance_ms);
         Ok(HistoryResponse {
             statistics: RangeStatistics {
                 range: range.clone(),
-                baseline_value_usd: baseline,
-                current_value_usd: current,
-                delta_usd: delta,
+                baseline_estimated_weekly_value_usd: baseline,
+                current_estimated_weekly_value_usd: current,
+                delta_value_usd,
                 delta_percent,
                 point_count: points.len(),
-                partial,
+                partial: points.first().map_or(true, |point| point.timestamp > since),
             },
             bucket: range.bucket().into(),
             points,
@@ -1025,13 +1696,12 @@ impl Database {
     }
 
     pub fn annotations(&self) -> Result<Vec<Annotation>, String> {
-        let mut statement = self
+        let mut annotations = self
             .connection
             .prepare(
                 "SELECT id, timestamp_ms, label, kind FROM annotations ORDER BY timestamp_ms ASC",
             )
-            .map_err(|_| "unable to read annotations".to_string())?;
-        let rows = statement
+            .map_err(|_| "unable to read annotations".to_string())?
             .query_map([], |row| {
                 let kind: String = row.get(3)?;
                 Ok(Annotation {
@@ -1045,9 +1715,39 @@ impl Database {
                     },
                 })
             })
-            .map_err(|_| "unable to read annotations".to_string())?;
-        rows.map(|row| row.map_err(|_| "unable to decode annotation".to_string()))
-            .collect()
+            .map_err(|_| "unable to read annotations".to_string())?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT window.id, window.started_at_ms, window.reset_reason
+                 FROM epochs AS window
+                 WHERE EXISTS (
+                    SELECT 1 FROM quotes
+                    WHERE quotes.window_id=window.id
+                      AND quotes.algorithm_version=?1
+                      AND quotes.status='valid'
+                      AND quotes.is_finalized=1
+                 )
+                 ORDER BY window.started_at_ms ASC",
+            )
+            .map_err(|_| "unable to read weekly windows".to_string())?;
+        let resets = statement
+            .query_map(params![ALGORITHM_VERSION], |row| {
+                let id: i64 = row.get(0)?;
+                let reason: String = row.get(2)?;
+                Ok(Annotation {
+                    id: format!("weekly-window-{id}"),
+                    timestamp: row.get(1)?,
+                    label: format!("Weekly window · {reason}"),
+                    kind: AnnotationKind::Reset,
+                })
+            })
+            .map_err(|_| "unable to read weekly windows".to_string())?;
+        annotations.extend(resets.filter_map(Result::ok));
+        annotations.sort_by_key(|annotation| annotation.timestamp);
+        Ok(annotations)
     }
 
     pub fn reset_annotations(&mut self) -> Result<(), String> {
@@ -1055,6 +1755,32 @@ impl Database {
             .execute("DELETE FROM annotations", [])
             .map_err(|_| "unable to reset annotations".to_string())?;
         Ok(())
+    }
+
+    pub fn reset_all_data(&mut self) -> Result<(), String> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| "unable to start data reset".to_string())?;
+        transaction
+            .execute_batch(
+                "DELETE FROM source_checkpoints;
+                 DELETE FROM usage_events;
+                 DELETE FROM pricing_snapshots;
+                 DELETE FROM quota_snapshots;
+                 DELETE FROM measurements;
+                 DELETE FROM epochs;
+                 DELETE FROM quotes;
+                 DELETE FROM chart_heartbeats;
+                 DELETE FROM annotations;
+                 DELETE FROM diagnostics;
+                 DELETE FROM accounts;
+                 DELETE FROM app_runs;",
+            )
+            .map_err(|_| "unable to reset local data".to_string())?;
+        transaction
+            .commit()
+            .map_err(|_| "unable to commit data reset".to_string())
     }
 
     pub fn diagnostics(&self) -> Result<DiagnosticsSummary, String> {
@@ -1065,7 +1791,7 @@ impl Database {
         let priced_events: i64 = self
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM usage_events WHERE eligible=1 AND pricing_status='priced'",
+                "SELECT COUNT(*) FROM usage_events WHERE eligible=1 AND pricing_status IN ('official', 'custom')",
                 [],
                 |row| row.get(0),
             )
@@ -1094,9 +1820,6 @@ impl Database {
                 |row| row.get(0),
             )
             .unwrap_or(0);
-        let partial_line_retries: i64 = self.diagnostic_count("partial final line");
-        let monitoring_gaps: i64 = self.diagnostic_count("monitoring gap");
-        let hidden_resets: i64 = self.diagnostic_count("hidden reset");
         let mut reasons_statement = self
             .connection
             .prepare("SELECT reason, count FROM diagnostics ORDER BY count DESC LIMIT 12")
@@ -1126,9 +1849,9 @@ impl Database {
             pending_events,
             rejected_events,
             unattributed_events,
-            partial_line_retries,
-            monitoring_gaps,
-            hidden_resets,
+            partial_line_retries: self.diagnostic_count("partial final line"),
+            monitoring_gaps: self.diagnostic_count("monitoring gap"),
+            hidden_resets: self.diagnostic_count("hidden reset"),
             reasons,
             model_ids,
             privacy:
@@ -1149,13 +1872,16 @@ impl Database {
 }
 
 fn add_diagnostic(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Transaction<'_>,
     reason: &str,
     increment: i64,
 ) -> Result<(), String> {
     transaction
         .execute(
-            "INSERT INTO diagnostics (reason, count, updated_at_ms) VALUES (?1, ?2, ?3) ON CONFLICT(reason) DO UPDATE SET count=count+excluded.count, updated_at_ms=excluded.updated_at_ms",
+            "INSERT INTO diagnostics (reason, count, updated_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(reason) DO UPDATE SET count=count+excluded.count,
+             updated_at_ms=excluded.updated_at_ms",
             params![reason, increment, now_ms()],
         )
         .map_err(|_| "unable to persist diagnostic".to_string())?;
@@ -1176,8 +1902,64 @@ pub fn hash_account_key(salt: &[u8], identity: &str) -> String {
 mod tests {
     use super::*;
     use crate::collector::CollectionSummary;
-    use crate::models::AdvancedSettings;
-    use crate::pricing::embedded_codex_snapshot;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DATABASE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn database() -> (Database, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "nerfify-token-test-{}-{}.db",
+            std::process::id(),
+            TEST_DATABASE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut database = Database {
+            path: path.clone(),
+            connection: open_connection(&path).expect("temporary database"),
+        };
+        database.migrate().expect("schema");
+        (database, path)
+    }
+
+    fn event(
+        timestamp_ms: i64,
+        token_millions: Option<f64>,
+        used_percent: f64,
+        reset_at_ms: Option<i64>,
+    ) -> UsageEvent {
+        UsageEvent {
+            timestamp_ms,
+            model: "gpt-5.2-codex".into(),
+            input_tokens: (token_millions.unwrap_or(0.0) * 1_000_000.0) as u64,
+            output_tokens: 0,
+            quota_used_percent: Some(used_percent),
+            quota_reset_at_ms: reset_at_ms,
+            quota_window_minutes: Some(WEEKLY_WINDOW_MINUTES),
+            quota_limit_id: Some("codex".into()),
+            authenticated_official_codex: true,
+            ..UsageEvent::default()
+        }
+    }
+
+    fn persist(database: &mut Database, events: Vec<UsageEvent>) {
+        persist_for_account(database, events, None);
+    }
+
+    fn persist_for_account(
+        database: &mut Database,
+        events: Vec<UsageEvent>,
+        account_key: Option<&str>,
+    ) {
+        database
+            .persist_collection::<()>(
+                &CollectionSummary {
+                    events,
+                    ..CollectionSummary::default()
+                },
+                account_key,
+                None,
+            )
+            .expect("persist collection");
+    }
 
     #[test]
     fn account_key_is_salted_and_non_reversible() {
@@ -1185,473 +1967,304 @@ mod tests {
         let second = hash_account_key(b"salt-b", "account-primary");
         assert_ne!(first, second);
         assert!(!first.contains("account-primary"));
-        assert!(first.starts_with("acct_"));
     }
 
     #[test]
-    fn settings_validate_defaults() {
-        assert!(AdvancedSettings::default().validate().is_ok());
-    }
-
-    #[test]
-    fn migration_v5_discards_stale_pricing_for_reimport() {
-        let path = std::env::temp_dir().join(format!(
-            "nerfify-parser-migration-{}-{}.db",
-            std::process::id(),
-            now_ms()
-        ));
-        let mut database = Database {
-            path: path.clone(),
-            connection: open_connection(&path).expect("temporary database"),
+    fn cost_prices_cached_input_and_reasoning_output_once() {
+        let event = UsageEvent {
+            model: "gpt-5.2-codex".into(),
+            input_tokens: 100,
+            cached_input_tokens: 20,
+            output_tokens: 8,
+            reasoning_tokens: 3,
+            ..UsageEvent::default()
         };
-        database.migrate().expect("schema");
+        let (cost, source) = event_cost(&event, &AppSettings::default()).expect("official price");
+        // 80 normal input + 20 cached input + 8 output; reasoning is a subset of output.
+        assert_eq!(source, "official");
+        assert!((cost - ((80.0 * 1.75 + 20.0 * 0.175 + 8.0 * 14.0) / 1_000_000.0)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn token_interval_persists_full_week_estimate() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 42.0, Some(10_000)),
+                event(2_000, Some(0.42), 43.0, Some(10_000)),
+            ],
+        );
+        let quote = database
+            .latest_quote()
+            .expect("quote")
+            .expect("current quote");
+        assert_eq!(quote.estimated_weekly_value_usd, Some(73.5));
+        assert_eq!(quote.observed_cost_usd, Some(0.735));
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn zero_token_cost_leaves_current_estimate_pending() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, None, 42.0, Some(10_000)),
+                event(2_000, None, 43.0, Some(10_000)),
+            ],
+        );
+        let quote = database
+            .latest_quote()
+            .expect("quote")
+            .expect("pending quote");
+        assert_eq!(quote.status, QuoteStatus::Pending);
+        assert!(quote.estimated_weekly_value_usd.is_none());
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rebuild_reprices_known_models_imported_before_rates_existed() {
+        let (mut database, path) = database();
+        let mut baseline = event(1_000, Some(0.0), 10.0, Some(10_000));
+        baseline.model = "gpt-5.6-luna".into();
+        let mut usage = event(2_000, Some(1.0), 11.0, Some(10_000));
+        usage.model = "gpt-5.6-luna".into();
+        persist(&mut database, vec![baseline, usage]);
         database
             .connection
             .execute(
-                "INSERT INTO usage_events (
-                    fingerprint, timestamp_ms, model_id, input_tokens,
-                    cached_input_tokens, output_tokens, pricing_status
-                 ) VALUES ('old', 1, 'gpt-5.6-sol', 1, 0, 0, 'priced')",
+                "UPDATE usage_events
+                 SET eligible=0, pricing_status='not_applicable', cost_usd=NULL
+                 WHERE model_id='gpt-5.6-luna'",
                 [],
             )
-            .expect("old usage");
-        database
-            .connection
-            .pragma_update(None, "user_version", 3)
-            .expect("old schema version");
+            .expect("simulate stale import");
 
-        database.migrate().expect("parser migration");
+        database.rebuild_quotes().expect("reprice and rebuild");
 
-        let events: i64 = database
-            .connection
-            .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
-            .expect("usage count");
-        assert_eq!(events, 0);
-        drop(database);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn live_collection_produces_current_quote_and_history() {
-        let path = std::env::temp_dir().join(format!(
-            "nerfify-live-{}-{}.db",
-            std::process::id(),
-            now_ms()
-        ));
-        let mut database = Database {
-            path: path.clone(),
-            connection: open_connection(&path).expect("temporary database"),
-        };
-        database.migrate().expect("schema");
-        assert_eq!(
-            database
-                .connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .expect("schema version"),
-            5
-        );
-        let hot_path_indexes: i64 = database
+        let priced: i64 = database
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type='index' AND name IN (
-                     'idx_usage_events_account_pricing_time',
-                     'idx_quota_snapshots_account_limit_time',
-                     'idx_quota_snapshots_time',
-                     'idx_quotes_algorithm_time'
-                 )",
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE model_id='gpt-5.6-luna' AND eligible=1 AND pricing_status='official'",
                 [],
                 |row| row.get(0),
             )
-            .expect("hot path indexes");
-        assert_eq!(hot_path_indexes, 4);
-        let bucket_start = now_ms().div_euclid(1_800_000) * 1_800_000 - 10_800_000;
-        let reset_at_ms = bucket_start + 604_800_000;
-        let events = vec![
-            UsageEvent {
-                timestamp_ms: bucket_start + 60_000,
-                model: "gpt-5.6-sol".into(),
-                input_tokens: 1_000_000,
-                output_tokens: 100_000,
-                authenticated_official_codex: true,
-                quota_used_percent: Some(10.0),
-                quota_reset_at_ms: Some(reset_at_ms),
-                quota_window_minutes: Some(10_080.0),
-                quota_limit_id: Some("codex".into()),
-                ..UsageEvent::default()
-            },
-            UsageEvent {
-                timestamp_ms: bucket_start + 1_860_000,
-                model: "gpt-5.6-sol".into(),
-                input_tokens: 100_000,
-                output_tokens: 10_000,
-                authenticated_official_codex: true,
-                quota_used_percent: Some(12.0),
-                quota_reset_at_ms: Some(reset_at_ms),
-                quota_window_minutes: Some(10_080.0),
-                quota_limit_id: Some("codex".into()),
-                ..UsageEvent::default()
-            },
-            UsageEvent {
-                timestamp_ms: bucket_start + 1_920_000,
-                model: "gpt-5.6-sol".into(),
-                input_tokens: 100_000,
-                output_tokens: 10_000,
-                authenticated_official_codex: true,
-                quota_used_percent: Some(15.0),
-                quota_reset_at_ms: Some(reset_at_ms),
-                quota_window_minutes: Some(10_080.0),
-                quota_limit_id: Some("codex".into()),
-                ..UsageEvent::default()
-            },
-            UsageEvent {
-                timestamp_ms: bucket_start + 3_660_000,
-                model: "gpt-5.6-sol".into(),
-                input_tokens: 100_000,
-                output_tokens: 10_000,
-                authenticated_official_codex: true,
-                quota_used_percent: Some(20.0),
-                quota_reset_at_ms: Some(reset_at_ms),
-                quota_window_minutes: Some(10_080.0),
-                quota_limit_id: Some("codex".into()),
-                ..UsageEvent::default()
-            },
-            UsageEvent {
-                timestamp_ms: bucket_start + 3_720_000,
-                model: "gpt-5.6-sol".into(),
-                input_tokens: 100_000,
-                output_tokens: 10_000,
-                authenticated_official_codex: true,
-                quota_used_percent: Some(25.0),
-                quota_reset_at_ms: Some(reset_at_ms),
-                quota_window_minutes: Some(10_080.0),
-                quota_limit_id: Some("codex".into()),
-                ..UsageEvent::default()
-            },
-            UsageEvent {
-                timestamp_ms: bucket_start + 5_460_000,
-                model: "gpt-5.6-sol".into(),
-                input_tokens: 100_000,
-                output_tokens: 10_000,
-                authenticated_official_codex: true,
-                quota_used_percent: Some(95.0),
-                quota_reset_at_ms: Some(reset_at_ms),
-                quota_window_minutes: Some(10_080.0),
-                quota_limit_id: Some("codex".into()),
-                ..UsageEvent::default()
-            },
-            UsageEvent {
-                timestamp_ms: bucket_start + 5_520_000,
-                model: "gpt-5.6-sol".into(),
-                input_tokens: 100_000,
-                output_tokens: 10_000,
-                authenticated_official_codex: true,
-                quota_used_percent: Some(100.0),
-                quota_reset_at_ms: Some(reset_at_ms),
-                quota_window_minutes: Some(10_080.0),
-                quota_limit_id: Some("codex".into()),
-                ..UsageEvent::default()
-            },
-            UsageEvent {
-                timestamp_ms: bucket_start + 7_260_000,
-                model: "gpt-5.6-sol".into(),
-                input_tokens: 100_000_000,
-                output_tokens: 10_000_000,
-                authenticated_official_codex: true,
-                quota_used_percent: Some(100.0),
-                quota_reset_at_ms: Some(reset_at_ms),
-                quota_window_minutes: Some(10_080.0),
-                quota_limit_id: Some("codex".into()),
-                ..UsageEvent::default()
-            },
-            UsageEvent {
-                timestamp_ms: bucket_start + 7_320_000,
-                model: "gpt-5.6-sol".into(),
-                input_tokens: 100_000_000,
-                output_tokens: 10_000_000,
-                authenticated_official_codex: true,
-                quota_used_percent: Some(100.0),
-                quota_reset_at_ms: Some(reset_at_ms),
-                quota_window_minutes: Some(10_080.0),
-                quota_limit_id: Some("codex".into()),
-                ..UsageEvent::default()
-            },
-        ];
-        let pricing = embedded_codex_snapshot(&events, now_ms());
-        database
-            .persist_collection(
-                &CollectionSummary {
-                    events,
-                    ..CollectionSummary::default()
-                },
-                None,
-                Some(&pricing),
-            )
-            .expect("persist live data");
+            .expect("priced events");
+        assert_eq!(priced, 2);
         let quote = database
             .latest_quote()
             .expect("quote")
             .expect("current quote");
-        assert!(quote.value_usd.is_some_and(|value| value > 0.0));
-        assert_eq!(quote.weekly_used_percent, Some(100.0));
-        assert_eq!(quote.change_usd, None);
-        assert_eq!(quote.algorithm_version, "nerfify-estimator-v3");
-        let history = database.history(Range::W1).expect("history");
-        assert_eq!(history.points.len(), 3);
-        assert_eq!(history.statistics.current_value_usd, quote.value_usd);
-        assert!(history
-            .points
-            .iter()
-            .all(|point| point.value_usd.is_some_and(|value| value < 100.0)));
+        assert_eq!(quote.estimated_weekly_value_usd, Some(200.0));
         drop(database);
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn small_movements_accumulate_and_heartbeats_do_not_delay_settlement() {
-        let path = std::env::temp_dir().join(format!(
-            "nerfify-heartbeats-{}-{}.db",
-            std::process::id(),
-            now_ms()
-        ));
-        let mut database = Database {
-            path: path.clone(),
-            connection: open_connection(&path).expect("temporary database"),
-        };
-        database.migrate().expect("schema");
-        let bucket_start = now_ms().div_euclid(1_800_000) * 1_800_000 - 10_800_000;
-        let first_observation = bucket_start + 60_000;
-        let first_heartbeat = bucket_start + 120_000;
-        let eleven_observation = bucket_start + 180_000;
-        let eleven_heartbeat = bucket_start + 240_000;
-        let twelve_observation = bucket_start + 300_000;
-        let changed_observation = bucket_start + 360_000;
-        let changed_heartbeat = bucket_start + 420_000;
-        let reset_at_ms = bucket_start + Range::W1.duration_ms();
-        let events = [
-            (first_observation, 10.0),
-            (first_heartbeat, 10.0),
-            (eleven_observation, 11.0),
-            (eleven_heartbeat, 11.0),
-            (twelve_observation, 12.0),
-            (changed_observation, 13.0),
-            (changed_heartbeat, 13.0),
-        ]
-        .into_iter()
-        .map(|(timestamp_ms, quota_used_percent)| UsageEvent {
-            timestamp_ms,
-            model: "gpt-5.6-sol".into(),
-            input_tokens: 100_000,
-            output_tokens: 10_000,
-            authenticated_official_codex: true,
-            quota_used_percent: Some(quota_used_percent),
-            quota_reset_at_ms: Some(reset_at_ms),
-            quota_window_minutes: Some(10_080.0),
-            quota_limit_id: Some("codex".into()),
-            ..UsageEvent::default()
-        })
-        .collect::<Vec<_>>();
-        let pricing = embedded_codex_snapshot(&events, now_ms());
-        database
-            .persist_collection(
-                &CollectionSummary {
-                    events,
-                    ..CollectionSummary::default()
-                },
-                None,
-                Some(&pricing),
-            )
-            .expect("persist heartbeat data");
-
-        let history = database.history(Range::W1).expect("history");
-        assert_eq!(history.points.len(), 1);
-        assert_eq!(history.points[0].timestamp, changed_observation);
-
-        drop(database);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn history_weights_single_mixed_and_future_models() {
-        let path = std::env::temp_dir().join(format!(
-            "nerfify-history-{}-{}.db",
-            std::process::id(),
-            now_ms()
-        ));
-        let mut database = Database {
-            path: path.clone(),
-            connection: open_connection(&path).expect("temporary database"),
-        };
-        database.migrate().expect("schema");
-        let current = now_ms();
-        let prior_reset = current - 2 * Range::W1.duration_ms();
-        let current_reset = current + Range::W1.duration_ms();
-        let insert_quote = |connection: &Connection,
-                            timestamp: i64,
-                            cost: f64,
-                            quota_points: f64,
-                            used_percent: f64,
-                            model: &str,
-                            reset: i64| {
-            let value = cost / quota_points * 100.0;
-            connection
-                .execute(
-                    "INSERT INTO quota_snapshots (
-                            observed_at_ms, reset_at_ms, duration_minutes, limit_id,
-                            used_percent, connection_quality
-                         ) VALUES (?1, ?2, 10080.0, 'codex', ?3, 'good')",
-                    params![timestamp, reset, used_percent],
-                )
-                .expect("quota");
-            connection
-                .execute(
-                    "INSERT INTO quotes (
-                            timestamp_ms, value_usd, raw_value_usd, observed_cost_usd,
-                            weekly_used_percent, dominant_model, confidence, status,
-                            is_finalized, algorithm_version
-                         ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, 'high', 'valid', 1, ?6)",
-                    params![
-                        timestamp,
-                        value,
-                        cost,
-                        used_percent,
-                        model,
-                        ALGORITHM_VERSION
-                    ],
-                )
-                .expect("quote");
-        };
-        for (index, (cost, model)) in [
-            (0.9, "gpt-5.5"),
-            (1.0, "gpt-future-official"),
-            (0.944, "gpt-5.5"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            insert_quote(
-                &database.connection,
-                current - 10 * 86_400_000 + index as i64 * 21_600_000,
-                cost,
-                10.0,
-                (index + 1) as f64 * 10.0,
-                model,
-                prior_reset,
-            );
-        }
-        let current_intervals = [
-            (2.959_801_5, 3.0, "gpt-5.6-luna"),
-            (1.240_624_5, 8.0, "gpt-5.6-sol"),
-            (0.716_424_5, 10.0, "gpt-5.6-sol"),
-            (0.871_220_5, 8.0, "gpt-5.6-sol"),
-            (0.305_190_75, 3.0, "gpt-5.6-sol"),
-        ];
-        let mut used_percent = 0.0;
-        for (index, (cost, quota_points, model)) in current_intervals.into_iter().enumerate() {
-            used_percent += quota_points;
-            insert_quote(
-                &database.connection,
-                current - 4 * 3_600_000 + index as i64 * 3_600_000,
-                cost,
-                quota_points,
-                used_percent,
-                model,
-                current_reset,
-            );
-        }
-
-        let expected_current =
-            current_intervals.iter().map(|item| item.0).sum::<f64>() / used_percent * 100.0;
-        let expected_previous = (0.9 + 1.0 + 0.944) / 30.0 * 100.0;
-        let quote = database
-            .latest_quote()
-            .expect("quote")
-            .expect("current quote");
-        assert!(quote
-            .value_usd
-            .is_some_and(|value| (value - expected_current).abs() < 0.000_001));
-        assert!(quote
-            .observed_cost_usd
-            .is_some_and(|value| (value - 6.093_261_75).abs() < 0.000_001));
-        assert_eq!(quote.dominant_model.as_deref(), Some("mixed"));
-        assert!(quote
-            .change_usd
-            .is_some_and(
-                |value| (value - (expected_current - expected_previous)).abs() < 0.000_001
-            ));
-
-        let week = database.history(Range::W1).expect("week");
-        assert_eq!(week.points.len(), 5);
-        assert!(week
-            .statistics
-            .baseline_value_usd
-            .is_some_and(|value| (value - expected_previous).abs() < 0.000_001));
-        assert_eq!(
-            week.points.last().and_then(|point| point.value_usd),
-            Some(expected_current)
-        );
-        assert_eq!(
-            week.points
-                .last()
-                .and_then(|point| point.dominant_model.as_deref()),
-            Some("mixed")
-        );
-
-        let day = database.history(Range::D1).expect("day");
-        assert_eq!(day.statistics.baseline_value_usd, None);
-        assert_eq!(day.statistics.delta_percent, None);
-        drop(database);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn graph_keeps_manual_resets_exact_without_transient_old_cycles() {
-        let quote = |timestamp, value, epoch| WeightedQuote {
-            point: HistoryPoint {
-                timestamp,
-                value_usd: Some(value),
-                raw_value_usd: Some(value),
-                weekly_used_percent: Some(10.0),
-                is_finalized: true,
-                is_heartbeat: false,
-                dominant_model: None,
-                epoch: Some(epoch),
-            },
-            epoch,
-            observed_cost_usd: value / 10.0,
-        };
-        let quotes = vec![
-            quote(1, 40.0, 10),
-            quote(2, 20.0, 10),
-            quote(3, 30.0, 11),
-            quote(4, 25.0, 11),
-            quote(5, 18.0, 12),
-            quote(6, 19.0, 12),
-        ];
-
-        let points = graph_points(&quotes, 0, Some(12), true);
-
-        assert_eq!(
-            points
-                .iter()
-                .map(|point| (point.timestamp, point.value_usd))
-                .collect::<Vec<_>>(),
+    fn changed_reset_timestamp_starts_a_new_window_without_crossing() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
             vec![
-                (2, Some(20.0)),
-                (4, Some(25.0)),
-                (5, Some(18.0)),
-                (6, Some(19.0))
-            ]
+                event(1_000, Some(0.0), 10.0, Some(10_000)),
+                event(2_000, Some(0.4), 11.0, Some(10_000)),
+                event(3_000, Some(0.5), 12.0, Some(20_000)),
+            ],
         );
-        assert!(points.iter().all(|point| point.epoch.is_none()));
+        let windows: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM epochs", [], |row| row.get(0))
+            .expect("windows");
+        assert_eq!(windows, 2);
+        let measurements: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM measurements WHERE status='valid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("measurements");
+        assert_eq!(measurements, 1);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
 
-        let long_range = graph_points(&quotes, 0, Some(12), false);
-        assert_eq!(
-            long_range
-                .iter()
-                .map(|point| (point.timestamp, point.value_usd))
-                .collect::<Vec<_>>(),
-            vec![(2, Some(20.0)), (4, Some(25.0)), (6, Some(19.0))]
+    #[test]
+    fn scheduled_reset_and_usage_decrease_are_recorded() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 80.0, Some(2_000)),
+                event(2_000, Some(0.1), 10.0, Some(2_000)),
+            ],
         );
+        let reason: String = database
+            .connection
+            .query_row(
+                "SELECT reset_reason FROM epochs ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("reason");
+        assert_eq!(reason, "scheduled_reset");
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn restart_rebuilds_the_same_active_window_and_measurement() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 42.0, Some(10_000)),
+                event(2_000, Some(0.42), 43.0, Some(10_000)),
+            ],
+        );
+        let before = database.latest_quote().expect("before").expect("quote");
+        drop(database);
+        let mut reopened = Database {
+            path: path.clone(),
+            connection: open_connection(&path).expect("reopen database"),
+        };
+        reopened.migrate().expect("reopen schema");
+        reopened.rebuild_quotes().expect("rebuild");
+        let after = reopened.latest_quote().expect("after").expect("quote");
+        assert_eq!(
+            before.estimated_weekly_value_usd,
+            after.estimated_weekly_value_usd
+        );
+        let valid: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM measurements WHERE status='valid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("valid measurements");
+        assert_eq!(valid, 1);
+        drop(reopened);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn late_out_of_order_observation_stays_in_its_timestamp_window() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(3_000, Some(0.5), 5.0, Some(20_000)),
+                event(1_000, Some(0.0), 10.0, Some(10_000)),
+                event(2_000, Some(0.4), 11.0, Some(10_000)),
+            ],
+        );
+        let valid: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM measurements WHERE status='valid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("valid measurements");
+        assert_eq!(valid, 1);
+        let delta: f64 = database
+            .connection
+            .query_row(
+                "SELECT cost_delta_usd FROM measurements WHERE status='valid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cost delta");
+        assert_eq!(delta, 0.7);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn interleaved_account_observations_keep_each_account_window_intact() {
+        let (mut database, path) = database();
+        for account_key in ["account-a", "account-b"] {
+            database
+                .connection
+                .execute(
+                    "INSERT INTO accounts (account_key, created_at_ms, last_seen_at_ms)
+                     VALUES (?1, 0, 0)",
+                    params![account_key],
+                )
+                .expect("account");
+        }
+        persist_for_account(
+            &mut database,
+            vec![event(1_000, Some(0.0), 10.0, Some(10_000))],
+            Some("account-a"),
+        );
+        persist_for_account(
+            &mut database,
+            vec![event(2_000, Some(0.1), 50.0, Some(10_000))],
+            Some("account-b"),
+        );
+        persist_for_account(
+            &mut database,
+            vec![event(3_000, Some(0.4), 11.0, Some(10_000))],
+            Some("account-a"),
+        );
+        let valid: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM measurements WHERE status='valid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("valid measurements");
+        assert_eq!(valid, 1);
+        let windows: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM epochs", [], |row| row.get(0))
+            .expect("windows");
+        assert_eq!(windows, 2);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn credit_migration_preserves_raw_events_but_invalidates_old_derived_rows() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 42.0, Some(10_000)),
+                event(2_000, Some(0.42), 43.0, Some(10_000)),
+            ],
+        );
+        database
+            .connection
+            .execute(
+                "INSERT INTO quotes (timestamp_ms, value_usd, confidence, status, algorithm_version)
+                 VALUES (1, 1, 'high', 'valid', 'legacy')",
+                [],
+            )
+            .expect("legacy derived row");
+        database
+            .connection
+            .pragma_update(None, "user_version", 5)
+            .expect("legacy version");
+        database.migrate().expect("credit migration");
+        let events: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
+            .expect("raw events");
+        let quotes: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM quotes", [], |row| row.get(0))
+            .expect("quotes");
+        assert_eq!(events, 2);
+        assert_eq!(quotes, 0);
+        drop(database);
+        let _ = fs::remove_file(path);
     }
 }

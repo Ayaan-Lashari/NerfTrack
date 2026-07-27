@@ -13,7 +13,7 @@ const minute = 60_000;
 const hour = 60 * minute;
 const day = 24 * hour;
 
-export const demoNow = Date.UTC(2026, 4, 12, 15, 0, 0);
+export const demoNow = Date.now();
 
 const rangeDuration: Record<Range, number> = {
   '1D': day,
@@ -39,16 +39,16 @@ export const demoStatus: AppStatus = {
   accountState: 'authenticated',
   connectionQuality: 'good',
   plan: 'ChatGPT Plus',
-  resetAt: Date.UTC(2026, 4, 15),
+  resetAt: demoNow + 2 * day + 7 * hour,
   lastUpdatedAt: demoNow,
   codexHome: {
     state: 'auto_detected',
-    redactedLocation: '~/Library/Application Support/Codex',
+    redactedLocation: '<codex-data-directory>',
     message: 'Auto-detected',
   },
   codexExecutable: {
     state: 'auto_detected',
-    redactedLocation: '/usr/local/bin/codex',
+    redactedLocation: 'Detected Codex executable',
     message: 'Auto-detected',
   },
   appServer: {
@@ -60,36 +60,51 @@ export const demoStatus: AppStatus = {
 };
 
 export const demoQuote: CurrentQuote = {
-  valueUsd: 371.28,
-  changeUsd: -18.42,
+  estimatedWeeklyValueUsd: 371.28,
+  changeValueUsd: -18.42,
   changePercent: -4.73,
-  observedCostUsd: 77.49,
+  observedCostUsd: 138.6,
   weeklyUsedPercent: 34,
   resetAt: demoStatus.resetAt,
+  resetReason: 'scheduled_reset',
   status: 'valid',
-  dominantModel: 'gpt-5-codex',
-  algorithmVersion: 'nerfify-estimator-v3',
+  algorithmVersion: 'nerfify-token-api-equivalent-v2',
   confidence: 'high',
-  note: 'Values are estimates based on observed local usage and may differ from actual API pricing.',
+  validObservationCount: 6,
+  percentageCoverage: 34,
+  pricingSource: 'official',
+  modelStatus: 'official',
+  note: 'Rolling median of cumulative weekly cost-per-percent estimates.',
 };
 
 export const demoAnnotations: Annotation[] = [
-  { id: 'weekly-reset', timestamp: Date.UTC(2026, 4, 7, 0), label: 'Weekly reset', kind: 'reset' },
+  {
+    id: 'weekly-reset',
+    timestamp: Date.UTC(2026, 4, 7, 0),
+    label: 'Weekly window · scheduled reset',
+    kind: 'reset',
+  },
+  {
+    id: 'manual-reset',
+    timestamp: Date.UTC(2026, 4, 10, 6),
+    label: 'Weekly window · reported reset changed',
+    kind: 'reset',
+  },
 ];
 
 export const demoDiagnostics: DiagnosticsSummary = {
   totalEvents: 846,
   pricedEvents: 812,
-  pendingEvents: 22,
-  rejectedEvents: 12,
+  pendingEvents: 34,
+  rejectedEvents: 0,
   unattributedEvents: 0,
   partialLineRetries: 4,
   monitoringGaps: 0,
   hiddenResets: 0,
   reasons: [
-    { reason: 'Missing pricing snapshot', count: 22 },
-    { reason: 'Unknown provider evidence', count: 8 },
-    { reason: 'Unsupported record shape', count: 4 },
+    { reason: 'Unknown API price for model', count: 22 },
+    { reason: 'Reported reset changed', count: 1 },
+    { reason: 'Waiting for positive paired deltas', count: 11 },
   ],
   modelIds: ['gpt-5-codex', 'gpt-5-codex-mini'],
   privacy: 'Prompts, account identifiers, and full local paths are never stored or returned.',
@@ -99,11 +114,6 @@ export const defaultAdvancedSettings: AdvancedSettings = {
   refreshIntervalSeconds: 10,
   reconciliationIntervalHours: 1,
   monitoringGapMinutes: 5,
-  settlementWindowSeconds: 60,
-  minimumQuotaMovementPoints: 3,
-  minimumEligibleCostUsd: 0.25,
-  minimumEvents: 2,
-  lowUsageQuarantinePercent: 3,
   reducedMotion: false,
 };
 
@@ -114,6 +124,7 @@ export const demoSettings: AppSettings = {
   localOnly: true,
   telemetry: false,
   autoUpdater: false,
+  customPricing: [],
 };
 
 export function getDemoHistory(range: Range): HistoryResponse {
@@ -121,34 +132,33 @@ export function getDemoHistory(range: Range): HistoryResponse {
     range === '1D' ? 96 : range === '1W' ? 168 : range === '1M' ? 180 : range === '3M' ? 270 : 360;
   const duration = rangeDuration[range];
   const step = duration / Math.max(total - 1, 1);
+  const resetIndex = Math.floor(total * 0.52);
   const points = Array.from({ length: total }, (_, index) => {
     const progress = index / Math.max(total - 1, 1);
     const wave = Math.sin(index * 0.36) * 1.8 + Math.sin(index * 0.11) * 2.7;
     const noise = ((index * 17) % 11) * 0.08;
     const trend = progress * -29;
-    const resetBump = range === '1W' && index > total * 0.45 && index < total * 0.48 ? 3.2 : 0;
-    const value = 401 + trend + wave + noise + resetBump;
+    const estimatedValueUsd = Number((401 + trend + wave * 0.72 + noise * 0.16).toFixed(2));
     return {
       timestamp: demoNow - duration + index * step,
-      valueUsd: Number(value.toFixed(2)),
-      rawValueUsd: Number((value - 0.7).toFixed(2)),
+      estimatedWeeklyValueUsd: estimatedValueUsd,
+      observedCostUsd: Number((progress * 138.6).toFixed(2)),
       weeklyUsedPercent: Math.max(4, Number((11 + progress * 23).toFixed(1))),
+      resetAt: index >= resetIndex ? Date.UTC(2026, 4, 14) : Date.UTC(2026, 4, 7),
+      resetReason: index === resetIndex ? 'reported_reset_changed' : 'scheduled_reset',
       isFinalized: index < total - 2,
       isHeartbeat: index % 10 === 0,
-      dominantModel: index % 6 === 0 ? 'gpt-5-codex-mini' : 'gpt-5-codex',
-      epoch: Math.floor(index / Math.max(Math.floor(total / 3), 1)),
+      epoch: index < resetIndex ? 1 : 2,
     };
   });
-  const finalValue = demoQuote.valueUsd ?? 0;
-  points[points.length - 1].valueUsd = finalValue;
-  points[points.length - 1].rawValueUsd = finalValue;
+  points[points.length - 1].estimatedWeeklyValueUsd = demoQuote.estimatedWeeklyValueUsd ?? 0;
   return {
     points,
     statistics: {
       range,
-      baselineValueUsd: points[0].valueUsd,
-      currentValueUsd: demoQuote.valueUsd,
-      deltaUsd: demoQuote.changeUsd,
+      baselineEstimatedWeeklyValueUsd: points[0].estimatedWeeklyValueUsd,
+      currentEstimatedWeeklyValueUsd: demoQuote.estimatedWeeklyValueUsd,
+      deltaValueUsd: demoQuote.changeValueUsd,
       deltaPercent: demoQuote.changePercent,
       pointCount: points.length,
       partial: range !== '1D',

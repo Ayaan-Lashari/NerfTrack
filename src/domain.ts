@@ -34,35 +34,40 @@ export interface AppStatus {
 }
 
 export interface CurrentQuote {
-  valueUsd: number | null;
-  changeUsd: number | null;
+  estimatedWeeklyValueUsd: number | null;
+  changeValueUsd: number | null;
   changePercent: number | null;
   observedCostUsd: number | null;
   weeklyUsedPercent: number | null;
   resetAt: number | null;
+  resetReason: string | null;
   status: 'valid' | 'pending' | 'empty' | 'unsupported' | 'error';
-  dominantModel: string | null;
   algorithmVersion: string;
   confidence: 'high' | 'medium' | 'low' | 'none';
+  validObservationCount: number;
+  percentageCoverage: number | null;
+  pricingSource: string | null;
+  modelStatus: string | null;
   note: string | null;
 }
 
 export interface HistoryPoint {
   timestamp: number;
-  valueUsd: number | null;
-  rawValueUsd: number | null;
+  estimatedWeeklyValueUsd: number | null;
+  observedCostUsd: number | null;
   weeklyUsedPercent: number | null;
+  resetAt: number | null;
+  resetReason: string | null;
   isFinalized: boolean;
   isHeartbeat: boolean;
-  dominantModel: string | null;
   epoch: number | null;
 }
 
 export interface RangeStatistics {
   range: Range;
-  baselineValueUsd: number | null;
-  currentValueUsd: number | null;
-  deltaUsd: number | null;
+  baselineEstimatedWeeklyValueUsd: number | null;
+  currentEstimatedWeeklyValueUsd: number | null;
+  deltaValueUsd: number | null;
   deltaPercent: number | null;
   pointCount: number;
   partial: boolean;
@@ -99,11 +104,6 @@ export interface AdvancedSettings {
   refreshIntervalSeconds: number;
   reconciliationIntervalHours: number;
   monitoringGapMinutes: number;
-  settlementWindowSeconds: number;
-  minimumQuotaMovementPoints: number;
-  minimumEligibleCostUsd: number;
-  minimumEvents: number;
-  lowUsageQuarantinePercent: number;
   reducedMotion: boolean;
 }
 
@@ -113,6 +113,15 @@ export interface AppSettings extends AdvancedSettings {
   localOnly: true;
   telemetry: false;
   autoUpdater: false;
+  customPricing: Array<CustomPriceOverride>;
+}
+
+export interface CustomPriceOverride {
+  modelId: string;
+  alias: string | null;
+  inputUsdPerMillion: number;
+  cachedInputUsdPerMillion: number;
+  outputUsdPerMillion: number;
 }
 
 export interface RedactedSelection {

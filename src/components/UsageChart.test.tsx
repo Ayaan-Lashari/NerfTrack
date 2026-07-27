@@ -13,14 +13,14 @@ describe('UsageChart', () => {
         annotations={demoAnnotations}
         range="1W"
         reducedMotion={false}
-        changeUsd={-1}
+        changeValueUsd={-1}
       />,
     );
-    const chart = screen.getByRole('img', { name: /Estimated weekly API equivalent/ });
+    const chart = screen.getByRole('img', { name: /Estimated weekly API-equivalent value/ });
     expect(chart.closest('.usage-chart')).toHaveClass('chart-negative');
     await user.click(chart);
     await user.keyboard('{ArrowLeft}');
-    expect(screen.getAllByText(/May/).length).toBeGreaterThan(0);
+    expect(document.querySelector('.scrub-readout')).toHaveTextContent(/Observed:/);
   });
 
   it('scrubs continuously while dragging', () => {
@@ -34,7 +34,7 @@ describe('UsageChart', () => {
         onScrub={onScrub}
       />,
     );
-    const chart = screen.getByRole('img', { name: /Estimated weekly API equivalent/ });
+    const chart = screen.getByRole('img', { name: /Estimated weekly API-equivalent value/ });
     vi.spyOn(chart, 'getBoundingClientRect').mockReturnValue({
       left: 0,
       top: 0,
@@ -64,22 +64,24 @@ describe('UsageChart', () => {
     const points = [
       {
         timestamp: 0,
-        valueUsd: 0,
-        rawValueUsd: 0,
+        estimatedWeeklyValueUsd: 0,
+        observedCostUsd: 0,
         weeklyUsedPercent: 0,
+        resetAt: null,
+        resetReason: null,
         isFinalized: true,
         isHeartbeat: false,
-        dominantModel: null,
         epoch: 1,
       },
       {
         timestamp: 86_400_000,
-        valueUsd: 100,
-        rawValueUsd: 100,
+        estimatedWeeklyValueUsd: 100,
+        observedCostUsd: 10,
         weeklyUsedPercent: 100,
+        resetAt: null,
+        resetReason: null,
         isFinalized: true,
         isHeartbeat: false,
-        dominantModel: null,
         epoch: 1,
       },
     ];
@@ -92,7 +94,7 @@ describe('UsageChart', () => {
         onScrub={onScrub}
       />,
     );
-    const chart = screen.getByRole('img', { name: /Estimated weekly API equivalent/ });
+    const chart = screen.getByRole('img', { name: /Estimated weekly API-equivalent value/ });
     vi.spyOn(chart, 'getBoundingClientRect').mockReturnValue({
       left: 0,
       top: 0,
@@ -111,7 +113,7 @@ describe('UsageChart', () => {
 
     const interpolated = onScrub.mock.calls.at(-1)?.[0];
     expect(interpolated.timestamp).toBeCloseTo(43_200_000);
-    expect(interpolated.valueUsd).toBeCloseTo(50);
+    expect(interpolated.estimatedWeeklyValueUsd).toBeCloseTo(50);
     expect(interpolated.timestamp).not.toBe(points[0].timestamp);
     expect(interpolated.timestamp).not.toBe(points[1].timestamp);
 
@@ -128,5 +130,19 @@ describe('UsageChart', () => {
 
     const path = document.querySelector('.chart-line');
     expect(path?.getAttribute('d')?.match(/M /g)).toHaveLength(2);
+  });
+
+  it('renders fixture API-equivalent values with a manual reset boundary', () => {
+    render(
+      <UsageChart
+        points={getDemoHistory('1W').points}
+        annotations={demoAnnotations}
+        range="1W"
+        reducedMotion={false}
+      />,
+    );
+    expect(screen.getByText('Estimated weekly API-equivalent value')).toBeInTheDocument();
+    expect(screen.getByText('USD · local token-derived estimate')).toBeInTheDocument();
+    expect(document.querySelector('.chart-line')?.getAttribute('d')?.match(/M /g)?.length).toBe(2);
   });
 });
