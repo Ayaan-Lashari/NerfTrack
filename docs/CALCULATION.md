@@ -10,7 +10,7 @@ percent_delta = current_weekly_used_percent - previous_weekly_used_percent
 estimated_weekly_api_equivalent_usd = cost_delta_usd / (percent_delta / 100)
 ```
 
-The visible value is the bounded median of the latest seven valid interval estimates. Raw interval cost, percentage deltas, and estimates stay local for audit. Zero or negative cost movement, no percentage movement, unknown pricing, or a reset boundary is pending/rejected rather than converted into an estimate.
+Each history point shows the unsmoothed cumulative cost-per-usage estimate for that observation. The headline remains the median of the latest seven valid cumulative estimates so short-lived noise does not redefine the current projection. Raw interval cost, percentage deltas, cumulative estimates, confidence, and coverage stay local for audit. Zero or negative cost movement, no percentage movement, unknown pricing, or a reset boundary is pending/rejected rather than converted into an estimate.
 
 ## Pricing and overrides
 
@@ -26,6 +26,8 @@ User-provided model overrides are local-only and take precedence over verified b
 
 ## Windows, reset safety, and migration
 
-Only 10,080-minute weekly limits are used. Windows are separated by account, limit ID, and reset identity; a changed reset timestamp, material usage decline, or scheduled boundary starts a new window. The first point is a baseline, not a reset annotation. Out-of-order events are rebuilt in timestamp order and cannot form cross-window intervals.
+Only 10,080-minute weekly limits are used. Windows are separated by account and limit ID. Reported reset timestamps within five minutes are treated as one reset identity so normal server jitter cannot fragment a weekly allowance. A larger reset-time change or an observed scheduled boundary starts a new window. A usage regression before the reported reset is retained in raw quota history but excluded from estimation as stale/out-of-order data. Event costs are attributed by the accepted epoch's time bounds rather than exact reset timestamp equality.
 
-Schema migration 7 preserves raw usage events, quota observations, accounts, and checkpoints, but invalidates incompatible derived estimates, measurements, and charts. Algorithm version: `nerfify-token-api-equivalent-v2`. All processing and override storage is local; prompts, raw JSONL, credentials, account identifiers, and complete paths are not returned.
+Range changes are calculated only when both endpoints have medium or high confidence, the baseline lies inside the selected range, and it precedes the current estimate. Otherwise the comparison is unavailable rather than inferred from stale or low-coverage history.
+
+Schema migration 8 preserves raw usage events, quota observations, accounts, settings, user annotations, and checkpoints, but invalidates and rebuilds incompatible derived estimates, measurements, epochs, and charts. Algorithm version: `nerfify-token-api-equivalent-v3`. All processing and override storage is local; prompts, raw JSONL, credentials, account identifiers, and complete paths are not returned.

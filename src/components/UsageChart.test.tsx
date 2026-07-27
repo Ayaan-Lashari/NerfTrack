@@ -65,6 +65,7 @@ describe('UsageChart', () => {
       {
         timestamp: 0,
         estimatedWeeklyValueUsd: 0,
+        rawEstimatedWeeklyValueUsd: 0,
         observedCostUsd: 0,
         weeklyUsedPercent: 0,
         resetAt: null,
@@ -72,10 +73,13 @@ describe('UsageChart', () => {
         isFinalized: true,
         isHeartbeat: false,
         epoch: 1,
+        confidence: 'high' as const,
+        percentageCoverage: 20,
       },
       {
         timestamp: 86_400_000,
         estimatedWeeklyValueUsd: 100,
+        rawEstimatedWeeklyValueUsd: 100,
         observedCostUsd: 10,
         weeklyUsedPercent: 100,
         resetAt: null,
@@ -83,6 +87,8 @@ describe('UsageChart', () => {
         isFinalized: true,
         isHeartbeat: false,
         epoch: 1,
+        confidence: 'high' as const,
+        percentageCoverage: 40,
       },
     ];
     render(
@@ -130,6 +136,30 @@ describe('UsageChart', () => {
 
     const path = document.querySelector('.chart-line');
     expect(path?.getAttribute('d')?.match(/M /g)).toHaveLength(2);
+  });
+
+  it('plots raw estimates and excludes comparison baselines from axis bounds', () => {
+    const points = getDemoHistory('1D')
+      .points.slice(0, 2)
+      .map((point, index) => ({
+        ...point,
+        estimatedWeeklyValueUsd: 50,
+        rawEstimatedWeeklyValueUsd: index === 0 ? 10 : 90,
+      }));
+    render(
+      <UsageChart
+        points={points}
+        annotations={[]}
+        range="1D"
+        reducedMotion={false}
+        baselineEstimatedWeeklyValueUsd={-1_000}
+      />,
+    );
+
+    const path = document.querySelector('.chart-line')?.getAttribute('d') ?? '';
+    const yCoordinates = [...path.matchAll(/[ML] [\d.]+ ([\d.]+)/g)].map((match) => match[1]);
+    expect(new Set(yCoordinates).size).toBe(2);
+    expect(screen.queryByText('$-1000')).not.toBeInTheDocument();
   });
 
   it('renders fixture API-equivalent values with a manual reset boundary', () => {

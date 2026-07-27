@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const ALGORITHM_VERSION: &str = "nerfify-token-api-equivalent-v2";
+pub const ALGORITHM_VERSION: &str = "nerfify-token-api-equivalent-v3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -178,6 +178,7 @@ pub struct CurrentQuote {
 pub struct HistoryPoint {
     pub timestamp: i64,
     pub estimated_weekly_value_usd: Option<f64>,
+    pub raw_estimated_weekly_value_usd: Option<f64>,
     pub observed_cost_usd: Option<f64>,
     pub weekly_used_percent: Option<f64>,
     pub reset_at: Option<i64>,
@@ -185,6 +186,8 @@ pub struct HistoryPoint {
     pub is_finalized: bool,
     pub is_heartbeat: bool,
     pub epoch: Option<i64>,
+    pub confidence: Confidence,
+    pub percentage_coverage: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +195,7 @@ pub struct HistoryPoint {
 pub struct RangeStatistics {
     pub range: Range,
     pub baseline_estimated_weekly_value_usd: Option<f64>,
+    pub baseline_timestamp: Option<i64>,
     pub current_estimated_weekly_value_usd: Option<f64>,
     pub delta_value_usd: Option<f64>,
     pub delta_percent: Option<f64>,

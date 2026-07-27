@@ -90,7 +90,7 @@ describe('Nerfify app shell', () => {
 
     await user.click(screen.getByRole('tab', { name: '1M' }));
 
-    expect(screen.getByText('Past Month')).toBeInTheDocument();
+    expect(screen.getByText(/^Since /)).toBeInTheDocument();
     expect(screen.getByRole('img', { name: /Estimated weekly API-equivalent value/ })).toBe(chart);
   });
 });

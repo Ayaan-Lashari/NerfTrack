@@ -1,4 +1,5 @@
 export type Range = '1D' | '1W' | '1M' | '3M' | '6M';
+export type Confidence = 'high' | 'medium' | 'low' | 'none';
 
 export type AppStatusState =
   | 'connected'
@@ -43,7 +44,7 @@ export interface CurrentQuote {
   resetReason: string | null;
   status: 'valid' | 'pending' | 'empty' | 'unsupported' | 'error';
   algorithmVersion: string;
-  confidence: 'high' | 'medium' | 'low' | 'none';
+  confidence: Confidence;
   validObservationCount: number;
   percentageCoverage: number | null;
   pricingSource: string | null;
@@ -54,6 +55,7 @@ export interface CurrentQuote {
 export interface HistoryPoint {
   timestamp: number;
   estimatedWeeklyValueUsd: number | null;
+  rawEstimatedWeeklyValueUsd: number | null;
   observedCostUsd: number | null;
   weeklyUsedPercent: number | null;
   resetAt: number | null;
@@ -61,11 +63,14 @@ export interface HistoryPoint {
   isFinalized: boolean;
   isHeartbeat: boolean;
   epoch: number | null;
+  confidence: Confidence;
+  percentageCoverage: number | null;
 }
 
 export interface RangeStatistics {
   range: Range;
   baselineEstimatedWeeklyValueUsd: number | null;
+  baselineTimestamp: number | null;
   currentEstimatedWeeklyValueUsd: number | null;
   deltaValueUsd: number | null;
   deltaPercent: number | null;

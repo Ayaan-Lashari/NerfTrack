@@ -170,6 +170,7 @@ function RangeSelector({ range, onChange }: { range: Range; onChange: (range: Ra
   );
 }
 
+// harn:assume reliable-range-comparisons ref=range-comparison-display scope=function
 function HomeView({
   status,
   quote,
@@ -197,12 +198,14 @@ function HomeView({
     point: HistoryPoint;
     anchor: HistoryPoint | null;
   } | null>(null);
-  const displayValue =
-    scrubbed?.point.estimatedWeeklyValueUsd ?? quote?.estimatedWeeklyValueUsd ?? null;
+  const displayValue = scrubbed
+    ? (scrubbed.point.rawEstimatedWeeklyValueUsd ?? scrubbed.point.estimatedWeeklyValueUsd)
+    : (quote?.estimatedWeeklyValueUsd ?? null);
   const stableEstimate = hasStableEstimate(quote) && !scrubbed;
   const comparisonValue =
     stableEstimate || scrubbed
-      ? (scrubbed?.anchor?.estimatedWeeklyValueUsd ??
+      ? (scrubbed?.anchor?.rawEstimatedWeeklyValueUsd ??
+        scrubbed?.anchor?.estimatedWeeklyValueUsd ??
         history.statistics.baselineEstimatedWeeklyValueUsd ??
         null)
       : null;
@@ -221,7 +224,14 @@ function HomeView({
         })
       : history.statistics.baselineEstimatedWeeklyValueUsd === null
         ? `${rangeLabels[range]} unavailable`
-        : rangeLabels[range];
+        : history.statistics.partial && history.statistics.baselineTimestamp !== null
+          ? `Since ${new Date(history.statistics.baselineTimestamp).toLocaleString('en-US', {
+              month: 'short',
+              day: 'numeric',
+              hour: range === '1D' ? 'numeric' : undefined,
+              minute: range === '1D' ? '2-digit' : undefined,
+            })}`
+          : rangeLabels[range];
   const isEmpty = displayValue === null || !quote || quote.status === 'empty';
   const selectRange = (nextRange: Range) => {
     setScrubbed(null);
@@ -538,6 +548,7 @@ export default function App() {
         statistics: {
           range,
           baselineEstimatedWeeklyValueUsd: null,
+          baselineTimestamp: null,
           currentEstimatedWeeklyValueUsd: null,
           deltaValueUsd: null,
           deltaPercent: null,

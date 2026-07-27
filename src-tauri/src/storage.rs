@@ -15,6 +15,7 @@ use crate::parser::{event_fingerprint, UsageEvent};
 
 const WEEKLY_WINDOW_MINUTES: f64 = 10_080.0;
 const WEEKLY_WINDOW_TOLERANCE_MINUTES: f64 = 240.0;
+const RESET_TIMESTAMP_JITTER_MS: i64 = 5 * 60 * 1_000;
 
 #[derive(Clone, Copy)]
 struct ApiPrice {
@@ -253,6 +254,7 @@ fn empty_history(range: Range) -> HistoryResponse {
         statistics: RangeStatistics {
             range,
             baseline_estimated_weekly_value_usd: None,
+            baseline_timestamp: None,
             current_estimated_weekly_value_usd: None,
             delta_value_usd: None,
             delta_percent: None,
@@ -618,6 +620,21 @@ impl Database {
                  COMMIT;",
             ).map_err(|error| format!("token estimator migration failed: {error}"))?;
         }
+        if previous_version < 8 {
+            self.connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     DELETE FROM quotes;
+                     DELETE FROM measurements;
+                     DELETE FROM epochs;
+                     DELETE FROM chart_heartbeats;
+                     INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms)
+                         VALUES (8, strftime('%s','now') * 1000);
+                     PRAGMA user_version=8;
+                     COMMIT;",
+                )
+                .map_err(|error| format!("usage history correction migration failed: {error}"))?;
+        }
         if self.load_settings().is_err() {
             self.save_settings(&AppSettings::default())?;
         }
@@ -940,7 +957,14 @@ impl Database {
             .execute("DELETE FROM epochs", [])
             .map_err(|_| "unable to clear stale weekly windows".to_string())?;
 
-        let groups = Self::window_groups(observations);
+        let (groups, stale_regressions) = Self::window_groups(observations);
+        if stale_regressions > 0 {
+            add_diagnostic(
+                transaction,
+                "stale pre-reset weekly usage regression",
+                stale_regressions as i64,
+            )?;
+        }
         for group in groups {
             let window_id = transaction
                 .query_row(
@@ -993,31 +1017,33 @@ impl Database {
         Ok(observations)
     }
 
-    fn window_groups(observations: Vec<QuotaPoint>) -> Vec<WindowGroup> {
+    // harn:assume jitter-safe-weekly-windows ref=window-reconstruction scope=function
+    fn window_groups(observations: Vec<QuotaPoint>) -> (Vec<WindowGroup>, usize) {
         let mut groups_by_stream =
             HashMap::<(Option<String>, Option<String>), Vec<WindowGroup>>::new();
+        let mut stale_regressions = 0;
         for current in observations {
             let groups = groups_by_stream
                 .entry((current.account_key.clone(), current.limit_id.clone()))
                 .or_default();
             let new_reason = groups.last().and_then(|group| {
                 let previous = group.points.last()?;
-                if previous.reset_at_ms != current.reset_at_ms {
+                let reset_changed = match (group.reset_at_ms, current.reset_at_ms) {
+                    (Some(left), Some(right)) => {
+                        left.abs_diff(right) > RESET_TIMESTAMP_JITTER_MS as u64
+                    }
+                    _ => false,
+                };
+                if reset_changed {
                     return Some("reported_reset_changed");
                 }
                 if current.used_percent
                     < previous.used_percent - crate::estimator::MATERIAL_USAGE_DECREASE_PERCENT
                 {
-                    return Some(
-                        if previous
-                            .reset_at_ms
-                            .is_some_and(|reset| current.observed_at_ms >= reset)
-                        {
-                            "scheduled_reset"
-                        } else {
-                            "usage_decreased"
-                        },
-                    );
+                    return previous
+                        .reset_at_ms
+                        .is_some_and(|reset| current.observed_at_ms >= reset)
+                        .then_some("scheduled_reset");
                 }
                 None
             });
@@ -1032,6 +1058,13 @@ impl Database {
                     points: vec![current],
                 });
             } else if let Some(group) = groups.last_mut() {
+                if group.points.last().is_some_and(|previous| {
+                    current.used_percent
+                        < previous.used_percent - crate::estimator::MATERIAL_USAGE_DECREASE_PERCENT
+                }) {
+                    stale_regressions += 1;
+                    continue;
+                }
                 group.ended_at_ms = current.observed_at_ms;
                 group.points.push(current);
             } else {
@@ -1050,9 +1083,10 @@ impl Database {
         }
         let mut groups = groups_by_stream.into_values().flatten().collect::<Vec<_>>();
         groups.sort_by_key(|group| group.started_at_ms);
-        groups
+        (groups, stale_regressions)
     }
 
+    // harn:assume raw-history-stable-headline ref=history-signal-contract scope=function
     fn rebuild_group(
         transaction: &Transaction<'_>,
         group: &WindowGroup,
@@ -1151,11 +1185,12 @@ impl Database {
                                 percentage_coverage, valid_observation_count, window_id,
                                 window_start_ms, window_end_ms, reported_reset_at_ms,
                                 reset_reason, credit_source
-                             ) VALUES (?1, ?2, ?2, ?3, ?4, NULL, ?5, 'valid', 1, ?6,
-                                ?2, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 'valid', 1, ?7,
+                                ?2, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                             params![
                                 current.observed_at_ms,
                                 smoothed_value,
+                                cumulative_estimate,
                                 observed_cost,
                                 current.used_percent,
                                 confidence,
@@ -1262,15 +1297,8 @@ impl Database {
                  WHERE eligible=1 AND pricing_status IN ('official', 'custom')
                    AND timestamp_ms > ?1 AND timestamp_ms <= ?2
                    AND account_key IS ?3
-                   AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)
-                   AND (quota_reset_at_ms IS ?5 OR quota_reset_at_ms IS NULL)",
-                params![
-                    start_ms,
-                    end_ms,
-                    group.account_key,
-                    group.limit_id,
-                    group.reset_at_ms
-                ],
+                   AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)",
+                params![start_ms, end_ms, group.account_key, group.limit_id],
                 |row| row.get(0),
             )
             .map_err(|_| "unable to read token-derived costs".to_string())?;
@@ -1293,15 +1321,8 @@ impl Database {
                  WHERE eligible=1 AND pricing_status IN ('official', 'custom')
                    AND timestamp_ms > ?1 AND timestamp_ms <= ?2
                    AND account_key IS ?3
-                   AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)
-                   AND (quota_reset_at_ms IS ?5 OR quota_reset_at_ms IS NULL)",
-                params![
-                    start_ms,
-                    end_ms,
-                    group.account_key,
-                    group.limit_id,
-                    group.reset_at_ms
-                ],
+                   AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)",
+                params![start_ms, end_ms, group.account_key, group.limit_id],
                 |row| row.get(0),
             )
             .map_err(|_| "unable to count priced token events".to_string())
@@ -1320,19 +1341,12 @@ impl Database {
                    AND timestamp_ms > ?1 AND timestamp_ms <= ?2
                    AND account_key IS ?3
                    AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)
-                   AND (quota_reset_at_ms IS ?5 OR quota_reset_at_ms IS NULL)
-                 ORDER BY credit_source",
+                 ORDER BY pricing_status",
             )
             .map_err(|_| "unable to read pricing status".to_string())?;
         let sources = statement
             .query_map(
-                params![
-                    start_ms,
-                    end_ms,
-                    group.account_key,
-                    group.limit_id,
-                    group.reset_at_ms
-                ],
+                params![start_ms, end_ms, group.account_key, group.limit_id],
                 |row| row.get::<_, String>(0),
             )
             .map_err(|_| "unable to read pricing status".to_string())?
@@ -1349,9 +1363,9 @@ impl Database {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT timestamp_ms, estimated_weekly_value_usd, observed_cost_usd,
+                "SELECT timestamp_ms, estimated_weekly_value_usd, raw_value_usd, observed_cost_usd,
                         weekly_used_percent, reported_reset_at_ms, reset_reason,
-                        is_finalized, window_id
+                        is_finalized, window_id, confidence, percentage_coverage
                  FROM quotes
                  WHERE algorithm_version=?1 AND status='valid' AND is_finalized=1
                  ORDER BY timestamp_ms, id",
@@ -1359,20 +1373,28 @@ impl Database {
             .map_err(|_| "unable to read token estimate history".to_string())?;
         let rows = statement
             .query_map(params![ALGORITHM_VERSION], |row| {
-                let window_id: i64 = row.get(7)?;
+                let window_id: i64 = row.get(8)?;
                 Ok(StoredPoint {
                     point: HistoryPoint {
                         timestamp: row.get(0)?,
                         estimated_weekly_value_usd: row.get(1)?,
-                        observed_cost_usd: row.get(2)?,
-                        weekly_used_percent: row.get(3)?,
-                        reset_at: row.get(4)?,
-                        reset_reason: row.get(5)?,
-                        is_finalized: row.get::<_, i64>(6)? != 0,
+                        raw_estimated_weekly_value_usd: row.get(2)?,
+                        observed_cost_usd: row.get(3)?,
+                        weekly_used_percent: row.get(4)?,
+                        reset_at: row.get(5)?,
+                        reset_reason: row.get(6)?,
+                        is_finalized: row.get::<_, i64>(7)? != 0,
                         is_heartbeat: false,
                         epoch: Some(window_id),
+                        confidence: match row.get::<_, String>(9)?.as_str() {
+                            "high" => Confidence::High,
+                            "medium" => Confidence::Medium,
+                            "low" => Confidence::Low,
+                            _ => Confidence::None,
+                        },
+                        percentage_coverage: row.get(10)?,
                     },
-                    window_id: row.get(7)?,
+                    window_id: row.get(8)?,
                 })
             })
             .map_err(|_| "unable to read token estimate history".to_string())?;
@@ -1407,15 +1429,10 @@ impl Database {
         self.connection
             .query_row(
                 "SELECT id FROM epochs
-                 WHERE account_key IS ?1 AND limit_id IS ?2 AND reset_at_ms IS ?3
-                   AND started_at_ms <= ?4
+                 WHERE account_key IS ?1 AND limit_id IS ?2
+                   AND started_at_ms <= ?3
                  ORDER BY started_at_ms DESC, id DESC LIMIT 1",
-                params![
-                    latest.account_key,
-                    latest.limit_id,
-                    latest.reset_at_ms,
-                    latest.observed_at_ms
-                ],
+                params![latest.account_key, latest.limit_id, latest.observed_at_ms],
                 |row| row.get(0),
             )
             .optional()
@@ -1571,14 +1588,12 @@ impl Database {
                 "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage_events
                  WHERE eligible=1 AND pricing_status IN ('official', 'custom') AND timestamp_ms >= ?1 AND timestamp_ms <= ?2
                    AND account_key IS ?3
-                   AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)
-                   AND (quota_reset_at_ms IS ?5 OR quota_reset_at_ms IS NULL)",
+                   AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)",
                 params![
                     start_ms,
                     end_ms,
                     latest.account_key,
-                    latest.limit_id,
-                    latest.reset_at_ms
+                    latest.limit_id
                 ],
                 |row| row.get(0),
             )
@@ -1606,8 +1621,7 @@ impl Database {
                    AND event.timestamp_ms >= window.started_at_ms
                    AND event.timestamp_ms <= COALESCE(window.ended_at_ms, window.started_at_ms)
                    AND event.account_key IS window.account_key
-                   AND (event.quota_limit_id IS window.limit_id OR event.quota_limit_id IS NULL)
-                   AND (event.quota_reset_at_ms IS window.reset_at_ms OR event.quota_reset_at_ms IS NULL)",
+                   AND (event.quota_limit_id IS window.limit_id OR event.quota_limit_id IS NULL)",
                 params![window_id],
                 |row| row.get(0),
             )
@@ -1629,6 +1643,7 @@ impl Database {
         Ok((count.max(0) as u64, coverage, source))
     }
 
+    // harn:assume reliable-range-comparisons ref=range-comparison-selection scope=function
     pub fn history(&self, range: Range) -> Result<HistoryResponse, String> {
         let latest_timestamp: Option<i64> = self
             .connection
@@ -1652,27 +1667,31 @@ impl Database {
             })
             .map(|stored| stored.point.clone())
             .collect::<Vec<_>>();
-        let baseline = stored
-            .iter()
-            .rev()
-            .find(|stored| stored.point.timestamp <= since)
-            .and_then(|stored| stored.point.estimated_weekly_value_usd)
-            .or_else(|| {
-                points
-                    .first()
-                    .and_then(|point| point.estimated_weekly_value_usd)
-            });
         let active_window = self
             .latest_quota_observation()?
             .and_then(|latest| self.active_window_id(&latest).ok().flatten());
-        let current = active_window
-            .and_then(|window_id| {
-                stored
-                    .iter()
-                    .rev()
-                    .find(|stored| stored.window_id == window_id)
+        let current_point = active_window.and_then(|window_id| {
+            stored.iter().rev().find(|stored| {
+                stored.window_id == window_id
+                    && matches!(
+                        stored.point.confidence,
+                        Confidence::Medium | Confidence::High
+                    )
             })
-            .and_then(|stored| stored.point.estimated_weekly_value_usd);
+        });
+        let baseline_point = current_point.and_then(|current| {
+            stored.iter().find(|candidate| {
+                candidate.point.timestamp >= since
+                    && candidate.point.timestamp < current.point.timestamp
+                    && matches!(
+                        candidate.point.confidence,
+                        Confidence::Medium | Confidence::High
+                    )
+            })
+        });
+        let current = current_point.and_then(|stored| stored.point.estimated_weekly_value_usd);
+        let baseline = baseline_point.and_then(|stored| stored.point.estimated_weekly_value_usd);
+        let baseline_timestamp = baseline_point.map(|stored| stored.point.timestamp);
         let delta_value_usd = current
             .zip(baseline)
             .map(|(current, baseline)| current - baseline);
@@ -1684,6 +1703,7 @@ impl Database {
             statistics: RangeStatistics {
                 range: range.clone(),
                 baseline_estimated_weekly_value_usd: baseline,
+                baseline_timestamp,
                 current_estimated_weekly_value_usd: current,
                 delta_value_usd,
                 delta_percent,
@@ -2065,7 +2085,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_reset_timestamp_starts_a_new_window_without_crossing() {
+    fn reset_timestamp_jitter_stays_in_one_window() {
         let (mut database, path) = database();
         persist(
             &mut database,
@@ -2079,7 +2099,7 @@ mod tests {
             .connection
             .query_row("SELECT COUNT(*) FROM epochs", [], |row| row.get(0))
             .expect("windows");
-        assert_eq!(windows, 2);
+        assert_eq!(windows, 1);
         let measurements: i64 = database
             .connection
             .query_row(
@@ -2088,7 +2108,199 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("measurements");
-        assert_eq!(measurements, 1);
+        assert_eq!(measurements, 2);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn material_reset_timestamp_change_starts_a_new_window() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 10.0, Some(1_000_000)),
+                event(2_000, Some(0.4), 11.0, Some(1_000_000)),
+                event(
+                    3_000,
+                    Some(0.5),
+                    12.0,
+                    Some(1_000_000 + RESET_TIMESTAMP_JITTER_MS + 1),
+                ),
+            ],
+        );
+        let windows: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM epochs", [], |row| row.get(0))
+            .expect("windows");
+        assert_eq!(windows, 2);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pre_reset_usage_regression_is_ignored_and_diagnosed() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 10.0, Some(1_000_000)),
+                event(2_000, Some(0.1), 11.0, Some(1_000_000)),
+                event(3_000, Some(0.1), 10.0, Some(1_000_000)),
+                event(4_000, Some(0.1), 12.0, Some(1_000_000)),
+            ],
+        );
+        let windows: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM epochs", [], |row| row.get(0))
+            .expect("windows");
+        let valid: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM measurements WHERE status='valid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("valid measurements");
+        assert_eq!(windows, 1);
+        assert_eq!(valid, 2);
+        assert_eq!(
+            database.diagnostic_count("stale pre-reset weekly usage regression"),
+            1
+        );
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn jittered_reset_events_contribute_to_one_raw_estimate() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 10.0, Some(1_000_000)),
+                event(2_000, Some(0.1), 10.0, Some(1_010_000)),
+                event(3_000, Some(0.3), 11.0, Some(1_000_000)),
+            ],
+        );
+        let raw: f64 = database
+            .connection
+            .query_row(
+                "SELECT raw_value_usd FROM quotes ORDER BY timestamp_ms DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("raw estimate");
+        assert!((raw - 70.0).abs() < 1e-10);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_uses_reliable_in_range_baseline_across_windows() {
+        let (database, path) = database();
+        database
+            .connection
+            .execute(
+                "INSERT INTO quota_snapshots (
+                    observed_at_ms, reset_at_ms, duration_minutes, limit_id, used_percent
+                 ) VALUES (10000, 20000, 10080, 'codex', 20)",
+                [],
+            )
+            .expect("latest quota");
+        database
+            .connection
+            .execute_batch(
+                "INSERT INTO epochs (
+                    id, limit_id, reset_at_ms, started_at_ms, ended_at_ms, reset_reason
+                 ) VALUES
+                    (1, 'codex', 9000, 0, 4000, 'uncertain_reset'),
+                    (2, 'codex', 20000, 5000, 10000, 'reported_reset_changed');",
+            )
+            .expect("epochs");
+        for (timestamp, value, confidence, coverage, window_id) in [
+            (1_000, 3.28, "low", 1.0, 1),
+            (2_000, 50.0, "medium", 5.0, 1),
+            (10_000, 60.0, "high", 20.0, 2),
+        ] {
+            database
+                .connection
+                .execute(
+                    "INSERT INTO quotes (
+                        timestamp_ms, value_usd, raw_value_usd, estimated_weekly_value_usd,
+                        confidence, status, is_finalized, algorithm_version,
+                        percentage_coverage, window_id
+                     ) VALUES (?1, ?2, ?2, ?2, ?3, 'valid', 1, ?4, ?5, ?6)",
+                    params![
+                        timestamp,
+                        value,
+                        confidence,
+                        ALGORITHM_VERSION,
+                        coverage,
+                        window_id
+                    ],
+                )
+                .expect("quote");
+        }
+
+        let history = database.history(Range::D1).expect("history");
+        assert_eq!(history.statistics.baseline_timestamp, Some(2_000));
+        assert_eq!(
+            history.statistics.baseline_estimated_weekly_value_usd,
+            Some(50.0)
+        );
+        assert_eq!(history.statistics.delta_value_usd, Some(10.0));
+        assert_eq!(history.points[0].raw_estimated_weekly_value_usd, Some(3.28));
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_does_not_reuse_stale_baseline_outside_range() {
+        let (database, path) = database();
+        let current_timestamp = Range::D1.duration_ms() + 10_000;
+        database
+            .connection
+            .execute(
+                "INSERT INTO quota_snapshots (
+                    observed_at_ms, reset_at_ms, duration_minutes, limit_id, used_percent
+                 ) VALUES (?1, ?2, 10080, 'codex', 20)",
+                params![
+                    current_timestamp,
+                    current_timestamp + Range::W1.duration_ms()
+                ],
+            )
+            .expect("latest quota");
+        database
+            .connection
+            .execute(
+                "INSERT INTO epochs (
+                    id, limit_id, reset_at_ms, started_at_ms, ended_at_ms, reset_reason
+                 ) VALUES (1, 'codex', ?1, 0, ?2, 'uncertain_reset')",
+                params![
+                    current_timestamp + Range::W1.duration_ms(),
+                    current_timestamp
+                ],
+            )
+            .expect("epoch");
+        for (timestamp, value) in [(1, 3.28), (current_timestamp, 60.0)] {
+            database
+                .connection
+                .execute(
+                    "INSERT INTO quotes (
+                        timestamp_ms, value_usd, raw_value_usd, estimated_weekly_value_usd,
+                        confidence, status, is_finalized, algorithm_version,
+                        percentage_coverage, window_id
+                     ) VALUES (?1, ?2, ?2, ?2, 'high', 'valid', 1, ?3, 20, 1)",
+                    params![timestamp, value, ALGORITHM_VERSION],
+                )
+                .expect("quote");
+        }
+
+        let history = database.history(Range::D1).expect("history");
+        assert_eq!(history.statistics.baseline_timestamp, None);
+        assert_eq!(history.statistics.delta_value_usd, None);
+        assert_eq!(history.statistics.delta_percent, None);
         drop(database);
         let _ = fs::remove_file(path);
     }
@@ -2264,6 +2476,55 @@ mod tests {
             .expect("quotes");
         assert_eq!(events, 2);
         assert_eq!(quotes, 0);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_v8_migration_preserves_raw_data_settings_and_user_annotations() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 10.0, Some(100_000)),
+                event(2_000, Some(0.4), 11.0, Some(100_000)),
+            ],
+        );
+        database
+            .connection
+            .execute(
+                "INSERT INTO annotations (id, timestamp_ms, label, kind)
+                 VALUES ('user-note', 1500, 'Keep me', 'note')",
+                [],
+            )
+            .expect("user annotation");
+        database
+            .save_settings(&AppSettings::default())
+            .expect("settings");
+        database
+            .connection
+            .pragma_update(None, "user_version", 7)
+            .expect("simulate v7");
+
+        database.migrate().expect("history correction migration");
+
+        for (table, expected) in [
+            ("usage_events", 2_i64),
+            ("quota_snapshots", 2),
+            ("settings", 1),
+            ("annotations", 1),
+            ("quotes", 0),
+            ("measurements", 0),
+            ("epochs", 0),
+        ] {
+            let count: i64 = database
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("row count");
+            assert_eq!(count, expected, "unexpected {table} count");
+        }
         drop(database);
         let _ = fs::remove_file(path);
     }

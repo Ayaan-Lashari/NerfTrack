@@ -68,7 +68,7 @@ export const demoQuote: CurrentQuote = {
   resetAt: demoStatus.resetAt,
   resetReason: 'scheduled_reset',
   status: 'valid',
-  algorithmVersion: 'nerfify-token-api-equivalent-v2',
+  algorithmVersion: 'nerfify-token-api-equivalent-v3',
   confidence: 'high',
   validObservationCount: 6,
   percentageCoverage: 34,
@@ -142,6 +142,9 @@ export function getDemoHistory(range: Range): HistoryResponse {
     return {
       timestamp: demoNow - duration + index * step,
       estimatedWeeklyValueUsd: estimatedValueUsd,
+      rawEstimatedWeeklyValueUsd: Number(
+        (estimatedValueUsd + Math.sin(index * 0.91) * 6.4).toFixed(2),
+      ),
       observedCostUsd: Number((progress * 138.6).toFixed(2)),
       weeklyUsedPercent: Math.max(4, Number((11 + progress * 23).toFixed(1))),
       resetAt: index >= resetIndex ? Date.UTC(2026, 4, 14) : Date.UTC(2026, 4, 7),
@@ -149,6 +152,8 @@ export function getDemoHistory(range: Range): HistoryResponse {
       isFinalized: index < total - 2,
       isHeartbeat: index % 10 === 0,
       epoch: index < resetIndex ? 1 : 2,
+      confidence: index < 8 ? ('low' as const) : ('high' as const),
+      percentageCoverage: Number((progress * 34).toFixed(1)),
     };
   });
   points[points.length - 1].estimatedWeeklyValueUsd = demoQuote.estimatedWeeklyValueUsd ?? 0;
@@ -157,6 +162,7 @@ export function getDemoHistory(range: Range): HistoryResponse {
     statistics: {
       range,
       baselineEstimatedWeeklyValueUsd: points[0].estimatedWeeklyValueUsd,
+      baselineTimestamp: points[0].timestamp,
       currentEstimatedWeeklyValueUsd: demoQuote.estimatedWeeklyValueUsd,
       deltaValueUsd: demoQuote.changeValueUsd,
       deltaPercent: demoQuote.changePercent,

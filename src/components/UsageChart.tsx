@@ -105,6 +105,11 @@ function interpolatePoint(points: HistoryPoint[], timestamp: number): HistoryPoi
       right.estimatedWeeklyValueUsd,
       ratio,
     ),
+    rawEstimatedWeeklyValueUsd: interpolateNullable(
+      left.rawEstimatedWeeklyValueUsd,
+      right.rawEstimatedWeeklyValueUsd,
+      ratio,
+    ),
     observedCostUsd: interpolateNullable(left.observedCostUsd, right.observedCostUsd, ratio),
     weeklyUsedPercent: interpolateNullable(left.weeklyUsedPercent, right.weeklyUsedPercent, ratio),
     resetAt: nearest.resetAt,
@@ -112,9 +117,20 @@ function interpolatePoint(points: HistoryPoint[], timestamp: number): HistoryPoi
     isFinalized: left.isFinalized && right.isFinalized,
     isHeartbeat: nearest.isHeartbeat,
     epoch: nearest.epoch,
+    confidence: nearest.confidence,
+    percentageCoverage: interpolateNullable(
+      left.percentageCoverage,
+      right.percentageCoverage,
+      ratio,
+    ),
   };
 }
 
+function historySignal(point: HistoryPoint) {
+  return point.rawEstimatedWeeklyValueUsd ?? point.estimatedWeeklyValueUsd;
+}
+
+// harn:assume raw-history-stable-headline ref=history-chart-rendering scope=function
 export function UsageChart({
   points,
   annotations,
@@ -137,13 +153,10 @@ export function UsageChart({
     setAnchorPoint(null);
   }, [range]);
 
-  const values = useMemo(() => {
-    const result = points
-      .map((point) => point.estimatedWeeklyValueUsd)
-      .filter((value): value is number => value !== null);
-    if (baselineEstimatedWeeklyValueUsd !== null) result.push(baselineEstimatedWeeklyValueUsd);
-    return result;
-  }, [baselineEstimatedWeeklyValueUsd, points]);
+  const values = useMemo(
+    () => points.map(historySignal).filter((value): value is number => value !== null),
+    [points],
+  );
   const bounds = useMemo(() => {
     if (!values.length) return { min: 0, max: 1 };
     const minValue = Math.min(...values);
@@ -161,17 +174,18 @@ export function UsageChart({
         plotLeft +
         ((point.timestamp - rangeStart) / rangeDurationMs[range]) * (plotRight - plotLeft),
       y:
-        point.estimatedWeeklyValueUsd === null
+        historySignal(point) === null
           ? plotBottom
           : plotTop +
-            ((bounds.max - point.estimatedWeeklyValueUsd) / valueRange) * (plotBottom - plotTop),
+            ((bounds.max - (historySignal(point) ?? bounds.min)) / valueRange) *
+              (plotBottom - plotTop),
     }));
   }, [bounds.max, bounds.min, points, range, rangeStart]);
 
   const segments = useMemo(() => {
     const result: { x: number; y: number }[][] = [];
     points.forEach((point, index) => {
-      if (point.estimatedWeeklyValueUsd === null) return;
+      if (historySignal(point) === null) return;
       if (index === 0 || points[index - 1].epoch !== point.epoch) result.push([]);
       result.at(-1)?.push(coordinates[index]);
     });
@@ -229,15 +243,17 @@ export function UsageChart({
         plotLeft +
         ((anchorPoint.timestamp - rangeStart) / rangeDurationMs[range]) * (plotRight - plotLeft),
       y:
-        anchorPoint.estimatedWeeklyValueUsd === null
+        historySignal(anchorPoint) === null
           ? plotBottom
           : plotTop +
-            ((bounds.max - anchorPoint.estimatedWeeklyValueUsd) / valueRange) *
+            ((bounds.max - (historySignal(anchorPoint) ?? bounds.min)) / valueRange) *
               (plotBottom - plotTop),
     };
   }, [anchorPoint, bounds.max, bounds.min, points.length, range, rangeStart]);
   const baselineCoordinate =
-    baselineEstimatedWeeklyValueUsd === null
+    baselineEstimatedWeeklyValueUsd === null ||
+    baselineEstimatedWeeklyValueUsd < bounds.min ||
+    baselineEstimatedWeeklyValueUsd > bounds.max
       ? null
       : {
           y:
@@ -247,10 +263,12 @@ export function UsageChart({
               (plotBottom - plotTop),
         };
   const dragChange =
-    anchorPoint?.estimatedWeeklyValueUsd != null &&
-    selected?.estimatedWeeklyValueUsd != null &&
+    anchorPoint &&
+    historySignal(anchorPoint) != null &&
+    selected &&
+    historySignal(selected) != null &&
     (selection?.source === 'held' || selection?.source === 'locked')
-      ? selected.estimatedWeeklyValueUsd - anchorPoint.estimatedWeeklyValueUsd
+      ? (historySignal(selected) ?? 0) - (historySignal(anchorPoint) ?? 0)
       : null;
   const isNegative = (dragChange ?? changeValueUsd ?? 0) < 0;
   const chartColor = isNegative ? '#ff5d73' : '#5cf07a';
@@ -279,10 +297,11 @@ export function UsageChart({
     if (!point) return null;
     const valueRange = Math.max(bounds.max - bounds.min, 1);
     const y =
-      point.estimatedWeeklyValueUsd === null
+      historySignal(point) === null
         ? plotBottom
         : plotTop +
-          ((bounds.max - point.estimatedWeeklyValueUsd) / valueRange) * (plotBottom - plotTop);
+          ((bounds.max - (historySignal(point) ?? bounds.min)) / valueRange) *
+            (plotBottom - plotTop);
     setSelection({
       point,
       coordinate: { x: plotLeft + ratio * (plotRight - plotLeft), y },
@@ -364,7 +383,7 @@ export function UsageChart({
           >
             <Icon name="calendar" size={14} />
             <span>{formatDate(selected.timestamp, range)}</span>
-            <strong>{formatUsd(selected.estimatedWeeklyValueUsd)}</strong>
+            <strong>{formatUsd(historySignal(selected))}</strong>
             <small>Observed: {formatUsd(selected.observedCostUsd)}</small>
           </div>
         )}
