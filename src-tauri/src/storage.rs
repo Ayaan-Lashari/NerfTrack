@@ -748,6 +748,7 @@ impl Database {
             .collect()
     }
 
+    // harn:assume persisted-incremental-indexing ref=incremental-persistence scope=function
     pub fn persist_collection<P>(
         &mut self,
         collection: &CollectionSummary,
@@ -781,13 +782,19 @@ impl Database {
                 .map_err(|_| "unable to persist source checkpoint".to_string())?;
         }
         let mut inserted = 0;
+        let mut earliest_inserted_at_ms = None;
         for event in &collection.events {
             if Self::persist_event(&transaction, event, account_key, &settings)? {
                 inserted += 1;
+                earliest_inserted_at_ms = Some(
+                    earliest_inserted_at_ms.map_or(event.timestamp_ms, |timestamp: i64| {
+                        timestamp.min(event.timestamp_ms)
+                    }),
+                );
             }
         }
-        if inserted > 0 {
-            Self::rebuild_quotes_in_transaction(&transaction)?;
+        if let Some(affected_from_ms) = earliest_inserted_at_ms {
+            Self::rebuild_quotes_incrementally(&transaction, affected_from_ms)?;
         }
         if collection.stats.partial_line_retries > 0 {
             add_diagnostic(
@@ -970,27 +977,101 @@ impl Database {
             )?;
         }
         for group in groups {
-            let window_id = transaction
-                .query_row(
-                    "INSERT INTO epochs (
-                        account_key, limit_id, reset_at_ms, started_at_ms, ended_at_ms,
-                        boundary_reason, reset_reason
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-                     RETURNING id",
-                    params![
-                        group.account_key,
-                        group.limit_id,
-                        group.reset_at_ms,
-                        group.started_at_ms,
-                        group.ended_at_ms,
-                        group.reset_reason,
-                    ],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(|_| "unable to persist weekly window".to_string())?;
-            Self::rebuild_group(transaction, &group, window_id)?;
+            Self::persist_window_group(transaction, &group)?;
         }
         Ok(())
+    }
+
+    fn rebuild_quotes_incrementally(
+        transaction: &Transaction<'_>,
+        affected_from_ms: i64,
+    ) -> Result<(), String> {
+        let observations = Self::weekly_observations(transaction)?;
+        let (groups, stale_regressions) = Self::window_groups(observations);
+        if stale_regressions > 0 {
+            add_diagnostic(
+                transaction,
+                "stale pre-reset weekly usage regression",
+                stale_regressions as i64,
+            )?;
+        }
+
+        let mut cutoffs = HashMap::<(Option<String>, Option<String>), i64>::new();
+        for group in &groups {
+            if group.ended_at_ms >= affected_from_ms {
+                cutoffs
+                    .entry((group.account_key.clone(), group.limit_id.clone()))
+                    .or_insert(group.started_at_ms);
+            }
+        }
+        for ((account_key, limit_id), cutoff_ms) in &cutoffs {
+            transaction
+                .execute(
+                    "DELETE FROM quotes
+                     WHERE window_id IN (
+                        SELECT id FROM epochs
+                        WHERE account_key IS ?1 AND limit_id IS ?2
+                          AND started_at_ms >= ?3
+                     )",
+                    params![account_key, limit_id, cutoff_ms],
+                )
+                .map_err(|_| "unable to clear affected token estimates".to_string())?;
+            transaction
+                .execute(
+                    "DELETE FROM measurements
+                     WHERE epoch_id IN (
+                        SELECT id FROM epochs
+                        WHERE account_key IS ?1 AND limit_id IS ?2
+                          AND started_at_ms >= ?3
+                     )",
+                    params![account_key, limit_id, cutoff_ms],
+                )
+                .map_err(|_| "unable to clear affected token measurements".to_string())?;
+            transaction
+                .execute(
+                    "DELETE FROM epochs
+                     WHERE account_key IS ?1 AND limit_id IS ?2
+                       AND started_at_ms >= ?3",
+                    params![account_key, limit_id, cutoff_ms],
+                )
+                .map_err(|_| "unable to clear affected weekly windows".to_string())?;
+        }
+
+        for group in groups {
+            let key = (group.account_key.clone(), group.limit_id.clone());
+            if cutoffs
+                .get(&key)
+                .is_some_and(|cutoff_ms| group.started_at_ms >= *cutoff_ms)
+            {
+                Self::persist_window_group(transaction, &group)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_window_group(
+        transaction: &Transaction<'_>,
+        group: &WindowGroup,
+    ) -> Result<(), String> {
+        let window_id = transaction
+            .query_row(
+                "INSERT INTO epochs (
+                    account_key, limit_id, reset_at_ms, started_at_ms, ended_at_ms,
+                    boundary_reason, reset_reason
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 RETURNING id",
+                params![
+                    group.account_key,
+                    group.limit_id,
+                    group.reset_at_ms,
+                    group.started_at_ms,
+                    group.ended_at_ms,
+                    group.reset_reason,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| "unable to persist weekly window".to_string())?;
+        Self::rebuild_group(transaction, group, window_id)
     }
 
     fn weekly_observations(transaction: &Transaction<'_>) -> Result<Vec<QuotaPoint>, String> {
@@ -2056,6 +2137,58 @@ mod tests {
     }
 
     #[test]
+    fn incremental_scan_preserves_completed_window_rows() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 42.0, Some(10_000)),
+                event(2_000, Some(0.42), 43.0, Some(10_000)),
+                event(3_000, Some(0.0), 10.0, Some(20_000)),
+                event(4_000, Some(0.2), 11.0, Some(20_000)),
+            ],
+        );
+        let completed_window_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM epochs ORDER BY started_at_ms LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("completed window");
+        let completed_quote_id: i64 = database
+            .connection
+            .query_row("SELECT id FROM quotes WHERE timestamp_ms=2000", [], |row| {
+                row.get(0)
+            })
+            .expect("completed quote");
+
+        persist(
+            &mut database,
+            vec![event(5_000, Some(0.3), 12.0, Some(20_000))],
+        );
+
+        let completed_window_id_after_refresh: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM epochs ORDER BY started_at_ms LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("completed window after refresh");
+        let completed_quote_id_after_refresh: i64 = database
+            .connection
+            .query_row("SELECT id FROM quotes WHERE timestamp_ms=2000", [], |row| {
+                row.get(0)
+            })
+            .expect("completed quote after refresh");
+        assert_eq!(completed_window_id_after_refresh, completed_window_id);
+        assert_eq!(completed_quote_id_after_refresh, completed_quote_id);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn estimate_reads_use_the_filtered_time_index() {
         let (database, path) = database();
         let plan: String = database
@@ -2068,7 +2201,12 @@ mod tests {
                    AND timestamp_ms > ?1 AND timestamp_ms <= ?2
                    AND account_key IS ?3
                    AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)",
-                params![0_i64, i64::MAX, Option::<String>::None, Option::<String>::None],
+                params![
+                    0_i64,
+                    i64::MAX,
+                    Option::<String>::None,
+                    Option::<String>::None
+                ],
                 |row| row.get(3),
             )
             .expect("estimate query plan");
