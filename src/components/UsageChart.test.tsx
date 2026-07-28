@@ -77,7 +77,7 @@ describe('UsageChart', () => {
         percentageCoverage: 20,
       },
       {
-        timestamp: 86_400_000,
+        timestamp: 3_600_000,
         estimatedWeeklyValueUsd: 100,
         rawEstimatedWeeklyValueUsd: 100,
         observedCostUsd: 10,
@@ -113,12 +113,12 @@ describe('UsageChart', () => {
       toJSON: () => ({}),
     });
 
-    const hoverEvent = new MouseEvent('pointermove', { bubbles: true, clientX: 472 });
+    const hoverEvent = new MouseEvent('pointermove', { bubbles: true, clientX: 924.333333 });
     Object.defineProperty(hoverEvent, 'pointerType', { value: 'mouse' });
     fireEvent(chart, hoverEvent);
 
     const interpolated = onScrub.mock.calls.at(-1)?.[0];
-    expect(interpolated.timestamp).toBeCloseTo(43_200_000);
+    expect(interpolated.timestamp).toBeCloseTo(1_800_000, -4);
     expect(interpolated.estimatedWeeklyValueUsd).toBeCloseTo(50);
     expect(interpolated.timestamp).not.toBe(points[0].timestamp);
     expect(interpolated.timestamp).not.toBe(points[1].timestamp);
@@ -136,6 +136,40 @@ describe('UsageChart', () => {
 
     const path = document.querySelector('.chart-line');
     expect(path?.getAttribute('d')?.match(/M /g)).toHaveLength(2);
+  });
+
+  it('renders substantial inactivity as a faded dotted bridge labeled on hover', () => {
+    const points = getDemoHistory('1D')
+      .points.slice(0, 2)
+      .map((point, index) => ({
+        ...point,
+        timestamp: index === 0 ? 0 : 12 * 60 * 60 * 1_000,
+        epoch: index + 1,
+      }));
+    render(<UsageChart points={points} annotations={[]} range="1D" reducedMotion={false} />);
+
+    const chart = screen.getByRole('img', { name: /Estimated weekly API-equivalent value/ });
+    const dottedBridge = chart.querySelector('.chart-no-usage-line');
+    expect(dottedBridge?.getAttribute('d')).toMatch(/^M .* L /);
+    expect(chart.querySelector('.chart-line')?.getAttribute('d')?.match(/M /g)).toHaveLength(2);
+
+    vi.spyOn(chart, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 1000,
+      height: 308,
+      right: 1000,
+      bottom: 308,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    const hoverEvent = new MouseEvent('pointermove', { bubbles: true, clientX: 708 });
+    Object.defineProperty(hoverEvent, 'pointerType', { value: 'mouse' });
+    fireEvent(chart, hoverEvent);
+
+    expect(screen.getByRole('status')).toHaveTextContent('No usage');
+    expect(document.querySelector('.scrub-readout')).not.toBeInTheDocument();
   });
 
   it('plots raw estimates and excludes comparison baselines from axis bounds', () => {

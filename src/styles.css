@@ -473,6 +473,32 @@ p {
   stroke-linejoin: round;
   vector-effect: non-scaling-stroke;
 }
+.chart-no-usage-line {
+  fill: none;
+  stroke: var(--green);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-dasharray: 2 4;
+  opacity: 0.42;
+  vector-effect: non-scaling-stroke;
+}
+.no-usage-readout {
+  position: absolute;
+  z-index: 4;
+  top: 12px;
+  left: clamp(48px, var(--no-usage-x), calc(100% - 48px));
+  transform: translateX(-50%);
+  padding: 6px 10px;
+  border: 1px solid rgba(92, 240, 122, 0.24);
+  border-radius: 7px;
+  color: rgba(214, 247, 221, 0.88);
+  background: rgba(12, 18, 16, 0.9);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.28);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
 .chart-point {
   fill: var(--chart-color, var(--green));
 }

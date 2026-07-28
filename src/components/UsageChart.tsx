@@ -33,6 +33,13 @@ interface ChartSelection {
   source: 'hover' | 'held' | 'locked' | 'keyboard';
 }
 
+interface NoUsageGap {
+  startTimestamp: number;
+  endTimestamp: number;
+  start: { x: number; y: number };
+  end: { x: number; y: number };
+}
+
 function formatDate(timestamp: number, range: Range) {
   const date = new Date(timestamp);
   if (range === '1D') {
@@ -130,6 +137,33 @@ function historySignal(point: HistoryPoint) {
   return point.rawEstimatedWeeklyValueUsd ?? point.estimatedWeeklyValueUsd;
 }
 
+// harn:assume visible-no-usage-gaps ref=no-usage-gap-rendering scope=function
+function findNoUsageGaps(
+  points: HistoryPoint[],
+  coordinates: { x: number; y: number }[],
+  thresholdMs: number,
+) {
+  const gaps: NoUsageGap[] = [];
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const current = points[index];
+    if (
+      historySignal(previous) === null ||
+      historySignal(current) === null ||
+      current.timestamp - previous.timestamp <= thresholdMs
+    ) {
+      continue;
+    }
+    gaps.push({
+      startTimestamp: previous.timestamp,
+      endTimestamp: current.timestamp,
+      start: coordinates[index - 1],
+      end: coordinates[index],
+    });
+  }
+  return gaps;
+}
+
 // harn:assume raw-history-stable-headline ref=history-chart-rendering scope=function
 export function UsageChart({
   points,
@@ -145,12 +179,14 @@ export function UsageChart({
   const anchorRef = useRef<HistoryPoint | null>(null);
   const [selection, setSelection] = useState<ChartSelection | null>(null);
   const [anchorPoint, setAnchorPoint] = useState<HistoryPoint | null>(null);
+  const [noUsageHoverX, setNoUsageHoverX] = useState<number | null>(null);
 
   useEffect(() => {
     isDragging.current = false;
     anchorRef.current = null;
     setSelection(null);
     setAnchorPoint(null);
+    setNoUsageHoverX(null);
   }, [range]);
 
   const values = useMemo(
@@ -181,16 +217,31 @@ export function UsageChart({
               (plotBottom - plotTop),
     }));
   }, [bounds.max, bounds.min, points, range, rangeStart]);
+  const noUsageThresholdMs = Math.max(2 * 60 * 60 * 1_000, rangeDurationMs[range] / 240);
+  const noUsageGaps = useMemo(
+    () => findNoUsageGaps(points, coordinates, noUsageThresholdMs),
+    [coordinates, noUsageThresholdMs, points],
+  );
+  const gapStartingAt = useMemo(
+    () => new Set(noUsageGaps.map((gap) => gap.startTimestamp)),
+    [noUsageGaps],
+  );
 
   const segments = useMemo(() => {
     const result: { x: number; y: number }[][] = [];
     points.forEach((point, index) => {
       if (historySignal(point) === null) return;
-      if (index === 0 || points[index - 1].epoch !== point.epoch) result.push([]);
+      if (
+        index === 0 ||
+        points[index - 1].epoch !== point.epoch ||
+        gapStartingAt.has(points[index - 1].timestamp)
+      ) {
+        result.push([]);
+      }
       result.at(-1)?.push(coordinates[index]);
     });
     return result;
-  }, [coordinates, points]);
+  }, [coordinates, gapStartingAt, points]);
   const linePath = segments
     .map((segment) =>
       segment
@@ -212,6 +263,12 @@ export function UsageChart({
         .join(' ');
       return `${line} L ${segment.at(-1)?.x ?? plotRight} ${plotBottom} L ${segment[0].x} ${plotBottom} Z`;
     })
+    .join(' ');
+  const noUsagePath = noUsageGaps
+    .map(
+      (gap) =>
+        `M ${gap.start.x.toFixed(2)} ${gap.start.y.toFixed(2)} L ${gap.end.x.toFixed(2)} ${gap.end.y.toFixed(2)}`,
+    )
     .join(' ');
   const visibleAnnotations = useMemo(() => {
     let previousX = -Infinity;
@@ -293,6 +350,16 @@ export function UsageChart({
     const svgX = ((clientX - rect.left) / rect.width) * chartWidth;
     const ratio = Math.max(0, Math.min(1, (svgX - plotLeft) / (plotRight - plotLeft)));
     const timestamp = rangeStart + ratio * rangeDurationMs[range];
+    const noUsageGap = noUsageGaps.find(
+      (gap) => timestamp > gap.startTimestamp && timestamp < gap.endTimestamp,
+    );
+    if (source === 'hover' && noUsageGap) {
+      setNoUsageHoverX(plotLeft + ratio * (plotRight - plotLeft));
+      setSelection(null);
+      onScrub?.(null, null);
+      return null;
+    }
+    setNoUsageHoverX(null);
     const point = interpolatePoint(points, timestamp);
     if (!point) return null;
     const valueRange = Math.max(bounds.max - bounds.min, 1);
@@ -372,6 +439,19 @@ export function UsageChart({
         <small>USD · local token-derived estimate</small>
       </div>
       <div className="chart-canvas-wrap">
+        {noUsageHoverX !== null && (
+          <div
+            className="no-usage-readout"
+            role="status"
+            style={
+              {
+                '--no-usage-x': `${(noUsageHoverX / chartWidth) * 100}%`,
+              } as React.CSSProperties
+            }
+          >
+            No usage
+          </div>
+        )}
         {selected && selectedCoordinate && (
           <div
             className="scrub-readout"
@@ -431,6 +511,7 @@ export function UsageChart({
             );
           }}
           onPointerLeave={() => {
+            setNoUsageHoverX(null);
             if (!isDragging.current && selection?.source === 'hover') {
               setSelection(null);
               onScrub?.(null, null);
@@ -484,6 +565,9 @@ export function UsageChart({
             />
           )}
           <path className="chart-area" d={areaPath} />
+          <path className="chart-no-usage-line" d={noUsagePath}>
+            <title>No usage</title>
+          </path>
           <path className="chart-line" d={linePath} />
           {segments
             .filter((segment) => segment.length === 1)
