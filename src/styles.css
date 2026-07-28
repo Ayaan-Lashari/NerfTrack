@@ -476,9 +476,9 @@ p {
 .chart-no-usage-line {
   fill: none;
   stroke: var(--chart-color, var(--green));
-  stroke-width: 1.8;
+  stroke-width: 2;
   stroke-linecap: round;
-  stroke-dasharray: 2 4;
+  stroke-dasharray: 8 6;
   opacity: 0.42;
   vector-effect: non-scaling-stroke;
 }
