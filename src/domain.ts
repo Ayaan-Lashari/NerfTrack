@@ -102,6 +102,7 @@ export interface DiagnosticsSummary {
   hiddenResets: number;
   reasons: Array<{ reason: string; count: number }>;
   modelIds: string[];
+  unpricedModelIds: string[];
   privacy: string;
 }
 

@@ -107,6 +107,7 @@ export const demoDiagnostics: DiagnosticsSummary = {
     { reason: 'Waiting for positive paired deltas', count: 11 },
   ],
   modelIds: ['gpt-5-codex', 'gpt-5-codex-mini'],
+  unpricedModelIds: ['local-codex-preview'],
   privacy: 'Prompts, account identifiers, and full local paths are never stored or returned.',
 };
 

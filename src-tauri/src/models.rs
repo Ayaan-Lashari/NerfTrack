@@ -248,6 +248,7 @@ pub struct DiagnosticsSummary {
     pub hidden_resets: i64,
     pub reasons: Vec<DiagnosticReason>,
     pub model_ids: Vec<String>,
+    pub unpriced_model_ids: Vec<String>,
     pub privacy: String,
 }
 

@@ -17,6 +17,60 @@ const WEEKLY_WINDOW_MINUTES: f64 = 10_080.0;
 const WEEKLY_WINDOW_TOLERANCE_MINUTES: f64 = 240.0;
 const RESET_TIMESTAMP_JITTER_MS: i64 = 5 * 60 * 1_000;
 
+const CLEAR_IMPORTED_DATA_SQL: &str = "
+    DELETE FROM source_checkpoints;
+    DELETE FROM usage_events;
+    DELETE FROM pricing_snapshots;
+    DELETE FROM quota_snapshots;
+    DELETE FROM measurements;
+    DELETE FROM epochs;
+    DELETE FROM quotes;
+    DELETE FROM chart_heartbeats;
+    DELETE FROM diagnostics;
+    DELETE FROM accounts;
+";
+
+const CREATE_RESET_CHECKPOINT_SQL: &str = "
+    DROP TABLE IF EXISTS reset_checkpoint_source_checkpoints;
+    DROP TABLE IF EXISTS reset_checkpoint_usage_events;
+    DROP TABLE IF EXISTS reset_checkpoint_pricing_snapshots;
+    DROP TABLE IF EXISTS reset_checkpoint_quota_snapshots;
+    DROP TABLE IF EXISTS reset_checkpoint_measurements;
+    DROP TABLE IF EXISTS reset_checkpoint_epochs;
+    DROP TABLE IF EXISTS reset_checkpoint_quotes;
+    DROP TABLE IF EXISTS reset_checkpoint_chart_heartbeats;
+    DROP TABLE IF EXISTS reset_checkpoint_diagnostics;
+    DROP TABLE IF EXISTS reset_checkpoint_accounts;
+    DROP TABLE IF EXISTS reset_checkpoint_meta;
+
+    CREATE TABLE reset_checkpoint_source_checkpoints AS SELECT * FROM source_checkpoints;
+    CREATE TABLE reset_checkpoint_usage_events AS SELECT * FROM usage_events;
+    CREATE TABLE reset_checkpoint_pricing_snapshots AS SELECT * FROM pricing_snapshots;
+    CREATE TABLE reset_checkpoint_quota_snapshots AS SELECT * FROM quota_snapshots;
+    CREATE TABLE reset_checkpoint_measurements AS SELECT * FROM measurements;
+    CREATE TABLE reset_checkpoint_epochs AS SELECT * FROM epochs;
+    CREATE TABLE reset_checkpoint_quotes AS SELECT * FROM quotes;
+    CREATE TABLE reset_checkpoint_chart_heartbeats AS SELECT * FROM chart_heartbeats;
+    CREATE TABLE reset_checkpoint_diagnostics AS SELECT * FROM diagnostics;
+    CREATE TABLE reset_checkpoint_accounts AS SELECT * FROM accounts;
+    CREATE TABLE reset_checkpoint_meta (created_at_ms INTEGER NOT NULL);
+    INSERT INTO reset_checkpoint_meta (created_at_ms)
+        VALUES (CAST(strftime('%s', 'now') AS INTEGER) * 1000);
+";
+
+const RESTORE_RESET_CHECKPOINT_SQL: &str = "
+    INSERT INTO accounts SELECT * FROM reset_checkpoint_accounts;
+    INSERT INTO source_checkpoints SELECT * FROM reset_checkpoint_source_checkpoints;
+    INSERT INTO usage_events SELECT * FROM reset_checkpoint_usage_events;
+    INSERT INTO pricing_snapshots SELECT * FROM reset_checkpoint_pricing_snapshots;
+    INSERT INTO quota_snapshots SELECT * FROM reset_checkpoint_quota_snapshots;
+    INSERT INTO epochs SELECT * FROM reset_checkpoint_epochs;
+    INSERT INTO measurements SELECT * FROM reset_checkpoint_measurements;
+    INSERT INTO quotes SELECT * FROM reset_checkpoint_quotes;
+    INSERT INTO chart_heartbeats SELECT * FROM reset_checkpoint_chart_heartbeats;
+    INSERT INTO diagnostics SELECT * FROM reset_checkpoint_diagnostics;
+";
+
 #[derive(Clone, Copy)]
 struct ApiPrice {
     input: f64,
@@ -762,7 +816,7 @@ impl Database {
             .map_err(|_| "unable to start collection transaction".to_string())?;
         for checkpoint in &collection.checkpoints {
             transaction
-                .execute(
+                .prepare_cached(
                     "INSERT INTO source_checkpoints (
                         source_key, byte_offset, parser_state_json, source_active, updated_at_ms
                      ) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -771,14 +825,16 @@ impl Database {
                         parser_state_json=excluded.parser_state_json,
                         source_active=excluded.source_active,
                         updated_at_ms=excluded.updated_at_ms",
-                    params![
+                )
+                .and_then(|mut statement| {
+                    statement.execute(params![
                         checkpoint.source_key,
                         checkpoint.byte_offset as i64,
                         checkpoint.parser_state_json,
                         i64::from(checkpoint.source_active),
                         now_ms()
-                    ],
-                )
+                    ])
+                })
                 .map_err(|_| "unable to persist source checkpoint".to_string())?;
         }
         let mut inserted = 0;
@@ -831,14 +887,16 @@ impl Database {
             }
         };
         let inserted = transaction
-            .execute(
+            .prepare_cached(
                 "INSERT OR IGNORE INTO usage_events (
                     fingerprint, account_key, timestamp_ms, model_id, input_tokens,
                     cached_input_tokens, output_tokens, eligible, pricing_status, cost_usd,
                     quota_reset_at_ms, quota_limit_id
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12)",
-                params![
+            )
+            .and_then(|mut statement| {
+                statement.execute(params![
                     event_fingerprint(event),
                     account_key,
                     event.timestamp_ms,
@@ -851,8 +909,8 @@ impl Database {
                     cost_usd,
                     event.quota_reset_at_ms,
                     event.quota_limit_id,
-                ],
-            )
+                ])
+            })
             .map_err(|_| "unable to persist usage event".to_string())?;
         if inserted == 1 {
             if let (Some(used_percent), Some(duration_minutes)) =
@@ -865,12 +923,14 @@ impl Database {
                         <= WEEKLY_WINDOW_TOLERANCE_MINUTES
                 {
                     transaction
-                        .execute(
+                        .prepare_cached(
                             "INSERT INTO quota_snapshots (
                                 account_key, observed_at_ms, reset_at_ms, duration_minutes,
                                 limit_id, plan, used_percent, connection_quality
                              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'good')",
-                            params![
+                        )
+                        .and_then(|mut statement| {
+                            statement.execute(params![
                                 account_key,
                                 event.timestamp_ms,
                                 event.quota_reset_at_ms,
@@ -878,8 +938,8 @@ impl Database {
                                 event.quota_limit_id,
                                 event.plan,
                                 used_percent
-                            ],
-                        )
+                            ])
+                        })
                         .map_err(|_| "unable to persist weekly observation".to_string())?;
                 }
             }
@@ -1862,30 +1922,72 @@ impl Database {
         Ok(())
     }
 
+    // harn:assume reset-checkpoint-recovery ref=reset-checkpoint-storage scope=function
     pub fn reset_all_data(&mut self) -> Result<(), String> {
         let transaction = self
             .connection
             .transaction()
             .map_err(|_| "unable to start data reset".to_string())?;
         transaction
+            .execute_batch(CREATE_RESET_CHECKPOINT_SQL)
+            .map_err(|_| "unable to create the pre-reset checkpoint".to_string())?;
+        transaction
+            .execute_batch(CLEAR_IMPORTED_DATA_SQL)
+            .map_err(|_| "unable to reset local data".to_string())?;
+        transaction
             .execute_batch(
-                "DELETE FROM source_checkpoints;
-                 DELETE FROM usage_events;
-                 DELETE FROM pricing_snapshots;
-                 DELETE FROM quota_snapshots;
-                 DELETE FROM measurements;
-                 DELETE FROM epochs;
-                 DELETE FROM quotes;
-                 DELETE FROM chart_heartbeats;
-                 DELETE FROM annotations;
-                 DELETE FROM diagnostics;
-                 DELETE FROM accounts;
+                "DELETE FROM annotations;
                  DELETE FROM app_runs;",
             )
-            .map_err(|_| "unable to reset local data".to_string())?;
+            .map_err(|_| "unable to reset local annotations".to_string())?;
         transaction
             .commit()
             .map_err(|_| "unable to commit data reset".to_string())
+    }
+
+    pub fn restore_last_reset_checkpoint(&mut self) -> Result<(), String> {
+        let checkpoint_exists = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name='reset_checkpoint_meta'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if !checkpoint_exists {
+            return Err("no reset checkpoint is available".into());
+        }
+
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| "unable to start checkpoint restore".to_string())?;
+        transaction
+            .execute_batch(CLEAR_IMPORTED_DATA_SQL)
+            .map_err(|_| "unable to clear current imported data".to_string())?;
+        transaction
+            .execute_batch(RESTORE_RESET_CHECKPOINT_SQL)
+            .map_err(|_| "the reset checkpoint is incompatible with this database".to_string())?;
+        transaction
+            .commit()
+            .map_err(|_| "unable to commit checkpoint restore".to_string())
+    }
+
+    // harn:assume explicit-full-log-import ref=explicit-full-import scope=function
+    pub fn clear_imported_data(&mut self) -> Result<(), String> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| "unable to start full data import".to_string())?;
+        transaction
+            .execute_batch(CLEAR_IMPORTED_DATA_SQL)
+            .map_err(|_| "unable to clear the existing import index".to_string())?;
+        transaction
+            .commit()
+            .map_err(|_| "unable to prepare the full data import".to_string())
     }
 
     pub fn diagnostics(&self) -> Result<DiagnosticsSummary, String> {
@@ -1948,6 +2050,20 @@ impl Database {
             .map_err(|_| "unable to read model IDs".to_string())?
             .filter_map(Result::ok)
             .collect();
+        let mut unpriced_model_statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT model_id
+                 FROM usage_events
+                 WHERE pricing_status='pending'
+                 ORDER BY model_id",
+            )
+            .map_err(|_| "unable to read unpriced model IDs".to_string())?;
+        let unpriced_model_ids = unpriced_model_statement
+            .query_map([], |row| row.get(0))
+            .map_err(|_| "unable to read unpriced model IDs".to_string())?
+            .filter_map(Result::ok)
+            .collect();
         Ok(DiagnosticsSummary {
             total_events,
             priced_events,
@@ -1959,6 +2075,7 @@ impl Database {
             hidden_resets: self.diagnostic_count("hidden reset"),
             reasons,
             model_ids,
+            unpriced_model_ids,
             privacy:
                 "Prompts, account identifiers, and full local paths are never stored or returned."
                     .into(),
@@ -2132,6 +2249,77 @@ mod tests {
             .query_row("SELECT MAX(id) FROM quotes", [], |row| row.get(0))
             .expect("quote id after refresh");
         assert_eq!(quote_id_after_refresh, quote_id);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reset_checkpoint_restores_the_pre_reset_graph() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 42.0, Some(10_000)),
+                event(2_000, Some(0.42), 43.0, Some(10_000)),
+            ],
+        );
+        let quote_before_reset = database.latest_quote().expect("quote before reset");
+        assert!(quote_before_reset.is_some());
+
+        database.reset_all_data().expect("reset with checkpoint");
+        assert!(database
+            .latest_quote()
+            .expect("quote after reset")
+            .is_none());
+
+        database
+            .restore_last_reset_checkpoint()
+            .expect("restore checkpoint");
+        assert_eq!(
+            database
+                .latest_quote()
+                .expect("restored quote")
+                .and_then(|quote| quote.estimated_weekly_value_usd),
+            quote_before_reset.and_then(|quote| quote.estimated_weekly_value_usd)
+        );
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn full_import_clear_keeps_the_reset_checkpoint_available() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 42.0, Some(10_000)),
+                event(2_000, Some(0.42), 43.0, Some(10_000)),
+            ],
+        );
+        database.reset_all_data().expect("reset with checkpoint");
+        database.clear_imported_data().expect("prepare full import");
+        database
+            .restore_last_reset_checkpoint()
+            .expect("checkpoint survives full import clear");
+        assert!(database.latest_quote().expect("restored quote").is_some());
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn diagnostics_exposes_only_detected_models_that_need_custom_pricing() {
+        let (mut database, path) = database();
+        let known = event(1_000, Some(0.1), 42.0, Some(10_000));
+        let mut unknown = event(2_000, Some(0.1), 43.0, Some(10_000));
+        unknown.model = "local-codex-preview".into();
+        persist(&mut database, vec![known, unknown]);
+
+        let diagnostics = database.diagnostics().expect("diagnostics");
+        assert_eq!(
+            diagnostics.unpriced_model_ids,
+            vec!["local-codex-preview".to_string()]
+        );
+        assert!(diagnostics.model_ids.contains(&"gpt-5.2-codex".to_string()));
         drop(database);
         let _ = fs::remove_file(path);
     }

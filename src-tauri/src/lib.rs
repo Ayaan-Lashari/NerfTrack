@@ -349,6 +349,41 @@ fn restore_graph_data(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn restore_last_checkpoint(state: State<'_, AppState>) -> Result<(), String> {
+    state.pause_collection()?;
+    let restore_result = state
+        .database
+        .lock()
+        .map_err(|_| "database writer is unavailable".to_string())?
+        .restore_last_reset_checkpoint();
+    if let Err(error) = restore_result {
+        let _ = state.resume_collection();
+        return Err(error);
+    }
+    state.resume_collection()?;
+    // The checkpoint contains the exact pre-reset graph and source offsets. Reconcile once
+    // afterward so activity written to the Codex logs since the reset is retained as well.
+    state.reconcile()
+}
+
+#[tauri::command]
+fn import_all_data(state: State<'_, AppState>) -> Result<(), String> {
+    state.pause_collection()?;
+    let clear_result = state
+        .database
+        .lock()
+        .map_err(|_| "database writer is unavailable".to_string())?
+        .clear_imported_data();
+    if let Err(error) = clear_result {
+        let _ = state.resume_collection();
+        return Err(error);
+    }
+    state.resume_collection()?;
+    // With all source checkpoints removed, reconciliation reads every available JSONL record.
+    state.reconcile()
+}
+
+#[tauri::command]
 async fn get_diagnostics_summary(
     state: State<'_, AppState>,
 ) -> Result<models::DiagnosticsSummary, String> {
@@ -465,6 +500,8 @@ pub fn run() {
             reset_annotations,
             reset_all_data,
             restore_graph_data,
+            restore_last_checkpoint,
+            import_all_data,
             get_diagnostics_summary,
             retry_detection,
             select_codex_home,

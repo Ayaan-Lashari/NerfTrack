@@ -34,6 +34,10 @@ export const resetAllData = () => invokeOr<void>('reset_all_data', undefined);
 
 export const restoreGraphData = () => invokeOr<void>('restore_graph_data', undefined);
 
+export const restoreLastCheckpoint = () => invokeOr<void>('restore_last_checkpoint', undefined);
+
+export const importAllData = () => invokeOr<void>('import_all_data', undefined);
+
 export const getDiagnosticsSummary = () =>
   invokeOr<DiagnosticsSummary>('get_diagnostics_summary', demoDiagnostics);
 

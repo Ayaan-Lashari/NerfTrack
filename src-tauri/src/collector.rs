@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 use crate::parser::{
-    event_fingerprint, parse_newline_terminated_with_state, ParseStats, ParserState, UsageEvent,
+    event_fingerprint, parse_newline_terminated_bytes_with_state, ParseStats, ParserState,
+    UsageEvent,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -134,18 +135,14 @@ pub fn scan_codex_home_with_state(
                 .map(|position| offset + position as u64 + 1)
                 .unwrap_or(offset)
         };
-        match parse_newline_terminated_with_state(Cursor::new(bytes), &mut parser_state) {
-            Ok((events, stats)) => {
-                summary.stats.imported_records += stats.imported_records;
-                summary.stats.partial_line_retries += stats.partial_line_retries;
-                summary.stats.rejected_records += stats.rejected_records;
-                for event in events {
-                    if seen.insert(event_fingerprint(&event)) {
-                        summary.events.push(event);
-                    }
-                }
+        let (events, stats) = parse_newline_terminated_bytes_with_state(&bytes, &mut parser_state);
+        summary.stats.imported_records += stats.imported_records;
+        summary.stats.partial_line_retries += stats.partial_line_retries;
+        summary.stats.rejected_records += stats.rejected_records;
+        for event in events {
+            if seen.insert(event_fingerprint(&event)) {
+                summary.events.push(event);
             }
-            Err(_) => summary.interrupted_sources.push(key.clone()),
         }
         summary.checkpoints.push(SourceCheckpoint {
             source_key: key,

@@ -23,10 +23,11 @@ import {
   getDiagnosticsSummary,
   getHistory,
   getSettings,
+  importAllData,
   resetAllData,
-  retryDetection,
-  restoreGraphData,
   resetAnnotations,
+  restoreLastCheckpoint,
+  retryDetection,
   selectCodexExecutable,
   selectCodexHome,
   updateSettings,
@@ -493,12 +494,16 @@ export default function App() {
     await refresh();
   };
 
-  const handleRestoreGraphData = async () => {
-    await restoreGraphData();
+  const refreshAfterDataRestore = async (restore: () => Promise<void>) => {
+    await restore();
     historyCache.current = {};
     setHistories({});
     await refresh();
   };
+
+  const handleRestoreLastCheckpoint = () => refreshAfterDataRestore(restoreLastCheckpoint);
+
+  const handleImportAllData = () => refreshAfterDataRestore(importAllData);
 
   const runDetection = async () => {
     setStatus((current) => ({
@@ -608,6 +613,7 @@ export default function App() {
                 hiddenResets: 0,
                 reasons: [],
                 modelIds: [],
+                unpricedModelIds: [],
                 privacy: 'Waiting for local data.',
               }
             }
@@ -621,10 +627,12 @@ export default function App() {
         return (
           <SettingsView
             settings={displaySettings}
+            detectedModelIds={diagnostics?.unpricedModelIds ?? []}
             onChange={handleSettingChange}
             onCustomPricingChange={handleCustomPricingChange}
             onResetAllData={handleResetAllData}
-            onRestoreGraphData={handleRestoreGraphData}
+            onRestoreLastCheckpoint={handleRestoreLastCheckpoint}
+            onImportAllData={handleImportAllData}
           />
         );
       default:

@@ -35,6 +35,17 @@ describe('Nerfify app shell', () => {
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
 
+  it('offers fast checkpoint restore and a separate full log import', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+
+    expect(screen.getByRole('button', { name: 'Restore last checkpoint' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Import all data' })).toBeInTheDocument();
+    expect(screen.getByText(/fastest recovery option/i)).toBeInTheDocument();
+    expect(screen.getByText(/re-read every available Codex log/i)).toBeInTheDocument();
+  });
+
   it('edits and validates a local custom pricing override', async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -46,6 +57,21 @@ describe('Nerfify app shell', () => {
     await user.type(screen.getByLabelText('Model ID 1'), 'local-codex');
     await user.click(screen.getByRole('button', { name: 'Save pricing' }));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('autofills custom pricing drafts from detected unpriced models', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+
+    expect(screen.getByText('local-codex-preview')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Autofill detected model' }));
+
+    expect(screen.getByLabelText('Model ID 1')).toHaveValue('local-codex-preview');
+    expect(screen.getByText('All detected models are in this draft')).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Autofill detected model' }),
+    ).not.toBeInTheDocument();
   });
 
   it('navigates to diagnostics without leaking sensitive fields', async () => {

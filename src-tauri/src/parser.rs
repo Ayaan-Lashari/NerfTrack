@@ -519,19 +519,34 @@ pub fn parse_newline_terminated_with_state<R: Read>(
     reader
         .read_to_end(&mut bytes)
         .map_err(|_| "unable to read JSONL source".to_string())?;
+    Ok(parse_newline_terminated_bytes_with_state(&bytes, state))
+}
+
+pub fn parse_newline_terminated_bytes_with_state(
+    bytes: &[u8],
+    state: &mut ParserState,
+) -> (Vec<UsageEvent>, ParseStats) {
     let mut stats = ParseStats::default();
     let mut records = Vec::new();
     let has_terminal_newline = bytes.last().is_some_and(|byte| *byte == b'\n');
-    let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text.split('\n').collect();
-    let last_index = lines.len().saturating_sub(1);
-    for (index, line) in lines.into_iter().enumerate() {
+    let complete_length = if has_terminal_newline {
+        bytes.len()
+    } else {
+        bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1)
+    };
+    if !has_terminal_newline
+        && !String::from_utf8_lossy(&bytes[complete_length..])
+            .trim()
+            .is_empty()
+    {
+        stats.partial_line_retries += 1;
+    }
+    let text = String::from_utf8_lossy(&bytes[..complete_length]);
+    for line in text.lines() {
         if line.trim().is_empty() {
-            continue;
-        }
-        let is_last = index == last_index;
-        if is_last && !has_terminal_newline {
-            stats.partial_line_retries += 1;
             continue;
         }
         match parse_jsonl_line_with_state(line, state) {
@@ -543,7 +558,7 @@ pub fn parse_newline_terminated_with_state<R: Read>(
             Err(_) => stats.rejected_records += 1,
         }
     }
-    Ok((records, stats))
+    (records, stats)
 }
 
 pub fn read_newline_terminated<R: Read>(reader: R) -> Result<(Vec<String>, ParseStats), String> {
