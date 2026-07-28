@@ -137,7 +137,7 @@ function historySignal(point: HistoryPoint) {
   return point.rawEstimatedWeeklyValueUsd ?? point.estimatedWeeklyValueUsd;
 }
 
-// harn:assume visible-no-usage-gaps ref=no-usage-gap-rendering scope=function
+// harn:assume state-colored-no-usage-gaps ref=no-usage-gap-rendering scope=function
 function findNoUsageGaps(
   points: HistoryPoint[],
   coordinates: { x: number; y: number }[],
