@@ -506,6 +506,9 @@ impl Database {
                 );
                 CREATE INDEX IF NOT EXISTS idx_usage_events_credit_time
                     ON usage_events(account_key, credit_status, timestamp_ms);
+                CREATE INDEX IF NOT EXISTS idx_usage_events_estimation
+                    ON usage_events(account_key, timestamp_ms)
+                    WHERE eligible=1 AND pricing_status IN ('official', 'custom');
                 CREATE INDEX IF NOT EXISTS idx_quota_snapshots_account_limit_time
                     ON quota_snapshots(account_key, limit_id, observed_at_ms, id);
                 CREATE INDEX IF NOT EXISTS idx_quota_snapshots_time
@@ -2048,6 +2051,28 @@ mod tests {
             .query_row("SELECT MAX(id) FROM quotes", [], |row| row.get(0))
             .expect("quote id after refresh");
         assert_eq!(quote_id_after_refresh, quote_id);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn estimate_reads_use_the_filtered_time_index() {
+        let (database, path) = database();
+        let plan: String = database
+            .connection
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT COALESCE(SUM(cost_usd), 0.0)
+                 FROM usage_events
+                 WHERE eligible=1 AND pricing_status IN ('official', 'custom')
+                   AND timestamp_ms > ?1 AND timestamp_ms <= ?2
+                   AND account_key IS ?3
+                   AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)",
+                params![0_i64, i64::MAX, Option::<String>::None, Option::<String>::None],
+                |row| row.get(3),
+            )
+            .expect("estimate query plan");
+        assert!(plan.contains("idx_usage_events_estimation"), "{plan}");
         drop(database);
         let _ = fs::remove_file(path);
     }
