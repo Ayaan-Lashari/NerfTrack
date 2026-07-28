@@ -11,6 +11,7 @@ APP_BINARY="$APP_BUNDLE/Contents/MacOS/$PROCESS_NAME"
 
 pkill -x "$PROCESS_NAME" >/dev/null 2>&1 || true
 npm --prefix "$ROOT_DIR" run tauri:build -- --bundles app
+/usr/bin/find /Applications -maxdepth 1 -type d -name "$APP_NAME*.app" -exec rm -rf {} +
 /usr/bin/ditto "$BUILT_APP" "$APP_BUNDLE"
 
 case "$MODE" in
