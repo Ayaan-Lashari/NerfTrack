@@ -67,7 +67,7 @@ export function HistoryView({ history, range, onRangeChange }: HistoryViewProps)
           <Icon name="history" size={23} />
           <h2>Recent observations</h2>
           <span className="table-note">
-            {history.statistics.partial ? 'Partial range' : 'Complete range'}
+            {history.statistics.partial ? 'All available history' : 'Complete range'}
           </span>
         </div>
         <div className="history-table" role="table" aria-label="Recent observations">

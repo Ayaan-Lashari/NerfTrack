@@ -80,13 +80,13 @@ export const demoQuote: CurrentQuote = {
 export const demoAnnotations: Annotation[] = [
   {
     id: 'weekly-reset',
-    timestamp: Date.UTC(2026, 4, 7, 0),
+    timestamp: demoNow - 4.7 * day,
     label: 'Weekly window · scheduled reset',
     kind: 'reset',
   },
   {
     id: 'manual-reset',
-    timestamp: Date.UTC(2026, 4, 10, 6),
+    timestamp: demoNow - 2.15 * day,
     label: 'Weekly window · reported reset changed',
     kind: 'reset',
   },
@@ -156,6 +156,13 @@ export function getDemoHistory(range: Range): HistoryResponse {
       confidence: index < 8 ? ('low' as const) : ('high' as const),
       percentageCoverage: Number((progress * 34).toFixed(1)),
     };
+  }).filter((_, index) => {
+    if (range === '1D') return true;
+    const progress = index / Math.max(total - 1, 1);
+    return !(
+      (progress > 0.17 && progress < 0.33) ||
+      (progress > 0.61 && progress < 0.76)
+    );
   });
   points[points.length - 1].estimatedWeeklyValueUsd = demoQuote.estimatedWeeklyValueUsd ?? 0;
   return {

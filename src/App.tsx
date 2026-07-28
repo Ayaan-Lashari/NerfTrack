@@ -43,6 +43,13 @@ const rangeLabels: Record<Range, string> = {
   '3M': 'Past 3 Months',
   '6M': 'Past 6 Months',
 };
+const rangeDurationMs: Record<Range, number> = {
+  '1D': 86_400_000,
+  '1W': 604_800_000,
+  '1M': 2_592_000_000,
+  '3M': 7_776_000_000,
+  '6M': 15_552_000_000,
+};
 
 function formatUsd(value: number | null) {
   return value === null ? 'Not available' : `$${value.toFixed(2)}`;
@@ -214,6 +221,18 @@ function HomeView({
     displayValue !== null && comparisonValue !== null ? displayValue - comparisonValue : null;
   const displayPercent =
     displayChange !== null && comparisonValue ? (displayChange / comparisonValue) * 100 : null;
+  const signalPoints = history.points.filter(
+    (point) =>
+      (point.rawEstimatedWeeklyValueUsd ?? point.estimatedWeeklyValueUsd) !== null,
+  );
+  const availableHistoryStart = signalPoints[0]?.timestamp ?? null;
+  const availableHistoryEnd = signalPoints.at(-1)?.timestamp ?? null;
+  const usesAvailableHistory =
+    availableHistoryStart !== null &&
+    availableHistoryEnd !== null &&
+    availableHistoryEnd - availableHistoryStart < rangeDurationMs[range] * 0.98;
+  const comparisonStartTimestamp =
+    history.statistics.baselineTimestamp ?? availableHistoryStart;
   const comparisonLabel = scrubbed?.anchor
     ? 'Selected range'
     : scrubbed
@@ -225,8 +244,9 @@ function HomeView({
         })
       : history.statistics.baselineEstimatedWeeklyValueUsd === null
         ? `${rangeLabels[range]} unavailable`
-        : history.statistics.partial && history.statistics.baselineTimestamp !== null
-          ? `Since ${new Date(history.statistics.baselineTimestamp).toLocaleString('en-US', {
+        : (history.statistics.partial || usesAvailableHistory) &&
+            comparisonStartTimestamp !== null
+          ? `Since ${new Date(comparisonStartTimestamp).toLocaleString('en-US', {
               month: 'short',
               day: 'numeric',
               hour: range === '1D' ? 'numeric' : undefined,
@@ -300,8 +320,8 @@ function HomeView({
         />
         <div className="chart-actions">
           <span>
-            {history.statistics.partial
-              ? 'Partial range · older observations are usage history'
+            {history.statistics.partial || usesAvailableHistory
+              ? 'Showing all available log history'
               : 'Complete range'}
           </span>
           <button onClick={onResetAnnotations}>

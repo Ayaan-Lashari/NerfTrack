@@ -1805,6 +1805,9 @@ impl Database {
         };
         let stored = self.stored_points()?;
         let since = latest_timestamp - range.duration_ms();
+        let has_history_before_range = stored
+            .first()
+            .is_some_and(|stored| stored.point.timestamp <= since);
         let points = stored
             .iter()
             .filter(|stored| {
@@ -1853,7 +1856,7 @@ impl Database {
                 delta_value_usd,
                 delta_percent,
                 point_count: points.len(),
-                partial: points.first().map_or(true, |point| point.timestamp > since),
+                partial: !has_history_before_range,
             },
             bucket: range.bucket().into(),
             points,
@@ -2629,6 +2632,7 @@ mod tests {
         );
         assert_eq!(history.statistics.delta_value_usd, Some(10.0));
         assert_eq!(history.points[0].raw_estimated_weekly_value_usd, Some(3.28));
+        assert!(history.statistics.partial);
         drop(database);
         let _ = fs::remove_file(path);
     }
@@ -2679,6 +2683,7 @@ mod tests {
         assert_eq!(history.statistics.baseline_timestamp, None);
         assert_eq!(history.statistics.delta_value_usd, None);
         assert_eq!(history.statistics.delta_percent, None);
+        assert!(!history.statistics.partial);
         drop(database);
         let _ = fs::remove_file(path);
     }

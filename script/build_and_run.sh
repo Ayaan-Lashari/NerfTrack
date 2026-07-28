@@ -8,10 +8,17 @@ PROCESS_NAME="nerfify"
 BUILT_APP="$ROOT_DIR/src-tauri/target/release/bundle/macos/$APP_NAME.app"
 APP_BUNDLE="/Applications/$APP_NAME.app"
 APP_BINARY="$APP_BUNDLE/Contents/MacOS/$PROCESS_NAME"
+BACKUP_APP="$ROOT_DIR/dist/install-backup/$APP_NAME.app"
 
 pkill -x "$PROCESS_NAME" >/dev/null 2>&1 || true
 npm --prefix "$ROOT_DIR" run tauri:build -- --bundles app
-/usr/bin/find /Applications -maxdepth 1 -type d -name "$APP_NAME*.app" -exec rm -rf {} +
+/usr/bin/codesign --force --deep --sign - "$BUILT_APP"
+if [[ -d "$APP_BUNDLE" ]]; then
+  /bin/rm -rf "$BACKUP_APP"
+  /bin/mkdir -p "$(dirname "$BACKUP_APP")"
+  /usr/bin/ditto "$APP_BUNDLE" "$BACKUP_APP"
+fi
+/bin/rm -rf "$APP_BUNDLE"
 /usr/bin/ditto "$BUILT_APP" "$APP_BUNDLE"
 
 case "$MODE" in

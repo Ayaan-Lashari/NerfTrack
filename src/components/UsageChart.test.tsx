@@ -113,7 +113,7 @@ describe('UsageChart', () => {
       toJSON: () => ({}),
     });
 
-    const hoverEvent = new MouseEvent('pointermove', { bubbles: true, clientX: 924.333333 });
+    const hoverEvent = new MouseEvent('pointermove', { bubbles: true, clientX: 472 });
     Object.defineProperty(hoverEvent, 'pointerType', { value: 'mouse' });
     fireEvent(chart, hoverEvent);
 
@@ -138,7 +138,7 @@ describe('UsageChart', () => {
     expect(path?.getAttribute('d')?.match(/M /g)).toHaveLength(2);
   });
 
-  it('renders substantial inactivity as a faded dotted bridge labeled on hover', () => {
+  it('compresses substantial inactivity into an unconnected break labeled on hover', () => {
     const points = getDemoHistory('1D')
       .points.slice(0, 2)
       .map((point, index) => ({
@@ -146,12 +146,23 @@ describe('UsageChart', () => {
         timestamp: index === 0 ? 0 : 12 * 60 * 60 * 1_000,
         epoch: index + 1,
       }));
-    render(<UsageChart points={points} annotations={[]} range="1D" reducedMotion={false} />);
+    render(
+      <UsageChart
+        points={points}
+        annotations={[]}
+        range="1D"
+        reducedMotion={false}
+      />,
+    );
 
     const chart = screen.getByRole('img', { name: /Estimated weekly API-equivalent value/ });
-    const dottedBridge = chart.querySelector('.chart-no-usage-line');
-    expect(dottedBridge?.getAttribute('d')).toMatch(/^M .* L /);
+    expect(chart.querySelector('.chart-no-usage-line')).not.toBeInTheDocument();
+    expect(chart.querySelector('.chart-inactivity-gap')).toBeInTheDocument();
     expect(chart.querySelector('.chart-line')?.getAttribute('d')?.match(/M /g)).toHaveLength(2);
+    const pointXs = [
+      ...(chart.querySelector('.chart-line')?.getAttribute('d') ?? '').matchAll(/M ([\d.]+)/g),
+    ].map((match) => Number(match[1]));
+    expect(pointXs[1] - pointXs[0]).toBeGreaterThan(400);
 
     vi.spyOn(chart, 'getBoundingClientRect').mockReturnValue({
       left: 0,
@@ -164,12 +175,58 @@ describe('UsageChart', () => {
       y: 0,
       toJSON: () => ({}),
     });
-    const hoverEvent = new MouseEvent('pointermove', { bubbles: true, clientX: 708 });
+    const hoverEvent = new MouseEvent('pointermove', { bubbles: true, clientX: 472 });
     Object.defineProperty(hoverEvent, 'pointerType', { value: 'mouse' });
     fireEvent(chart, hoverEvent);
 
-    expect(screen.getByRole('status')).toHaveTextContent('No usage');
+    expect(screen.getByRole('status')).toHaveTextContent('No activity · 12h');
     expect(document.querySelector('.scrub-readout')).not.toBeInTheDocument();
+  });
+
+  it('stretches all available history from the first to last chart edge', () => {
+    const points = getDemoHistory('1D')
+      .points.slice(0, 2)
+      .map((point, index) => ({
+        ...point,
+        timestamp: 1_000 + index * 3_600_000,
+      }));
+    render(
+      <UsageChart
+        points={points}
+        annotations={[]}
+        range="6M"
+        reducedMotion={false}
+      />,
+    );
+
+    const labels = [...document.querySelectorAll('.chart-x-label')].map(
+      (label) => label.textContent,
+    );
+    expect(labels[0]).toBe(labels[1]);
+    expect(labels.at(-1)).toBe(labels[0]);
+    const path = document.querySelector('.chart-line')?.getAttribute('d') ?? '';
+    expect(path).toMatch(/^M 0\.00 /);
+    expect(path).toContain('L 944.00 ');
+  });
+
+  it('renders reset annotations as compact icons with hover text', () => {
+    const points = getDemoHistory('1W').points;
+    const timestamp = points[Math.floor(points.length / 2)].timestamp;
+    render(
+      <UsageChart
+        points={points}
+        annotations={[
+          { id: 'reset-1', timestamp, label: 'Weekly window · reset changed', kind: 'reset' },
+        ]}
+        range="1W"
+        reducedMotion={false}
+      />,
+    );
+
+    const marker = screen.getByRole('img', { name: /Reset changed/ });
+    expect(marker.querySelector('rect')).not.toBeInTheDocument();
+    fireEvent.pointerEnter(marker);
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Reset changed');
   });
 
   it('plots raw estimates and excludes comparison baselines from axis bounds', () => {
@@ -207,6 +264,7 @@ describe('UsageChart', () => {
     );
     expect(screen.getByText('Estimated weekly API-equivalent value')).toBeInTheDocument();
     expect(screen.getByText('USD · local token-derived estimate')).toBeInTheDocument();
-    expect(document.querySelector('.chart-line')?.getAttribute('d')?.match(/M /g)?.length).toBe(2);
+    expect(document.querySelectorAll('.chart-inactivity-gap')).toHaveLength(2);
+    expect(document.querySelector('.chart-line')?.getAttribute('d')?.match(/M /g)?.length).toBe(4);
   });
 });

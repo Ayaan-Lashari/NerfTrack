@@ -36,8 +36,21 @@ interface ChartSelection {
 interface NoUsageGap {
   startTimestamp: number;
   endTimestamp: number;
-  start: { x: number; y: number };
-  end: { x: number; y: number };
+}
+
+interface TimelineSpan {
+  kind: 'activity' | 'gap';
+  startTimestamp: number;
+  endTimestamp: number;
+  startX: number;
+  endX: number;
+}
+
+interface AnnotationMarker {
+  id: string;
+  x: number;
+  count: number;
+  label: string;
 }
 
 function formatDate(timestamp: number, range: Range) {
@@ -52,12 +65,23 @@ function formatUsd(value: number | null) {
   return value === null ? '—' : `$${value.toFixed(2)}`;
 }
 
-function compactAnnotationLabel(label: string) {
-  return label
+function annotationLabel(label: string) {
+  const compact = label
     .replace(/^Weekly window · /, '')
     .replace(/_/g, ' ')
     .replace('reported reset changed', 'reset changed')
     .replace('usage decreased', 'usage drop');
+  return compact.charAt(0).toUpperCase() + compact.slice(1);
+}
+
+function formatGapDuration(durationMs: number) {
+  const totalMinutes = Math.max(1, Math.round(durationMs / 60_000));
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const totalHours = Math.round(totalMinutes / 60);
+  if (totalHours < 48) return `${totalHours}h`;
+  const days = Math.round(totalHours / 24);
+  if (days < 60) return `${days}d`;
+  return `${Math.round(days / 30)}mo`;
 }
 
 function nearestPoint(points: HistoryPoint[], timestamp: number) {
@@ -137,10 +161,9 @@ function historySignal(point: HistoryPoint) {
   return point.rawEstimatedWeeklyValueUsd ?? point.estimatedWeeklyValueUsd;
 }
 
-// harn:assume state-colored-no-usage-dashes ref=no-usage-gap-rendering scope=function
+// harn:assume compressed-inactivity-gaps ref=no-usage-gap-rendering scope=function
 function findNoUsageGaps(
   points: HistoryPoint[],
-  coordinates: { x: number; y: number }[],
   thresholdMs: number,
 ) {
   const gaps: NoUsageGap[] = [];
@@ -157,11 +180,123 @@ function findNoUsageGaps(
     gaps.push({
       startTimestamp: previous.timestamp,
       endTimestamp: current.timestamp,
-      start: coordinates[index - 1],
-      end: coordinates[index],
     });
   }
   return gaps;
+}
+
+function buildTimeline(
+  startTimestamp: number,
+  endTimestamp: number,
+  gaps: NoUsageGap[],
+): TimelineSpan[] {
+  if (endTimestamp <= startTimestamp) {
+    return [
+      {
+        kind: 'activity',
+        startTimestamp,
+        endTimestamp: startTimestamp,
+        startX: plotLeft,
+        endX: plotRight,
+      },
+    ];
+  }
+
+  const domainGaps = gaps.filter(
+    (gap) => gap.startTimestamp >= startTimestamp && gap.endTimestamp <= endTimestamp,
+  );
+  const rawSpans: Array<Omit<TimelineSpan, 'startX' | 'endX'>> = [];
+  let timestampCursor = startTimestamp;
+  domainGaps.forEach((gap) => {
+    rawSpans.push({
+      kind: 'activity',
+      startTimestamp: timestampCursor,
+      endTimestamp: gap.startTimestamp,
+    });
+    rawSpans.push({ kind: 'gap', ...gap });
+    timestampCursor = gap.endTimestamp;
+  });
+  rawSpans.push({
+    kind: 'activity',
+    startTimestamp: timestampCursor,
+    endTimestamp,
+  });
+
+  const plotWidth = plotRight - plotLeft;
+  const gapWidth = domainGaps.length
+    ? Math.min(8, (plotWidth * 0.08) / domainGaps.length)
+    : 0;
+  const activeWidth = plotWidth - gapWidth * domainGaps.length;
+  const activeSpans = rawSpans.filter((span) => span.kind === 'activity');
+  const activeDuration = activeSpans.reduce(
+    (total, span) => total + Math.max(span.endTimestamp - span.startTimestamp, 0),
+    0,
+  );
+  const baseActiveWidth = activeSpans.length
+    ? Math.min(10, activeWidth / (activeSpans.length * 2))
+    : 0;
+  const proportionalActiveWidth = activeWidth - baseActiveWidth * activeSpans.length;
+  const spans: TimelineSpan[] = [];
+  let xCursor = plotLeft;
+
+  rawSpans.forEach((span, index) => {
+    const duration = Math.max(span.endTimestamp - span.startTimestamp, 0);
+    const width =
+      span.kind === 'gap'
+        ? gapWidth
+        : activeDuration > 0
+          ? baseActiveWidth + (duration / activeDuration) * proportionalActiveWidth
+          : activeWidth / Math.max(activeSpans.length, 1);
+    const endX = index === rawSpans.length - 1 ? plotRight : xCursor + width;
+    spans.push({ ...span, startX: xCursor, endX });
+    xCursor = endX;
+  });
+  return spans;
+}
+
+function timestampToX(spans: TimelineSpan[], timestamp: number) {
+  const span =
+    spans.find(
+      (item) =>
+        item.kind === 'activity' &&
+        item.startTimestamp === item.endTimestamp &&
+        timestamp === item.startTimestamp,
+    ) ??
+    spans.find(
+      (item) => timestamp >= item.startTimestamp && timestamp <= item.endTimestamp,
+    ) ?? (timestamp < (spans[0]?.startTimestamp ?? 0) ? spans[0] : spans.at(-1));
+  if (!span) return plotLeft;
+  if (span.endTimestamp <= span.startTimestamp) {
+    if (spans.length === 1) return (span.startX + span.endX) / 2;
+    if (span === spans[0]) return span.startX;
+    if (span === spans.at(-1)) return span.endX;
+    return (span.startX + span.endX) / 2;
+  }
+  const ratio = Math.max(
+    0,
+    Math.min(
+      1,
+      (timestamp - span.startTimestamp) /
+        Math.max(span.endTimestamp - span.startTimestamp, 1),
+    ),
+  );
+  return span.startX + ratio * (span.endX - span.startX);
+}
+
+function xToTimelinePosition(spans: TimelineSpan[], x: number) {
+  const span =
+    spans.find((item) => x >= item.startX && x <= item.endX) ??
+    (x < (spans[0]?.startX ?? 0) ? spans[0] : spans.at(-1));
+  if (!span) return null;
+  const ratio = Math.max(
+    0,
+    Math.min(1, (x - span.startX) / Math.max(span.endX - span.startX, 1)),
+  );
+  return {
+    span,
+    timestamp:
+      span.startTimestamp + ratio * (span.endTimestamp - span.startTimestamp),
+  };
 }
 
 // harn:assume raw-history-stable-headline ref=history-chart-rendering scope=function
@@ -179,14 +314,19 @@ export function UsageChart({
   const anchorRef = useRef<HistoryPoint | null>(null);
   const [selection, setSelection] = useState<ChartSelection | null>(null);
   const [anchorPoint, setAnchorPoint] = useState<HistoryPoint | null>(null);
-  const [noUsageHoverX, setNoUsageHoverX] = useState<number | null>(null);
+  const [noUsageHover, setNoUsageHover] = useState<{
+    x: number;
+    durationMs: number;
+  } | null>(null);
+  const [annotationHover, setAnnotationHover] = useState<AnnotationMarker | null>(null);
 
   useEffect(() => {
     isDragging.current = false;
     anchorRef.current = null;
     setSelection(null);
     setAnchorPoint(null);
-    setNoUsageHoverX(null);
+    setNoUsageHover(null);
+    setAnnotationHover(null);
   }, [range]);
 
   const values = useMemo(
@@ -201,14 +341,28 @@ export function UsageChart({
     return { min: Math.max(0, minValue - padding), max: maxValue + padding };
   }, [values]);
 
-  const rangeEnd = points.at(-1)?.timestamp ?? Date.now();
-  const rangeStart = rangeEnd - rangeDurationMs[range];
+  const signalPoints = useMemo(
+    () => points.filter((point) => historySignal(point) !== null),
+    [points],
+  );
+  const rangeStart =
+    signalPoints[0]?.timestamp ?? points[0]?.timestamp ?? Date.now() - rangeDurationMs[range];
+  const rangeEnd =
+    signalPoints.at(-1)?.timestamp ?? points.at(-1)?.timestamp ?? rangeStart + rangeDurationMs[range];
+  const visibleDurationMs = Math.max(rangeEnd - rangeStart, 1);
+  const noUsageThresholdMs = Math.max(2 * 60 * 60 * 1_000, visibleDurationMs / 240);
+  const noUsageGaps = useMemo(
+    () => findNoUsageGaps(points, noUsageThresholdMs),
+    [noUsageThresholdMs, points],
+  );
+  const timeline = useMemo(
+    () => buildTimeline(rangeStart, rangeEnd, noUsageGaps),
+    [noUsageGaps, rangeEnd, rangeStart],
+  );
   const coordinates = useMemo(() => {
     const valueRange = Math.max(bounds.max - bounds.min, 1);
     return points.map((point) => ({
-      x:
-        plotLeft +
-        ((point.timestamp - rangeStart) / rangeDurationMs[range]) * (plotRight - plotLeft),
+      x: timestampToX(timeline, point.timestamp),
       y:
         historySignal(point) === null
           ? plotBottom
@@ -216,12 +370,7 @@ export function UsageChart({
             ((bounds.max - (historySignal(point) ?? bounds.min)) / valueRange) *
               (plotBottom - plotTop),
     }));
-  }, [bounds.max, bounds.min, points, range, rangeStart]);
-  const noUsageThresholdMs = Math.max(2 * 60 * 60 * 1_000, rangeDurationMs[range] / 240);
-  const noUsageGaps = useMemo(
-    () => findNoUsageGaps(points, coordinates, noUsageThresholdMs),
-    [coordinates, noUsageThresholdMs, points],
-  );
+  }, [bounds.max, bounds.min, points, timeline]);
   const gapStartingAt = useMemo(
     () => new Set(noUsageGaps.map((gap) => gap.startTimestamp)),
     [noUsageGaps],
@@ -264,41 +413,48 @@ export function UsageChart({
       return `${line} L ${segment.at(-1)?.x ?? plotRight} ${plotBottom} L ${segment[0].x} ${plotBottom} Z`;
     })
     .join(' ');
-  const noUsagePath = noUsageGaps
-    .map(
-      (gap) =>
-        `M ${gap.start.x.toFixed(2)} ${gap.start.y.toFixed(2)} L ${gap.end.x.toFixed(2)} ${gap.end.y.toFixed(2)}`,
-    )
-    .join(' ');
+  const gapSpans = useMemo(() => timeline.filter((span) => span.kind === 'gap'), [timeline]);
   const visibleAnnotations = useMemo(() => {
-    let previousX = -Infinity;
-    let lane = 0;
-    return annotations
-      .map((annotation) => {
-        const ratio = (annotation.timestamp - rangeStart) / rangeDurationMs[range];
-        if (ratio < 0 || ratio > 1) return null;
-        const x = plotLeft + ratio * (plotRight - plotLeft);
-        lane = x - previousX < 146 ? (lane + 1) % 3 : 0;
-        previousX = x;
-        return {
-          annotation,
-          x,
-          lane,
-          label: compactAnnotationLabel(annotation.label),
-        };
-      })
-      .filter((item): item is NonNullable<typeof item> => item !== null)
-      .slice(-10);
-  }, [annotations, range, rangeStart]);
+    const markers = annotations
+      .filter(
+        (annotation) =>
+          annotation.timestamp >= rangeStart && annotation.timestamp <= rangeEnd,
+      )
+      .map((annotation) => ({
+        id: annotation.id,
+        x: timestampToX(timeline, annotation.timestamp),
+        count: 1,
+        label: `${annotationLabel(annotation.label)} · ${new Date(
+          annotation.timestamp,
+        ).toLocaleString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          hour: 'numeric',
+          minute: '2-digit',
+        })}`,
+      }));
+
+    return markers.reduce<AnnotationMarker[]>((groups, marker) => {
+      const previous = groups.at(-1);
+      if (previous && marker.x - previous.x < 24) {
+        const count = previous.count + 1;
+        previous.x = (previous.x * previous.count + marker.x) / count;
+        previous.count = count;
+        previous.label = `${count} reset changes`;
+        previous.id = `${previous.id}-${marker.id}`;
+      } else {
+        groups.push({ ...marker });
+      }
+      return groups;
+    }, []);
+  }, [annotations, rangeEnd, rangeStart, timeline]);
   const selected = selection?.point ?? null;
   const selectedCoordinate = selection?.coordinate ?? null;
   const anchorCoordinate = useMemo(() => {
     if (!anchorPoint || points.length === 0) return null;
     const valueRange = Math.max(bounds.max - bounds.min, 1);
     return {
-      x:
-        plotLeft +
-        ((anchorPoint.timestamp - rangeStart) / rangeDurationMs[range]) * (plotRight - plotLeft),
+      x: timestampToX(timeline, anchorPoint.timestamp),
       y:
         historySignal(anchorPoint) === null
           ? plotBottom
@@ -306,7 +462,7 @@ export function UsageChart({
             ((bounds.max - (historySignal(anchorPoint) ?? bounds.min)) / valueRange) *
               (plotBottom - plotTop),
     };
-  }, [anchorPoint, bounds.max, bounds.min, points.length, range, rangeStart]);
+  }, [anchorPoint, bounds.max, bounds.min, points.length, timeline]);
   const baselineCoordinate =
     baselineEstimatedWeeklyValueUsd === null ||
     baselineEstimatedWeeklyValueUsd < bounds.min ||
@@ -348,18 +504,21 @@ export function UsageChart({
     const rect = svg.getBoundingClientRect();
     if (rect.width <= 0) return null;
     const svgX = ((clientX - rect.left) / rect.width) * chartWidth;
-    const ratio = Math.max(0, Math.min(1, (svgX - plotLeft) / (plotRight - plotLeft)));
-    const timestamp = rangeStart + ratio * rangeDurationMs[range];
-    const noUsageGap = noUsageGaps.find(
-      (gap) => timestamp > gap.startTimestamp && timestamp < gap.endTimestamp,
-    );
-    if (source === 'hover' && noUsageGap) {
-      setNoUsageHoverX(plotLeft + ratio * (plotRight - plotLeft));
+    const x = Math.max(plotLeft, Math.min(plotRight, svgX));
+    const timelinePosition = xToTimelinePosition(timeline, x);
+    if (!timelinePosition) return null;
+    if (timelinePosition.span.kind === 'gap') {
+      setNoUsageHover({
+        x,
+        durationMs:
+          timelinePosition.span.endTimestamp - timelinePosition.span.startTimestamp,
+      });
       setSelection(null);
       onScrub?.(null, null);
       return null;
     }
-    setNoUsageHoverX(null);
+    setNoUsageHover(null);
+    const timestamp = timelinePosition.timestamp;
     const point = interpolatePoint(points, timestamp);
     if (!point) return null;
     const valueRange = Math.max(bounds.max - bounds.min, 1);
@@ -371,7 +530,7 @@ export function UsageChart({
             (plotBottom - plotTop);
     setSelection({
       point,
-      coordinate: { x: plotLeft + ratio * (plotRight - plotLeft), y },
+      coordinate: { x, y },
       pointIndex: null,
       source,
     });
@@ -439,17 +598,31 @@ export function UsageChart({
         <small>USD · local token-derived estimate</small>
       </div>
       <div className="chart-canvas-wrap">
-        {noUsageHoverX !== null && (
+        {noUsageHover && (
           <div
             className="no-usage-readout"
             role="status"
             style={
               {
-                '--no-usage-x': `${(noUsageHoverX / chartWidth) * 100}%`,
+                '--no-usage-x': `${(noUsageHover.x / chartWidth) * 100}%`,
               } as React.CSSProperties
             }
           >
-            No usage
+            No activity · {formatGapDuration(noUsageHover.durationMs)}
+          </div>
+        )}
+        {annotationHover && (
+          <div
+            className="annotation-readout"
+            role="tooltip"
+            style={
+              {
+                '--annotation-x': `${(annotationHover.x / chartWidth) * 100}%`,
+              } as React.CSSProperties
+            }
+          >
+            <Icon name="refresh" size={13} />
+            {annotationHover.label}
           </div>
         )}
         {selected && selectedCoordinate && (
@@ -511,7 +684,8 @@ export function UsageChart({
             );
           }}
           onPointerLeave={() => {
-            setNoUsageHoverX(null);
+            setNoUsageHover(null);
+            setAnnotationHover(null);
             if (!isDragging.current && selection?.source === 'hover') {
               setSelection(null);
               onScrub?.(null, null);
@@ -565,9 +739,6 @@ export function UsageChart({
             />
           )}
           <path className="chart-area" d={areaPath} />
-          <path className="chart-no-usage-line" d={noUsagePath}>
-            <title>No usage</title>
-          </path>
           <path className="chart-line" d={linePath} />
           {segments
             .filter((segment) => segment.length === 1)
@@ -580,23 +751,69 @@ export function UsageChart({
                 r="3"
               />
             ))}
-          {visibleAnnotations.map(({ annotation, x, lane, label }) => {
-            const markerY = 20 + lane * 30;
-            const labelX = Math.max(4, Math.min(x - 64, plotRight - 132));
+          {gapSpans.map((gap) => {
+            const centerX = (gap.startX + gap.endX) / 2;
+            const durationMs = gap.endTimestamp - gap.startTimestamp;
             return (
-              <g key={annotation.id} className="chart-annotation">
-                <title>{annotation.label}</title>
-                <line x1={x} x2={x} y1={markerY} y2={plotBottom} />
-                <circle cx={x} cy={markerY} r={4.4} />
-                <g transform={`translate(${labelX}, ${markerY - 15})`}>
-                  <rect width="132" height="28" rx="7" />
-                  <text x="66" y="18" textAnchor="middle">
-                    {label}
-                  </text>
-                </g>
+              <g
+                key={`gap-${gap.startTimestamp}`}
+                className="chart-inactivity-gap"
+                role="img"
+                aria-label={`No activity for ${formatGapDuration(durationMs)}`}
+                tabIndex={0}
+                onPointerEnter={() => setNoUsageHover({ x: centerX, durationMs })}
+                onPointerLeave={() => setNoUsageHover(null)}
+                onFocus={() => setNoUsageHover({ x: centerX, durationMs })}
+                onBlur={() => setNoUsageHover(null)}
+              >
+                <title>No activity for {formatGapDuration(durationMs)}</title>
+                <rect
+                  x={gap.startX}
+                  y={plotTop}
+                  width={Math.max(gap.endX - gap.startX, 1)}
+                  height={plotBottom - plotTop}
+                />
+                <line
+                  x1={centerX - 3.2}
+                  x2={centerX - 0.8}
+                  y1={plotBottom + 3}
+                  y2={plotBottom - 3}
+                />
+                <line
+                  x1={centerX + 0.8}
+                  x2={centerX + 3.2}
+                  y1={plotBottom + 3}
+                  y2={plotBottom - 3}
+                />
               </g>
             );
           })}
+          {visibleAnnotations.map((marker) => (
+            <g
+              key={marker.id}
+              className="chart-annotation"
+              role="img"
+              aria-label={marker.label}
+              tabIndex={0}
+              transform={`translate(${marker.x}, ${plotTop + 7})`}
+              onPointerEnter={() => setAnnotationHover(marker)}
+              onPointerLeave={() => setAnnotationHover(null)}
+              onFocus={() => setAnnotationHover(marker)}
+              onBlur={() => setAnnotationHover(null)}
+            >
+              <title>{marker.label}</title>
+              <circle r="9" />
+              <path d="M 3.8 -2.2 A 4.7 4.7 0 1 0 3.2 3.1 M 3.8 -2.2 L 3.7 -5.1 M 3.8 -2.2 L 1 -2.3" />
+              {marker.count > 1 && (
+                <>
+                  <circle className="chart-annotation-count-bg" cx="7" cy="-7" r="5.5" />
+                  <text className="chart-annotation-count" x="7" y="-5.1" textAnchor="middle">
+                    {marker.count}
+                  </text>
+                </>
+              )}
+            </g>
+          ))}
           {anchorCoordinate && (selection?.source === 'held' || selection?.source === 'locked') && (
             <g className="chart-anchor-marker">
               <line x1={anchorCoordinate.x} x2={anchorCoordinate.x} y1={plotTop} y2={plotBottom} />
@@ -644,7 +861,7 @@ export function UsageChart({
           })}
           {labelRatios.map((ratio, index) => {
             const x = plotLeft + ratio * (plotRight - plotLeft);
-            const timestamp = rangeStart + ratio * rangeDurationMs[range];
+            const timestamp = xToTimelinePosition(timeline, x)?.timestamp ?? rangeStart;
             return (
               <text
                 key={`x-${index}`}
