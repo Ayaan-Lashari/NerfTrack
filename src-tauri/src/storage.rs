@@ -355,7 +355,6 @@ impl Database {
         }
         database.restrict_directory_permissions(&directory);
         database.restrict_file_permissions();
-        database.rebuild_quotes()?;
         database.record_app_run()?;
         Ok(database)
     }
@@ -784,7 +783,9 @@ impl Database {
                 inserted += 1;
             }
         }
-        Self::rebuild_quotes_in_transaction(&transaction)?;
+        if inserted > 0 {
+            Self::rebuild_quotes_in_transaction(&transaction)?;
+        }
         if collection.stats.partial_line_retries > 0 {
             add_diagnostic(
                 &transaction,
@@ -2021,6 +2022,32 @@ mod tests {
             .expect("current quote");
         assert_eq!(quote.estimated_weekly_value_usd, Some(73.5));
         assert_eq!(quote.observed_cost_usd, Some(0.735));
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_incremental_scan_keeps_existing_estimates() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 42.0, Some(10_000)),
+                event(2_000, Some(0.42), 43.0, Some(10_000)),
+            ],
+        );
+        let quote_id: i64 = database
+            .connection
+            .query_row("SELECT MAX(id) FROM quotes", [], |row| row.get(0))
+            .expect("quote id");
+
+        persist(&mut database, Vec::new());
+
+        let quote_id_after_refresh: i64 = database
+            .connection
+            .query_row("SELECT MAX(id) FROM quotes", [], |row| row.get(0))
+            .expect("quote id after refresh");
+        assert_eq!(quote_id_after_refresh, quote_id);
         drop(database);
         let _ = fs::remove_file(path);
     }

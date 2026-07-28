@@ -33,7 +33,6 @@ impl AppState {
             codex_binary_override: Mutex::new(None),
             collection_paused: Mutex::new(false),
         };
-        let _ = state.reconcile();
         Ok(state)
     }
 
