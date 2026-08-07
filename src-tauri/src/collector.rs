@@ -61,6 +61,19 @@ fn source_key(path: &Path) -> String {
     format!("source_{:x}", digest.finalize())
 }
 
+fn has_complete_unterminated_record(bytes: &[u8]) -> bool {
+    if bytes.is_empty() || bytes.last().is_some_and(|byte| *byte == b'\n') {
+        return false;
+    }
+    let tail_start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let tail = &bytes[tail_start..];
+    !tail.iter().all(|byte| byte.is_ascii_whitespace())
+        && serde_json::from_slice::<serde_json::Value>(tail).is_ok()
+}
+
 pub fn scan_codex_home(
     home: &Path,
     previous: &HashMap<String, u64>,
@@ -126,7 +139,8 @@ pub fn scan_codex_home_with_state(
             continue;
         }
         let terminal_newline = bytes.last().is_some_and(|byte| *byte == b'\n');
-        let next_offset = if terminal_newline {
+        let complete_unterminated_record = has_complete_unterminated_record(&bytes);
+        let next_offset = if terminal_newline || complete_unterminated_record {
             size
         } else {
             bytes
@@ -135,7 +149,15 @@ pub fn scan_codex_home_with_state(
                 .map(|position| offset + position as u64 + 1)
                 .unwrap_or(offset)
         };
-        let (events, stats) = parse_newline_terminated_bytes_with_state(&bytes, &mut parser_state);
+        let mut parse_bytes = bytes;
+        if complete_unterminated_record {
+            // A writer can exit after flushing a complete JSON object but before its newline.
+            // Once the tail is valid JSON, consuming it is safe and prevents the final usage
+            // record from being stranded at the same checkpoint forever.
+            parse_bytes.push(b'\n');
+        }
+        let (events, stats) =
+            parse_newline_terminated_bytes_with_state(&parse_bytes, &mut parser_state);
         summary.stats.imported_records += stats.imported_records;
         summary.stats.partial_line_retries += stats.partial_line_retries;
         summary.stats.rejected_records += stats.rejected_records;
@@ -195,6 +217,54 @@ mod tests {
         assert!(!first.checkpoints[0]
             .source_key
             .contains(root.to_string_lossy().as_ref()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imports_completed_final_record_without_trailing_newline_after_retry() {
+        let root = std::env::temp_dir().join(format!(
+            "nerfify-collector-final-record-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        let active = root.join("session.jsonl");
+        let first_line = r#"{"request_id":"r1","turn_id":"t1","timestamp":1735689600,"model":"gpt-5-codex","usage":{"input_tokens":10,"output_tokens":4}}"#;
+        let final_line = r#"{"request_id":"r2","turn_id":"t2","timestamp":1735689660,"model":"gpt-5-codex","usage":{"input_tokens":12,"output_tokens":5}}"#;
+        let split = final_line.len() / 2;
+
+        fs::write(&active, format!("{first_line}\n{}", &final_line[..split]))
+            .expect("partial write");
+        let first =
+            scan_codex_home_with_state(&root, &HashMap::new()).expect("first scan");
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.stats.partial_line_retries, 1);
+
+        let previous: HashMap<_, _> = first
+            .checkpoints
+            .iter()
+            .map(|checkpoint| {
+                (
+                    checkpoint.source_key.clone(),
+                    PersistedCheckpoint {
+                        byte_offset: checkpoint.byte_offset,
+                        parser_state_json: checkpoint.parser_state_json.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        fs::write(&active, format!("{first_line}\n{final_line}")).expect("final write");
+        let second =
+            scan_codex_home_with_state(&root, &previous).expect("second scan");
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].request_id.as_deref(), Some("r2"));
+        assert_eq!(second.stats.partial_line_retries, 0);
+        assert_eq!(
+            second.checkpoints[0].byte_offset,
+            fs::metadata(&active).expect("metadata").len()
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 }
