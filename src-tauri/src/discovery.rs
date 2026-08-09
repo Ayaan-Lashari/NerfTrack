@@ -487,9 +487,12 @@ fn codex_file_name(path: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        return windows_executable_extensions().iter().any(|extension| {
-            name == format!("codex{extension}") || name == format!("codex-cli{extension}")
-        });
+        return windows_executable_extensions()
+            .iter()
+            .filter(|extension| !matches!(extension.as_str(), ".bat" | ".cmd"))
+            .any(|extension| {
+                name == format!("codex{extension}") || name == format!("codex-cli{extension}")
+            });
     }
     #[cfg(not(windows))]
     {
@@ -534,7 +537,10 @@ pub fn is_executable_file(path: &Path) -> bool {
         path.extension()
             .and_then(|extension| extension.to_str())
             .map(|extension| format!(".{extension}").to_ascii_lowercase())
-            .is_some_and(|extension| windows_executable_extensions().contains(&extension))
+            .is_some_and(|extension| {
+                !matches!(extension.as_str(), ".bat" | ".cmd")
+                    && windows_executable_extensions().contains(&extension)
+            })
     }
     #[cfg(not(any(unix, windows)))]
     {

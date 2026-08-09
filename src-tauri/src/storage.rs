@@ -354,7 +354,7 @@ fn empty_history(range: Range) -> HistoryResponse {
 /// Resolves the per-user application-data directory through the platform-aware
 /// `dirs` crate. There is deliberately no current-working-directory fallback.
 pub fn data_directory() -> Result<PathBuf, String> {
-    dirs::data_dir()
+    dirs::data_local_dir()
         .map(|directory| directory.join("NerfTrack"))
         .ok_or_else(|| "the platform did not provide a user application-data directory".into())
 }
