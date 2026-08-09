@@ -3,8 +3,8 @@ set -euo pipefail
 
 MODE="${1:-run}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_NAME="Nerfify"
-PROCESS_NAME="nerfify"
+APP_NAME="NerfTrack"
+PROCESS_NAME="nerftrack"
 BUILT_APP="$ROOT_DIR/src-tauri/target/release/bundle/macos/$APP_NAME.app"
 APP_BUNDLE="/Applications/$APP_NAME.app"
 APP_BINARY="$APP_BUNDLE/Contents/MacOS/$PROCESS_NAME"
@@ -34,7 +34,7 @@ case "$MODE" in
     ;;
   --telemetry|telemetry)
     open "$APP_BUNDLE"
-    /usr/bin/log stream --info --style compact --predicate 'subsystem == "com.nerfify.desktop"'
+    /usr/bin/log stream --info --style compact --predicate 'subsystem == "com.nerftrack.desktop"'
     ;;
   --verify|verify)
     open "$APP_BUNDLE"

@@ -58,6 +58,9 @@ export const selectCodexHome = () =>
 export const selectCodexExecutable = () =>
   invokeOr<RedactedSelection>('select_codex_executable', missingSelection);
 
+export const clearDiscoveryOverrides = () =>
+  invokeOr<AppStatus>('clear_discovery_overrides', demoStatus);
+
 export const getSettings = () => invokeOr<AppSettings>('get_settings', demoSettings);
 
 export const updateSettings = (settings: AppSettings) =>

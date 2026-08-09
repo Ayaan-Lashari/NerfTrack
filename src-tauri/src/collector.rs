@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -30,6 +30,7 @@ pub struct CollectionSummary {
     pub checkpoints: Vec<SourceCheckpoint>,
     pub stats: ParseStats,
     pub interrupted_sources: Vec<String>,
+    pub skipped_symlinks: u64,
 }
 
 fn is_active_source(path: &Path) -> bool {
@@ -37,17 +38,41 @@ fn is_active_source(path: &Path) -> bool {
     !lower.contains("archive") && !lower.contains("archived")
 }
 
-fn collect_jsonl_paths(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries =
-        fs::read_dir(directory).map_err(|_| "unable to read Codex data directory".to_string())?;
-    for entry in entries.flatten() {
+#[derive(Default)]
+struct TraversalState {
+    visited_directories: HashSet<PathBuf>,
+    skipped_symlinks: u64,
+}
+
+fn collect_jsonl_paths(
+    directory: &Path,
+    output: &mut Vec<PathBuf>,
+    state: &mut TraversalState,
+) -> Result<(), String> {
+    let canonical = fs::canonicalize(directory)
+        .map_err(|_| "unable to access a Codex data directory during scan".to_string())?;
+    if !state.visited_directories.insert(canonical) {
+        return Err("recursive Codex directory link detected during scan".into());
+    }
+    let entries = fs::read_dir(directory)
+        .map_err(|_| "unable to read a Codex data directory during scan".to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|_| "unable to read a Codex directory entry".to_string())?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| "unable to inspect a Codex directory entry".to_string())?;
+        if file_type.is_symlink() {
+            state.skipped_symlinks += 1;
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            let _ = collect_jsonl_paths(&path, output);
-        } else if path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+        if file_type.is_dir() {
+            collect_jsonl_paths(&path, output, state)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
         {
             output.push(path);
         }
@@ -98,9 +123,13 @@ pub fn scan_codex_home_with_state(
     previous: &HashMap<String, PersistedCheckpoint>,
 ) -> Result<CollectionSummary, String> {
     let mut paths = Vec::new();
-    collect_jsonl_paths(home, &mut paths)?;
+    let mut traversal = TraversalState::default();
+    collect_jsonl_paths(home, &mut paths, &mut traversal)?;
     paths.sort_by_key(|path| (!is_active_source(path), source_key(path)));
-    let mut summary = CollectionSummary::default();
+    let mut summary = CollectionSummary {
+        skipped_symlinks: traversal.skipped_symlinks,
+        ..CollectionSummary::default()
+    };
     let mut seen = HashSet::new();
     for path in paths {
         let key = source_key(&path);
@@ -121,54 +150,75 @@ pub fn scan_codex_home_with_state(
                 serde_json::from_str::<ParserState>(&checkpoint.parser_state_json).ok()
             })
             .unwrap_or_default();
-        let offset = requested_offset.min(size);
-        let mut file = match File::open(&path) {
+        let offset = if requested_offset > size {
+            // A rotated or truncated file must not reuse cumulative parser
+            // state from bytes that no longer exist.
+            parser_state = ParserState::default();
+            0
+        } else {
+            requested_offset
+        };
+        let file = match File::open(&path) {
             Ok(file) => file,
             Err(_) => {
                 summary.interrupted_sources.push(key);
                 continue;
             }
         };
-        if file.seek(SeekFrom::Start(offset)).is_err() {
+        let mut reader = BufReader::new(file);
+        if reader.seek(SeekFrom::Start(offset)).is_err() {
             summary.interrupted_sources.push(key);
             continue;
         }
-        let mut bytes = Vec::new();
-        if file.read_to_end(&mut bytes).is_err() {
-            summary.interrupted_sources.push(key);
-            continue;
-        }
-        let terminal_newline = bytes.last().is_some_and(|byte| *byte == b'\n');
-        let complete_unterminated_record = has_complete_unterminated_record(&bytes);
-        let next_offset = if terminal_newline || complete_unterminated_record {
-            size
-        } else {
-            bytes
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map(|position| offset + position as u64 + 1)
-                .unwrap_or(offset)
-        };
-        let mut parse_bytes = bytes;
-        if complete_unterminated_record {
-            // A writer can exit after flushing a complete JSON object but before its newline.
-            // Once the tail is valid JSON, consuming it is safe and prevents the final usage
-            // record from being stranded at the same checkpoint forever.
-            parse_bytes.push(b'\n');
-        }
-        let (events, stats) =
-            parse_newline_terminated_bytes_with_state(&parse_bytes, &mut parser_state);
-        summary.stats.imported_records += stats.imported_records;
-        summary.stats.partial_line_retries += stats.partial_line_retries;
-        summary.stats.rejected_records += stats.rejected_records;
-        for event in events {
-            if seen.insert(event_fingerprint(&event)) {
-                summary.events.push(event);
+        let mut line = Vec::new();
+        let mut next_offset = offset;
+        let mut read_failed = false;
+        loop {
+            line.clear();
+            let bytes_read = match reader.read_until(b'\n', &mut line) {
+                Ok(bytes_read) => bytes_read,
+                Err(_) => {
+                    read_failed = true;
+                    break;
+                }
+            };
+            if bytes_read == 0 {
+                break;
             }
+            let terminal_newline = line.last().is_some_and(|byte| *byte == b'\n');
+            let complete_unterminated_record =
+                !terminal_newline && has_complete_unterminated_record(&line);
+            if !terminal_newline && !complete_unterminated_record {
+                if !line.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    summary.stats.partial_line_retries += 1;
+                }
+                break;
+            }
+            if complete_unterminated_record {
+                // A writer can exit after flushing a complete JSON object but before its newline.
+                // Once the tail is valid JSON, consuming it is safe and prevents the final usage
+                // record from being stranded at the same checkpoint forever.
+                line.push(b'\n');
+            }
+            let (events, stats) =
+                parse_newline_terminated_bytes_with_state(&line, &mut parser_state);
+            summary.stats.imported_records += stats.imported_records;
+            summary.stats.partial_line_retries += stats.partial_line_retries;
+            summary.stats.rejected_records += stats.rejected_records;
+            for event in events {
+                if seen.insert(event_fingerprint(&event)) {
+                    summary.events.push(event);
+                }
+            }
+            next_offset += bytes_read as u64;
+        }
+        if read_failed {
+            summary.interrupted_sources.push(key);
+            continue;
         }
         summary.checkpoints.push(SourceCheckpoint {
             source_key: key,
-            byte_offset: next_offset,
+            byte_offset: next_offset.min(size),
             source_active: is_active_source(&path),
             parser_state_json: serde_json::to_string(&parser_state).unwrap_or_else(|_| "{}".into()),
         });
@@ -189,7 +239,7 @@ mod tests {
 
     #[test]
     fn scans_with_byte_offsets_and_active_files_first() {
-        let root = std::env::temp_dir().join(format!("nerfify-collector-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("nerftrack-collector-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("archive")).expect("directory");
         let active = root.join("session.jsonl");
@@ -223,7 +273,7 @@ mod tests {
     #[test]
     fn imports_completed_final_record_without_trailing_newline_after_retry() {
         let root = std::env::temp_dir().join(format!(
-            "nerfify-collector-final-record-{}",
+            "nerftrack-collector-final-record-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
@@ -235,8 +285,7 @@ mod tests {
 
         fs::write(&active, format!("{first_line}\n{}", &final_line[..split]))
             .expect("partial write");
-        let first =
-            scan_codex_home_with_state(&root, &HashMap::new()).expect("first scan");
+        let first = scan_codex_home_with_state(&root, &HashMap::new()).expect("first scan");
         assert_eq!(first.events.len(), 1);
         assert_eq!(first.stats.partial_line_retries, 1);
 
@@ -255,8 +304,7 @@ mod tests {
             .collect();
 
         fs::write(&active, format!("{first_line}\n{final_line}")).expect("final write");
-        let second =
-            scan_codex_home_with_state(&root, &previous).expect("second scan");
+        let second = scan_codex_home_with_state(&root, &previous).expect("second scan");
         assert_eq!(second.events.len(), 1);
         assert_eq!(second.events[0].request_id.as_deref(), Some("r2"));
         assert_eq!(second.stats.partial_line_retries, 0);
@@ -265,6 +313,44 @@ mod tests {
             fs::metadata(&active).expect("metadata").len()
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn empty_directory_is_distinct_from_an_unreadable_root() {
+        let root = std::env::temp_dir().join(format!(
+            "nerftrack-collector-empty (unicode-✓)-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("empty directory");
+        let empty = scan_codex_home(&root, &HashMap::new()).expect("empty scan");
+        assert!(empty.events.is_empty());
+        assert!(empty.checkpoints.is_empty());
+
+        let file_root = root.join("not-a-directory.jsonl");
+        fs::write(&file_root, b"{}").expect("file root");
+        assert!(scan_codex_home(&file_root, &HashMap::new()).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_recursive_directory_links_and_surfaces_the_skip() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "nerftrack-collector-links (private)-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        let source = root.join("session (✓).jsonl");
+        let line = r#"{"request_id":"r1","turn_id":"t1","timestamp":1735689600,"model":"gpt-5-codex","usage":{"input_tokens":10,"output_tokens":4}}"#;
+        fs::write(&source, format!("{line}\n")).expect("source");
+        symlink(&root, root.join("cycle")).expect("cycle link");
+        let result = scan_codex_home(&root, &HashMap::new()).expect("safe scan");
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.skipped_symlinks, 1);
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -56,8 +56,6 @@ const createPricingOverride = (modelId = ''): CustomPriceOverride => ({
   outputUsdPerMillion: 0,
 });
 
-// harn:assume visible-estimator-version ref=settings-version-label scope=function
-// harn:assume detected-model-pricing ref=detected-model-pricing-settings scope=function
 export function SettingsView({
   settings,
   detectedModelIds,
@@ -191,8 +189,8 @@ export function SettingsView({
           </div>
           <h2>Privacy first</h2>
           <p>
-            Nerfify runs locally. No prompts, code, raw account identifiers, or telemetry leave this
-            device.
+            NerfTrack runs locally. No prompts, code, raw account identifiers, or telemetry leave
+            this device.
           </p>
           <div className="privacy-check">
             <Icon name="check" size={17} />
@@ -214,7 +212,7 @@ export function SettingsView({
           <h2 id="custom-pricing-heading">Custom API pricing</h2>
         </div>
         <p>
-          Overrides are local only and take precedence over Nerfify’s verified official model
+          Overrides are local only and take precedence over NerfTrack’s verified official model
           prices. Use them for an unpriced model or a local alias; prices are USD per 1M tokens.
         </p>
         <p className="settings-note">
@@ -427,7 +425,7 @@ export function SettingsView({
             <div>
               <strong id="reset-confirm-heading">Reset all local data?</strong>
               <span>
-                This clears Nerfify’s imported usage, quota observations, graph history,
+                This clears NerfTrack’s imported usage, quota observations, graph history,
                 diagnostics, annotations, and scan checkpoints. Codex source logs are not deleted;
                 monitoring resumes from the current end of those logs.
               </span>

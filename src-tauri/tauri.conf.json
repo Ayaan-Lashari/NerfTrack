@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Nerfify",
+  "productName": "NerfTrack",
   "version": "0.1.0",
-  "identifier": "com.nerfify.desktop",
+  "identifier": "com.nerftrack.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Nerfify",
+        "title": "NerfTrack",
         "width": 1584,
         "height": 992,
         "minWidth": 920,

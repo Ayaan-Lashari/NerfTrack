@@ -161,11 +161,7 @@ function historySignal(point: HistoryPoint) {
   return point.rawEstimatedWeeklyValueUsd ?? point.estimatedWeeklyValueUsd;
 }
 
-// harn:assume compressed-inactivity-gaps ref=no-usage-gap-rendering scope=function
-function findNoUsageGaps(
-  points: HistoryPoint[],
-  thresholdMs: number,
-) {
+function findNoUsageGaps(points: HistoryPoint[], thresholdMs: number) {
   const gaps: NoUsageGap[] = [];
   for (let index = 1; index < points.length; index += 1) {
     const previous = points[index - 1];
@@ -223,9 +219,7 @@ function buildTimeline(
   });
 
   const plotWidth = plotRight - plotLeft;
-  const gapWidth = domainGaps.length
-    ? Math.min(8, (plotWidth * 0.08) / domainGaps.length)
-    : 0;
+  const gapWidth = domainGaps.length ? Math.min(8, (plotWidth * 0.08) / domainGaps.length) : 0;
   const activeWidth = plotWidth - gapWidth * domainGaps.length;
   const activeSpans = rawSpans.filter((span) => span.kind === 'activity');
   const activeDuration = activeSpans.reduce(
@@ -262,9 +256,8 @@ function timestampToX(spans: TimelineSpan[], timestamp: number) {
         item.startTimestamp === item.endTimestamp &&
         timestamp === item.startTimestamp,
     ) ??
-    spans.find(
-      (item) => timestamp >= item.startTimestamp && timestamp <= item.endTimestamp,
-    ) ?? (timestamp < (spans[0]?.startTimestamp ?? 0) ? spans[0] : spans.at(-1));
+    spans.find((item) => timestamp >= item.startTimestamp && timestamp <= item.endTimestamp) ??
+    (timestamp < (spans[0]?.startTimestamp ?? 0) ? spans[0] : spans.at(-1));
   if (!span) return plotLeft;
   if (span.endTimestamp <= span.startTimestamp) {
     if (spans.length === 1) return (span.startX + span.endX) / 2;
@@ -276,8 +269,7 @@ function timestampToX(spans: TimelineSpan[], timestamp: number) {
     0,
     Math.min(
       1,
-      (timestamp - span.startTimestamp) /
-        Math.max(span.endTimestamp - span.startTimestamp, 1),
+      (timestamp - span.startTimestamp) / Math.max(span.endTimestamp - span.startTimestamp, 1),
     ),
   );
   return span.startX + ratio * (span.endX - span.startX);
@@ -288,18 +280,13 @@ function xToTimelinePosition(spans: TimelineSpan[], x: number) {
     spans.find((item) => x >= item.startX && x <= item.endX) ??
     (x < (spans[0]?.startX ?? 0) ? spans[0] : spans.at(-1));
   if (!span) return null;
-  const ratio = Math.max(
-    0,
-    Math.min(1, (x - span.startX) / Math.max(span.endX - span.startX, 1)),
-  );
+  const ratio = Math.max(0, Math.min(1, (x - span.startX) / Math.max(span.endX - span.startX, 1)));
   return {
     span,
-    timestamp:
-      span.startTimestamp + ratio * (span.endTimestamp - span.startTimestamp),
+    timestamp: span.startTimestamp + ratio * (span.endTimestamp - span.startTimestamp),
   };
 }
 
-// harn:assume raw-history-stable-headline ref=history-chart-rendering scope=function
 export function UsageChart({
   points,
   annotations,
@@ -348,7 +335,9 @@ export function UsageChart({
   const rangeStart =
     signalPoints[0]?.timestamp ?? points[0]?.timestamp ?? Date.now() - rangeDurationMs[range];
   const rangeEnd =
-    signalPoints.at(-1)?.timestamp ?? points.at(-1)?.timestamp ?? rangeStart + rangeDurationMs[range];
+    points.at(-1)?.timestamp ??
+    signalPoints.at(-1)?.timestamp ??
+    rangeStart + rangeDurationMs[range];
   const visibleDurationMs = Math.max(rangeEnd - rangeStart, 1);
   const noUsageThresholdMs = Math.max(2 * 60 * 60 * 1_000, visibleDurationMs / 240);
   const noUsageGaps = useMemo(
@@ -417,8 +406,7 @@ export function UsageChart({
   const visibleAnnotations = useMemo(() => {
     const markers = annotations
       .filter(
-        (annotation) =>
-          annotation.timestamp >= rangeStart && annotation.timestamp <= rangeEnd,
+        (annotation) => annotation.timestamp >= rangeStart && annotation.timestamp <= rangeEnd,
       )
       .map((annotation) => ({
         id: annotation.id,
@@ -510,8 +498,7 @@ export function UsageChart({
     if (timelinePosition.span.kind === 'gap') {
       setNoUsageHover({
         x,
-        durationMs:
-          timelinePosition.span.endTimestamp - timelinePosition.span.startTimestamp,
+        durationMs: timelinePosition.span.endTimestamp - timelinePosition.span.startTimestamp,
       });
       setSelection(null);
       onScrub?.(null, null);

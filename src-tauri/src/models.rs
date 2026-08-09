@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-pub const ALGORITHM_VERSION: &str = "nerfify-token-api-equivalent-v3";
+// This persisted identifier stays stable so a branding change does not invalidate
+// derived data or force an unnecessary rebuild for existing installations.
+pub const ALGORITHM_VERSION: &str = "nerftrack-token-api-equivalent-v4";
+/// This is deliberately independent from the SQLite schema and estimator versions.
+pub const PRICING_RULE_VERSION: &str = "openai-api-pricing-2026-08-08-v1";
+pub const RECONSTRUCTION_VERSION: &str = "weekly-window-reconstruction-v4";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -24,12 +29,9 @@ impl Range {
     }
 
     pub fn bucket(&self) -> &'static str {
-        match self {
-            Self::D1 => "raw",
-            Self::W1 => "30m",
-            Self::M1 => "2h",
-            Self::M3 | Self::M6 => "4h",
-        }
+        // The API currently retains every eligible observation.  Do not advertise a
+        // bucket that has not actually been applied.
+        "raw"
     }
 }
 
@@ -197,10 +199,14 @@ pub struct RangeStatistics {
     pub baseline_estimated_weekly_value_usd: Option<f64>,
     pub baseline_timestamp: Option<i64>,
     pub current_estimated_weekly_value_usd: Option<f64>,
+    pub current_timestamp: Option<i64>,
     pub delta_value_usd: Option<f64>,
     pub delta_percent: Option<f64>,
     pub point_count: usize,
     pub partial: bool,
+    pub requested_start_timestamp: Option<i64>,
+    pub available_start_timestamp: Option<i64>,
+    pub available_end_timestamp: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +215,8 @@ pub struct HistoryResponse {
     pub points: Vec<HistoryPoint>,
     pub statistics: RangeStatistics,
     pub bucket: String,
+    pub pricing_rule_version: String,
+    pub reconstruction_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

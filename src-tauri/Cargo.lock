@@ -2125,10 +2125,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "nerfify"
+name = "nerftrack"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "dirs",
  "rfd",
  "rusqlite",
  "serde",

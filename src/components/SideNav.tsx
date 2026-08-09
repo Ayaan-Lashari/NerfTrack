@@ -19,9 +19,9 @@ export function SideNav({ active, status, onNavigate }: SideNavProps) {
   const isConnected = status.state === 'connected';
   return (
     <aside className="side-nav">
-      <div className="brand" aria-label="Nerfify">
+      <div className="brand" aria-label="NerfTrack">
         <LogoMark size={28} />
-        <span>Nerfify</span>
+        <span>NerfTrack</span>
       </div>
       <nav aria-label="Primary">
         {navItems.map((item) => (

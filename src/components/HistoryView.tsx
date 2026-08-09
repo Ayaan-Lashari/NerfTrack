@@ -94,7 +94,9 @@ export function HistoryView({ history, range, onRangeChange }: HistoryViewProps)
                   ? '—'
                   : `$${point.estimatedWeeklyValueUsd.toFixed(2)}`}
               </strong>
-              <span>{point.observedCostUsd === null ? '—' : `$${point.observedCostUsd.toFixed(2)}`}</span>
+              <span>
+                {point.observedCostUsd === null ? '—' : `$${point.observedCostUsd.toFixed(2)}`}
+              </span>
               <span>
                 {point.weeklyUsedPercent === null ? '—' : `${Math.round(point.weeklyUsedPercent)}%`}
               </span>
@@ -106,7 +108,7 @@ export function HistoryView({ history, range, onRangeChange }: HistoryViewProps)
           ))}
         </div>
       </div>
-      <div className="pre-nerfify-note">
+      <div className="pre-nerftrack-note">
         <Icon name="info" size={18} />
         <span>
           <strong>Pending observations are omitted</strong> from the graph until a positive

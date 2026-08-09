@@ -1,3 +1,3 @@
 fn main() {
-    nerfify_lib::run();
+    nerftrack_lib::run();
 }

@@ -1,5 +1,5 @@
 // Derived from the pinned ccusage Codex adapter (MIT), commit
-// 31e084afbca3981af97ab6b55abe4f38f451bad4. Nerfify retains only parser behavior.
+// 31e084afbca3981af97ab6b55abe4f38f451bad4. NerfTrack retains only parser behavior.
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -186,7 +186,7 @@ fn bool_at(value: &Value, paths: &[&[&str]]) -> bool {
 
 fn opaque_identifier(value: &str) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"nerfify-parser-id:");
+    digest.update(b"nerftrack-parser-id:");
     digest.update(value.as_bytes());
     format!("id_{:x}", digest.finalize())
 }
@@ -474,7 +474,7 @@ pub fn parse_jsonl_line_with_state(
 
 pub fn event_fingerprint(event: &UsageEvent) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"nerfify-event:");
+    digest.update(b"nerftrack-event:");
     digest.update(event.request_id.as_deref().unwrap_or("").as_bytes());
     digest.update([0]);
     digest.update(event.turn_id.as_deref().unwrap_or("").as_bytes());

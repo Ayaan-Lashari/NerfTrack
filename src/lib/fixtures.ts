@@ -52,9 +52,9 @@ export const demoStatus: AppStatus = {
     message: 'Auto-detected',
   },
   appServer: {
-    state: 'auto_detected',
-    redactedLocation: 'Local stdio App Server',
-    message: 'Connected',
+    state: 'unsupported',
+    redactedLocation: 'CLI App Server',
+    message: 'Unavailable: App Server supervision is not integrated',
   },
   dataQuality: 'complete',
 };
@@ -68,7 +68,7 @@ export const demoQuote: CurrentQuote = {
   resetAt: demoStatus.resetAt,
   resetReason: 'scheduled_reset',
   status: 'valid',
-  algorithmVersion: 'nerfify-token-api-equivalent-v3',
+  algorithmVersion: 'nerftrack-token-api-equivalent-v3',
   confidence: 'high',
   validObservationCount: 6,
   percentageCoverage: 34,
@@ -159,10 +159,7 @@ export function getDemoHistory(range: Range): HistoryResponse {
   }).filter((_, index) => {
     if (range === '1D') return true;
     const progress = index / Math.max(total - 1, 1);
-    return !(
-      (progress > 0.17 && progress < 0.33) ||
-      (progress > 0.61 && progress < 0.76)
-    );
+    return !((progress > 0.17 && progress < 0.33) || (progress > 0.61 && progress < 0.76));
   });
   points[points.length - 1].estimatedWeeklyValueUsd = demoQuote.estimatedWeeklyValueUsd ?? 0;
   return {

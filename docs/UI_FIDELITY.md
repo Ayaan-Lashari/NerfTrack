@@ -1,6 +1,6 @@
 # UI fidelity review
 
-Nerfify’s supplied dashboard screenshot is the visual reference for the first
+NerfTrack’s supplied dashboard screenshot is the visual reference for the first
 implementation pass. The reference is stored at
 `design-reference/dashboard-reference.png`; the first-run setup image is kept
 separately at `design-reference/first-run-concept.png` and is a concept, not an

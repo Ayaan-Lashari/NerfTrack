@@ -122,7 +122,7 @@ pub fn initialize_request(id: u64) -> Value {
         "id": id,
         "method": INITIALIZE_METHOD,
         "params": {
-            "clientInfo": {"name": "nerfify", "version": env!("CARGO_PKG_VERSION")},
+            "clientInfo": {"name": "nerftrack", "version": env!("CARGO_PKG_VERSION")},
             "capabilities": {}
         }
     })

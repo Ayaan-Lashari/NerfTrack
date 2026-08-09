@@ -1,5 +1,7 @@
 # Release and packaging
 
-V1 packages an unsigned Apple Silicon macOS `.app` and `.dmg` locally, and a Windows x64 NSIS `.exe`. Pull-request CI runs macOS ARM64 and x64 plus Windows x64 checks. Windows ARM64 is represented as a non-blocking preview job when the current `windows-11-arm` runner is available. MSI is intentionally skipped until enterprise deployment requires it.
+The supported packaging targets are unsigned macOS ARM64 and Intel x86_64 `.app`/`.dmg` artifacts, plus Windows ARM64 and Intel x86_64 current-user NSIS installers. Linux packaging is intentionally out of scope. MSI is deferred until enterprise deployment requires it.
 
-Signing and notarization are secret-driven release steps and are not part of pull-request CI. Certificates, API keys, signing identities, and generated local databases must never be committed or uploaded. Release jobs should add secrets only at the final packaging step and should preserve unsigned artifacts for review.
+Pull-request CI runs the frontend, Rust, and Tauri packaging smoke checks on `macos-14` (ARM64), `macos-15-intel` (Intel x86_64), `windows-latest` (Intel x86_64), and the `windows-11-arm` preview runner (ARM64). The Windows ARM64 job is non-blocking while that hosted runner remains experimental or unavailable; the workflow records the exact limitation rather than claiming verification. It should become blocking after the runner is stable and consistently provisioned.
+
+Signing and notarization are secret-driven release steps and are not part of pull-request CI. Certificates, API keys, signing identities, generated local databases, and audit snapshots must never be committed or uploaded. A maintainer must select a project license before publication; this repository intentionally does not invent one.

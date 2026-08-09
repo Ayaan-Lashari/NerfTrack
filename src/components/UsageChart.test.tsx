@@ -146,14 +146,7 @@ describe('UsageChart', () => {
         timestamp: index === 0 ? 0 : 12 * 60 * 60 * 1_000,
         epoch: index + 1,
       }));
-    render(
-      <UsageChart
-        points={points}
-        annotations={[]}
-        range="1D"
-        reducedMotion={false}
-      />,
-    );
+    render(<UsageChart points={points} annotations={[]} range="1D" reducedMotion={false} />);
 
     const chart = screen.getByRole('img', { name: /Estimated weekly API-equivalent value/ });
     expect(chart.querySelector('.chart-no-usage-line')).not.toBeInTheDocument();
@@ -190,14 +183,7 @@ describe('UsageChart', () => {
         ...point,
         timestamp: 1_000 + index * 3_600_000,
       }));
-    render(
-      <UsageChart
-        points={points}
-        annotations={[]}
-        range="6M"
-        reducedMotion={false}
-      />,
-    );
+    render(<UsageChart points={points} annotations={[]} range="6M" reducedMotion={false} />);
 
     const labels = [...document.querySelectorAll('.chart-x-label')].map(
       (label) => label.textContent,
@@ -207,6 +193,56 @@ describe('UsageChart', () => {
     const path = document.querySelector('.chart-line')?.getAttribute('d') ?? '';
     expect(path).toMatch(/^M 0\.00 /);
     expect(path).toContain('L 944.00 ');
+  });
+
+  it('uses a pending live endpoint for the time axis without plotting it', () => {
+    const points = [
+      {
+        timestamp: 0,
+        estimatedWeeklyValueUsd: 100,
+        rawEstimatedWeeklyValueUsd: null,
+        observedCostUsd: 1,
+        weeklyUsedPercent: 20,
+        resetAt: null,
+        resetReason: null,
+        isFinalized: true,
+        isHeartbeat: false,
+        epoch: 1,
+        confidence: 'high' as const,
+        percentageCoverage: 20,
+      },
+      {
+        timestamp: 12 * 60 * 60 * 1_000,
+        estimatedWeeklyValueUsd: null,
+        rawEstimatedWeeklyValueUsd: null,
+        observedCostUsd: null,
+        weeklyUsedPercent: 3,
+        resetAt: 24 * 60 * 60 * 1_000,
+        resetReason: 'reported_reset_changed',
+        isFinalized: false,
+        isHeartbeat: true,
+        epoch: 2,
+        confidence: 'none' as const,
+        percentageCoverage: null,
+      },
+    ];
+    render(<UsageChart points={points} annotations={[]} range="1D" reducedMotion={false} />);
+
+    const expectedEndLabel = new Date(points[1].timestamp).toLocaleTimeString('en-US', {
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+    const labels = [...document.querySelectorAll('.chart-x-label')].map(
+      (label) => label.textContent,
+    );
+    const path = document.querySelector('.chart-line')?.getAttribute('d') ?? '';
+
+    // The null-valued calibration endpoint controls the 1D domain, so the
+    // final tick is the latest quota observation rather than a 24-hour fallback.
+    expect(labels.at(-1)).toBe(expectedEndLabel);
+    // It remains excluded from the plotted estimate series.
+    expect(path).toMatch(/^M 0\.00 /);
+    expect(path).not.toContain('L 944.00 ');
   });
 
   it('renders reset annotations as compact icons with hover text', () => {

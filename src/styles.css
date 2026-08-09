@@ -1162,7 +1162,7 @@ p {
   color: #e8bd78;
   background: rgba(176, 114, 25, 0.16);
 }
-.pre-nerfify-note {
+.pre-nerftrack-note {
   display: flex;
   gap: 9px;
   align-items: flex-start;
@@ -1171,11 +1171,11 @@ p {
   font-size: 13px;
   line-height: 1.5;
 }
-.pre-nerfify-note svg {
+.pre-nerftrack-note svg {
   flex: 0 0 auto;
   color: #a6b0b8;
 }
-.pre-nerfify-note strong {
+.pre-nerftrack-note strong {
   color: #bac1c7;
   font-weight: 550;
 }

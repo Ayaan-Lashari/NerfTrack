@@ -63,8 +63,8 @@ export function DiagnosticsView({ diagnostics }: { diagnostics: DiagnosticsSumma
             Diagnostics never include prompts, account identifiers, or full local paths.
           </strong>
           <span>
-            Use this page to identify unpriced models, reset boundaries, and
-            data-quality interruptions before relying on an estimate.
+            Use this page to identify unpriced models, reset boundaries, and data-quality
+            interruptions before relying on an estimate.
           </span>
         </div>
       </div>

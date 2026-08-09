@@ -18,6 +18,7 @@ import { SideNav } from './components/SideNav';
 import { UsageChart } from './components/UsageChart';
 import {
   getAnnotations,
+  clearDiscoveryOverrides,
   getCurrentQuote,
   getCurrentStatus,
   getDiagnosticsSummary,
@@ -178,7 +179,6 @@ function RangeSelector({ range, onChange }: { range: Range; onChange: (range: Ra
   );
 }
 
-// harn:assume reliable-range-comparisons ref=range-comparison-display scope=function
 function HomeView({
   status,
   quote,
@@ -222,8 +222,7 @@ function HomeView({
   const displayPercent =
     displayChange !== null && comparisonValue ? (displayChange / comparisonValue) * 100 : null;
   const signalPoints = history.points.filter(
-    (point) =>
-      (point.rawEstimatedWeeklyValueUsd ?? point.estimatedWeeklyValueUsd) !== null,
+    (point) => (point.rawEstimatedWeeklyValueUsd ?? point.estimatedWeeklyValueUsd) !== null,
   );
   const availableHistoryStart = signalPoints[0]?.timestamp ?? null;
   const availableHistoryEnd = signalPoints.at(-1)?.timestamp ?? null;
@@ -231,8 +230,7 @@ function HomeView({
     availableHistoryStart !== null &&
     availableHistoryEnd !== null &&
     availableHistoryEnd - availableHistoryStart < rangeDurationMs[range] * 0.98;
-  const comparisonStartTimestamp =
-    history.statistics.baselineTimestamp ?? availableHistoryStart;
+  const comparisonStartTimestamp = history.statistics.baselineTimestamp ?? availableHistoryStart;
   const comparisonLabel = scrubbed?.anchor
     ? 'Selected range'
     : scrubbed
@@ -244,8 +242,7 @@ function HomeView({
         })
       : history.statistics.baselineEstimatedWeeklyValueUsd === null
         ? `${rangeLabels[range]} unavailable`
-        : (history.statistics.partial || usesAvailableHistory) &&
-            comparisonStartTimestamp !== null
+        : (history.statistics.partial || usesAvailableHistory) && comparisonStartTimestamp !== null
           ? `Since ${new Date(comparisonStartTimestamp).toLocaleString('en-US', {
               month: 'short',
               day: 'numeric',
@@ -409,14 +406,16 @@ export default function App() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [loadError, setLoadError] = useState(false);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (requestedRange?: Range) => {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
     setIsRefreshing(true);
     try {
-      const historyRanges = ranges.every((item) => historyCache.current[item])
-        ? [activeRange.current]
-        : ranges;
+      const historyRanges = requestedRange
+        ? [requestedRange]
+        : ranges.every((item) => historyCache.current[item])
+          ? [activeRange.current]
+          : ranges;
       // Status reconciliation imports newly written usage before every dependent read.
       // Sequencing it first prevents a refresh from mixing old chart data with new status.
       const nextStatus = await getCurrentStatus();
@@ -471,9 +470,22 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [refresh, settings?.refreshIntervalSeconds]);
 
+  useEffect(() => {
+    const refreshWhenVisible = () => {
+      if (document.visibilityState !== 'hidden') void refresh();
+    };
+    window.addEventListener('focus', refreshWhenVisible);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    return () => {
+      window.removeEventListener('focus', refreshWhenVisible);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+    };
+  }, [refresh]);
+
   const handleRangeChange = (nextRange: Range) => {
     activeRange.current = nextRange;
     setRange(nextRange);
+    void refresh(nextRange);
   };
 
   const handleSettingChange = async (key: keyof AppSettings, value: number | boolean) => {
@@ -566,6 +578,15 @@ export default function App() {
     }
   };
 
+  const handleResetDiscovery = async () => {
+    try {
+      setStatus(await clearDiscoveryOverrides());
+      await refresh();
+    } catch {
+      setLoadError(true);
+    }
+  };
+
   const displayHistory = useMemo(
     () =>
       history ?? {
@@ -614,6 +635,7 @@ export default function App() {
             onChooseHome={handleChooseHome}
             onChooseExecutable={handleChooseExecutable}
             onRetry={runDetection}
+            onResetDiscovery={handleResetDiscovery}
             onStart={runDetection}
             onSettingChange={handleSettingChange}
           />

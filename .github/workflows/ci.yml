@@ -10,20 +10,24 @@ permissions:
 
 jobs:
   quality:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - name: macOS ARM64
+            os: macos-14
             experimental: false
-          - os: macos-13
+          - name: macOS Intel x86_64
+            os: macos-15-intel
             experimental: false
-          - os: windows-latest
+          - name: Windows Intel x86_64
+            os: windows-latest
             experimental: false
-          - os: windows-11-arm
+          - name: Windows ARM64 (preview)
+            os: windows-11-arm
             experimental: true
     steps:
       - name: Checkout
@@ -47,7 +51,8 @@ jobs:
           npm run format:check
           npm run lint
           npm run typecheck
-          npm test
+          npm test -- --run
+          npm run build
       - name: Rust gates
         run: |
           cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
@@ -55,10 +60,12 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml
       - name: Build unsigned app artifacts
         run: npm run tauri:build
+      - name: Check patch whitespace
+        run: git diff --check
       - name: Upload unsigned artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nerfify-${{ matrix.os }}
+          name: nerftrack-${{ matrix.os }}
           path: |
             src-tauri/target/release/bundle/**
           if-no-files-found: error

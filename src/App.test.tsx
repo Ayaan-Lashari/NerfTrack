@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import App from './App';
 
-describe('Nerfify app shell', () => {
+describe('NerfTrack app shell', () => {
   it('renders the dashboard reference surface with a non-zero quote', async () => {
     render(<App />);
     expect(await screen.findByText('Codex Weekly API-equivalent Estimator')).toBeInTheDocument();
@@ -17,7 +17,7 @@ describe('Nerfify app shell', () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole('button', { name: 'Setup' }));
-    expect(screen.getByText('Set up Nerfify')).toBeInTheDocument();
+    expect(screen.getByText('Set up NerfTrack')).toBeInTheDocument();
     const refreshSelect = screen.getByLabelText('Refresh interval');
     await user.selectOptions(refreshSelect, '20');
     expect(refreshSelect).toHaveValue('20');

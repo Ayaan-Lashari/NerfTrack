@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use sha2::{Digest, Sha256};
 
 use crate::collector::{CollectionSummary, PersistedCheckpoint};
 use crate::models::{
     Annotation, AnnotationKind, AppSettings, Confidence, CurrentQuote, DiagnosticReason,
     DiagnosticsSummary, HistoryPoint, HistoryResponse, QuoteStatus, Range, RangeStatistics,
-    ALGORITHM_VERSION,
+    ALGORITHM_VERSION, PRICING_RULE_VERSION, RECONSTRUCTION_VERSION,
 };
 use crate::parser::{event_fingerprint, UsageEvent};
 
@@ -78,7 +79,7 @@ struct ApiPrice {
     output: f64,
 }
 
-// Verified 2026-07-24 from OpenAI's model catalog and individual model pages;
+// Verified 2026-08-08 from OpenAI's official model catalog and pricing pages;
 // see docs/CALCULATION.md for the source links. Rates are USD / 1M text tokens.
 fn official_price(model: &str) -> Option<ApiPrice> {
     match model.trim().to_ascii_lowercase().as_str() {
@@ -88,14 +89,14 @@ fn official_price(model: &str) -> Option<ApiPrice> {
             output: 30.0,
         }),
         "gpt-5.6-terra" | "gpt-5.4" => Some(ApiPrice {
-            input: 2.5,
-            cached_input: 0.25,
-            output: 15.0,
+            input: 2.0,
+            cached_input: 0.2,
+            output: 12.0,
         }),
         "gpt-5.6-luna" => Some(ApiPrice {
-            input: 1.0,
-            cached_input: 0.1,
-            output: 6.0,
+            input: 0.2,
+            cached_input: 0.02,
+            output: 1.2,
         }),
         "gpt-5.5" => Some(ApiPrice {
             input: 5.0,
@@ -249,6 +250,19 @@ fn event_cost(event: &UsageEvent, settings: &AppSettings) -> Result<(f64, &'stat
     }
 }
 
+fn pricing_configuration_digest(settings: &AppSettings) -> Result<String, String> {
+    let mut overrides = settings.custom_pricing.clone();
+    overrides.sort_by(|left, right| {
+        left.model_id
+            .to_ascii_lowercase()
+            .cmp(&right.model_id.to_ascii_lowercase())
+            .then_with(|| left.alias.cmp(&right.alias))
+    });
+    let bytes = serde_json::to_vec(&(PRICING_RULE_VERSION, overrides))
+        .map_err(|_| "unable to encode pricing configuration".to_string())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 #[derive(Clone)]
 struct StoredUsageForPricing {
     fingerprint: String,
@@ -258,6 +272,12 @@ struct StoredUsageForPricing {
 pub struct Database {
     pub path: PathBuf,
     connection: Connection,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryOverrides {
+    pub codex_home: Option<PathBuf>,
+    pub codex_binary: Option<PathBuf>,
 }
 
 pub struct LatestQuotaObservation {
@@ -295,6 +315,12 @@ struct StoredPoint {
     window_id: i64,
 }
 
+struct ChartHeartbeat {
+    timestamp_ms: i64,
+    value_usd: Option<f64>,
+    weekly_used_percent: Option<f64>,
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -310,39 +336,31 @@ fn empty_history(range: Range) -> HistoryResponse {
             baseline_estimated_weekly_value_usd: None,
             baseline_timestamp: None,
             current_estimated_weekly_value_usd: None,
+            current_timestamp: None,
             delta_value_usd: None,
             delta_percent: None,
             point_count: 0,
             partial: true,
+            requested_start_timestamp: None,
+            available_start_timestamp: None,
+            available_end_timestamp: None,
         },
         points: Vec::new(),
+        pricing_rule_version: PRICING_RULE_VERSION.into(),
+        reconstruction_version: RECONSTRUCTION_VERSION.into(),
     }
 }
 
-pub fn data_directory() -> PathBuf {
-    if let Some(path) = std::env::var_os("NERFIFY_DATA_DIR") {
-        return PathBuf::from(path);
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = crate::discovery::home_dir() {
-        return home
-            .join("Library")
-            .join("Application Support")
-            .join("Nerfify");
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(app_data) = std::env::var_os("APPDATA") {
-        return PathBuf::from(app_data).join("Nerfify");
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(data_home).join("Nerfify");
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some(home) = crate::discovery::home_dir() {
-        return home.join(".local").join("share").join("Nerfify");
-    }
-    PathBuf::from(".nerfify")
+/// Resolves the per-user application-data directory through the platform-aware
+/// `dirs` crate. There is deliberately no current-working-directory fallback.
+pub fn data_directory() -> Result<PathBuf, String> {
+    dirs::data_dir()
+        .map(|directory| directory.join("NerfTrack"))
+        .ok_or_else(|| "the platform did not provide a user application-data directory".into())
+}
+
+pub fn database_path() -> Result<PathBuf, String> {
+    data_directory().map(|directory| directory.join("nerftrack.db"))
 }
 
 fn open_connection(path: &Path) -> rusqlite::Result<Connection> {
@@ -354,11 +372,11 @@ fn open_connection(path: &Path) -> rusqlite::Result<Connection> {
 }
 
 fn preserve_database_files(path: &Path) -> Result<(), String> {
-    let recovery = path.with_file_name(format!("nerfify.recovery-{}.db", now_ms()));
+    let recovery = path.with_file_name(format!("nerftrack.recovery-{}.db", now_ms()));
     let base_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("nerfify.db");
+        .unwrap_or("nerftrack.db");
     for suffix in ["", "-wal", "-shm"] {
         let source = path.with_file_name(format!("{base_name}{suffix}"));
         if !source.exists() {
@@ -367,7 +385,7 @@ fn preserve_database_files(path: &Path) -> Result<(), String> {
         let recovery_name = recovery
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("nerfify.recovery.db");
+            .unwrap_or("nerftrack.recovery.db");
         let target = recovery.with_file_name(format!("{recovery_name}{suffix}"));
         fs::rename(&source, &target).map_err(|_| {
             "database is corrupt and recovery copy could not be created".to_string()
@@ -378,10 +396,10 @@ fn preserve_database_files(path: &Path) -> Result<(), String> {
 
 impl Database {
     pub fn open() -> Result<Self, String> {
-        let directory = data_directory();
+        let directory = data_directory()?;
         fs::create_dir_all(&directory)
             .map_err(|_| "unable to create local data directory".to_string())?;
-        let path = directory.join("nerfify.db");
+        let path = database_path()?;
         let mut database = match open_connection(&path) {
             Ok(connection) => Self {
                 path: path.clone(),
@@ -558,6 +576,11 @@ impl Database {
                     count INTEGER NOT NULL DEFAULT 0,
                     updated_at_ms INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS derived_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    completed_at_ms INTEGER NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_usage_events_credit_time
                     ON usage_events(account_key, credit_status, timestamp_ms);
                 CREATE INDEX IF NOT EXISTS idx_usage_events_estimation
@@ -691,10 +714,95 @@ impl Database {
                 )
                 .map_err(|error| format!("usage history correction migration failed: {error}"))?;
         }
+        if previous_version < 9 {
+            // Keep raw events intact while making every pricing input durable.  Legacy
+            // rows have explicit NULL-equivalent defaults rather than invented data.
+            for (table, column, definition) in [
+                ("usage_events", "original_model_id", "TEXT"),
+                (
+                    "usage_events",
+                    "reasoning_tokens",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+                ("usage_events", "long_context", "INTEGER NOT NULL DEFAULT 0"),
+                ("usage_events", "pricing_rule_version", "TEXT"),
+                ("usage_events", "pricing_source_digest", "TEXT"),
+                ("usage_events", "effective_input_rate", "REAL"),
+                ("usage_events", "effective_cached_input_rate", "REAL"),
+                ("usage_events", "effective_output_rate", "REAL"),
+                ("usage_events", "input_multiplier", "REAL"),
+                ("usage_events", "output_multiplier", "REAL"),
+            ] {
+                if !self.column_exists(table, column)? {
+                    self.connection
+                        .execute(
+                            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                            [],
+                        )
+                        .map_err(|_| format!("unable to migrate {table}.{column}"))?;
+                }
+            }
+            self.connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                 UPDATE usage_events SET original_model_id=model_id
+                   WHERE original_model_id IS NULL;
+                 DELETE FROM quotes; DELETE FROM measurements; DELETE FROM epochs;
+                 DELETE FROM chart_heartbeats;
+                 INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms)
+                   VALUES (9, strftime('%s','now') * 1000);
+                 PRAGMA user_version=9;
+                 COMMIT;",
+                )
+                .map_err(|error| format!("pricing and reconstruction migration failed: {error}"))?;
+        }
         if self.load_settings().is_err() {
             self.save_settings(&AppSettings::default())?;
         }
+        self.ensure_derived_state()?;
         Ok(())
+    }
+
+    fn ensure_derived_state(&mut self) -> Result<(), String> {
+        let settings = self.load_settings()?;
+        let expected_pricing = format!(
+            "{PRICING_RULE_VERSION}:{}",
+            pricing_configuration_digest(&settings)?
+        );
+        let pricing_state: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM derived_state WHERE key='pricing'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "unable to read pricing state".to_string())?;
+        let reconstruction_state: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM derived_state WHERE key='reconstruction'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "unable to read reconstruction state".to_string())?;
+        if pricing_state.as_deref() == Some(expected_pricing.as_str())
+            && reconstruction_state.as_deref() == Some(RECONSTRUCTION_VERSION)
+        {
+            return Ok(());
+        }
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| "unable to start derived-data rebuild".to_string())?;
+        Self::reprice_usage_events(&transaction, &settings)?;
+        Self::rebuild_quotes_in_transaction(&transaction)?;
+        Self::set_derived_state(&transaction, "pricing", &expected_pricing)?;
+        Self::set_derived_state(&transaction, "reconstruction", RECONSTRUCTION_VERSION)?;
+        transaction
+            .commit()
+            .map_err(|_| "unable to commit derived-data rebuild".to_string())
     }
 
     fn column_exists(&self, table: &str, column: &str) -> Result<bool, String> {
@@ -756,11 +864,76 @@ impl Database {
             .unwrap_or_else(|| Ok(AppSettings::default()))
     }
 
+    pub fn load_discovery_overrides(&self) -> Result<DiscoveryOverrides, String> {
+        Ok(DiscoveryOverrides {
+            codex_home: self.load_path_setting("discovery.codex_home")?,
+            codex_binary: self.load_path_setting("discovery.codex_binary")?,
+        })
+    }
+
+    pub fn save_codex_home_override(&mut self, path: Option<&Path>) -> Result<(), String> {
+        self.save_path_setting("discovery.codex_home", path)
+    }
+
+    pub fn save_codex_binary_override(&mut self, path: Option<&Path>) -> Result<(), String> {
+        self.save_path_setting("discovery.codex_binary", path)
+    }
+
+    fn load_path_setting(&self, key: &str) -> Result<Option<PathBuf>, String> {
+        self.connection
+            .query_row(
+                "SELECT value_json FROM settings WHERE key=?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| "unable to read discovery settings".to_string())?
+            .map(|value| {
+                serde_json::from_str::<String>(&value)
+                    .map(PathBuf::from)
+                    .map_err(|_| "stored discovery setting is invalid".to_string())
+            })
+            .transpose()
+    }
+
+    fn save_path_setting(&mut self, key: &str, path: Option<&Path>) -> Result<(), String> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| "unable to start discovery settings transaction".to_string())?;
+        if let Some(path) = path {
+            let value = serde_json::to_string(&path.to_string_lossy().into_owned())
+                .map_err(|_| "unable to serialize discovery setting".to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO settings (key, value_json, updated_at_ms)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,
+                     updated_at_ms=excluded.updated_at_ms",
+                    params![key, value, now_ms()],
+                )
+                .map_err(|_| "unable to save discovery setting".to_string())?;
+        } else {
+            transaction
+                .execute("DELETE FROM settings WHERE key=?1", params![key])
+                .map_err(|_| "unable to clear discovery setting".to_string())?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| "unable to commit discovery setting".to_string())
+    }
+
     pub fn save_settings(&mut self, settings: &AppSettings) -> Result<(), String> {
         settings.validate()?;
         let json = serde_json::to_string(settings)
             .map_err(|_| "unable to serialize settings".to_string())?;
-        self.connection
+        let previous_digest = self.pricing_configuration_digest()?;
+        let next_digest = pricing_configuration_digest(settings)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| "unable to start settings transaction".to_string())?;
+        transaction
             .execute(
                 "INSERT INTO settings (key, value_json, updated_at_ms)
                  VALUES ('app', ?1, ?2)
@@ -769,6 +942,39 @@ impl Database {
                 params![json, now_ms()],
             )
             .map_err(|_| "unable to save settings".to_string())?;
+        // A settings save is the authoritative custom-pricing invalidation path.  The
+        // reprice and all dependent reconstruction happen in this same transaction.
+        if previous_digest != next_digest {
+            Self::reprice_usage_events(&transaction, settings)?;
+            Self::rebuild_quotes_in_transaction(&transaction)?;
+            Self::set_derived_state(
+                &transaction,
+                "pricing",
+                &format!("{PRICING_RULE_VERSION}:{next_digest}"),
+            )?;
+            Self::set_derived_state(&transaction, "reconstruction", RECONSTRUCTION_VERSION)?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| "unable to commit settings".to_string())?;
+        Ok(())
+    }
+
+    fn pricing_configuration_digest(&self) -> Result<String, String> {
+        self.load_settings()
+            .and_then(|settings| pricing_configuration_digest(&settings))
+    }
+
+    fn set_derived_state(
+        transaction: &Transaction<'_>,
+        key: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        transaction.execute(
+            "INSERT INTO derived_state (key, value, completed_at_ms) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, completed_at_ms=excluded.completed_at_ms",
+            params![key, value, now_ms()],
+        ).map_err(|_| "unable to record derived-data state".to_string())?;
         Ok(())
     }
 
@@ -802,7 +1008,6 @@ impl Database {
             .collect()
     }
 
-    // harn:assume persisted-incremental-indexing ref=incremental-persistence scope=function
     pub fn persist_collection<P>(
         &mut self,
         collection: &CollectionSummary,
@@ -866,10 +1071,86 @@ impl Database {
                 collection.interrupted_sources.len() as i64,
             )?;
         }
+        if collection.skipped_symlinks > 0 {
+            add_diagnostic(
+                &transaction,
+                "unsafe recursive link skipped",
+                collection.skipped_symlinks as i64,
+            )?;
+        }
         transaction
             .commit()
             .map_err(|_| "unable to commit collection transaction".to_string())?;
         Ok(inserted)
+    }
+
+    /// Keep the graph's time axis live even when Codex has not emitted another
+    /// quota observation. A heartbeat copies only the latest stable estimate;
+    /// it is never used as estimator evidence and is exposed as a heartbeat in
+    /// the history DTO.
+    pub fn record_chart_heartbeat(&mut self) -> Result<(), String> {
+        self.record_chart_heartbeat_at(now_ms())
+    }
+
+    fn record_chart_heartbeat_at(&mut self, timestamp_ms: i64) -> Result<(), String> {
+        let Some(latest) = self.latest_quota_observation()? else {
+            return Ok(());
+        };
+        let Some(active_window_id) = self.active_window_id(&latest)? else {
+            return Ok(());
+        };
+        let points = self.stored_points()?;
+        let Some(source) = points.iter().rev().find(|stored| {
+            stored.window_id == active_window_id
+                && !stored.point.is_heartbeat
+                && stored.point.timestamp <= latest.observed_at_ms
+                && stored.point.estimated_weekly_value_usd.is_some()
+                && matches!(
+                    stored.point.confidence,
+                    Confidence::Medium | Confidence::High
+                )
+        }) else {
+            // Do not carry an estimate across a reset while the new window is
+            // still calibrating.
+            return Ok(());
+        };
+        let heartbeat_timestamp = timestamp_ms.max(latest.observed_at_ms);
+        if heartbeat_timestamp <= source.point.timestamp {
+            return Ok(());
+        }
+        let latest_heartbeat_timestamp: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT MAX(timestamp_ms) FROM chart_heartbeats",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| "unable to read chart heartbeat state".to_string())?;
+        if latest_heartbeat_timestamp.is_some_and(|previous| previous >= heartbeat_timestamp) {
+            return Ok(());
+        }
+
+        // Heartbeats are only a live-tail aid. Retain one selected range of
+        // them so an unattended app cannot grow the local database forever.
+        self.connection
+            .execute(
+                "DELETE FROM chart_heartbeats WHERE timestamp_ms < ?1",
+                params![heartbeat_timestamp.saturating_sub(Range::W1.duration_ms())],
+            )
+            .map_err(|_| "unable to trim old chart heartbeats".to_string())?;
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO chart_heartbeats (
+                    timestamp_ms, value_usd, weekly_used_percent
+                 ) VALUES (?1, ?2, ?3)",
+                params![
+                    heartbeat_timestamp,
+                    source.point.estimated_weekly_value_usd,
+                    latest.used_percent
+                ],
+            )
+            .map_err(|_| "unable to persist chart heartbeat".to_string())?;
+        Ok(())
     }
 
     fn persist_event(
@@ -879,6 +1160,7 @@ impl Database {
         settings: &AppSettings,
     ) -> Result<bool, String> {
         let pricing = event_cost(event, settings);
+        let pricing_digest = pricing_configuration_digest(settings)?;
         let (cost_usd, pricing_status, eligible) = match pricing {
             Ok((cost, source)) => (Some(cost), source, 1_i64),
             Err(reason) => {
@@ -889,11 +1171,12 @@ impl Database {
         let inserted = transaction
             .prepare_cached(
                 "INSERT OR IGNORE INTO usage_events (
-                    fingerprint, account_key, timestamp_ms, model_id, input_tokens,
-                    cached_input_tokens, output_tokens, eligible, pricing_status, cost_usd,
+                    fingerprint, account_key, timestamp_ms, model_id, original_model_id, input_tokens,
+                    cached_input_tokens, output_tokens, reasoning_tokens, long_context, eligible,
+                    pricing_status, cost_usd, pricing_rule_version, pricing_source_digest,
                     quota_reset_at_ms, quota_limit_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                    ?11, ?12)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, ?16, ?17)",
             )
             .and_then(|mut statement| {
                 statement.execute(params![
@@ -901,12 +1184,17 @@ impl Database {
                     account_key,
                     event.timestamp_ms,
                     event.model.trim().to_ascii_lowercase().replace('/', "-"),
+                    event.model.as_str(),
                     event.input_tokens as i64,
                     event.cached_input_tokens as i64,
                     event.output_tokens as i64,
+                    event.reasoning_tokens as i64,
+                    i64::from(event.long_context),
                     eligible,
                     pricing_status,
                     cost_usd,
+                    PRICING_RULE_VERSION,
+                    pricing_digest,
                     event.quota_reset_at_ms,
                     event.quota_limit_id,
                 ])
@@ -924,7 +1212,7 @@ impl Database {
                 {
                     transaction
                         .prepare_cached(
-                            "INSERT INTO quota_snapshots (
+                            "INSERT OR IGNORE INTO quota_snapshots (
                                 account_key, observed_at_ms, reset_at_ms, duration_minutes,
                                 limit_id, plan, used_percent, connection_quality
                              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'good')",
@@ -967,7 +1255,8 @@ impl Database {
         let rows = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT fingerprint, model_id, input_tokens, cached_input_tokens, output_tokens
+                    "SELECT fingerprint, COALESCE(original_model_id, model_id), input_tokens,
+                            cached_input_tokens, output_tokens, reasoning_tokens, long_context
                      FROM usage_events",
                 )
                 .map_err(|_| "unable to read imported usage for repricing".to_string())?;
@@ -980,6 +1269,8 @@ impl Database {
                             input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
                             cached_input_tokens: row.get::<_, i64>(3)?.max(0) as u64,
                             output_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                            reasoning_tokens: row.get::<_, i64>(5)?.max(0) as u64,
+                            long_context: row.get::<_, i64>(6)? != 0,
                             ..UsageEvent::default()
                         },
                     })
@@ -995,9 +1286,16 @@ impl Database {
                     transaction
                         .execute(
                             "UPDATE usage_events
-                             SET eligible=1, pricing_status=?2, cost_usd=?3
+                             SET eligible=1, pricing_status=?2, cost_usd=?3,
+                                 pricing_rule_version=?4, pricing_source_digest=?5
                              WHERE fingerprint=?1",
-                            params![row.fingerprint, source, cost],
+                            params![
+                                row.fingerprint,
+                                source,
+                                cost,
+                                PRICING_RULE_VERSION,
+                                pricing_configuration_digest(settings)?
+                            ],
                         )
                         .map_err(|_| "unable to update repriced usage".to_string())?;
                 }
@@ -1005,9 +1303,14 @@ impl Database {
                     transaction
                         .execute(
                             "UPDATE usage_events
-                             SET eligible=0, pricing_status='pending', cost_usd=NULL
+                             SET eligible=0, pricing_status='pending', cost_usd=NULL,
+                                 pricing_rule_version=?2, pricing_source_digest=?3
                              WHERE fingerprint=?1",
-                            params![row.fingerprint],
+                            params![
+                                row.fingerprint,
+                                PRICING_RULE_VERSION,
+                                pricing_configuration_digest(settings)?
+                            ],
                         )
                         .map_err(|_| "unable to update pending usage price".to_string())?;
                 }
@@ -1138,12 +1441,22 @@ impl Database {
         let mut statement = transaction
             .prepare(
                 "SELECT account_key, limit_id, observed_at_ms, reset_at_ms, used_percent
-                 FROM quota_snapshots
-                 WHERE used_percent IS NOT NULL
-                   AND used_percent BETWEEN 0.0 AND 100.0
-                   AND duration_minutes IS NOT NULL
-                   AND ABS(duration_minutes - 10080.0) <= 240.0
-                 ORDER BY observed_at_ms, id",
+                 FROM (
+                    SELECT account_key, limit_id, observed_at_ms, reset_at_ms, used_percent,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY COALESCE(account_key, ''), COALESCE(limit_id, ''),
+                                            CAST(observed_at_ms / 1000 AS INTEGER)
+                               ORDER BY observed_at_ms DESC, used_percent DESC,
+                                        COALESCE(reset_at_ms, -1) DESC, id DESC
+                           ) AS observation_rank
+                    FROM quota_snapshots
+                    WHERE used_percent IS NOT NULL
+                      AND used_percent BETWEEN 0.0 AND 100.0
+                      AND duration_minutes IS NOT NULL
+                      AND ABS(duration_minutes - 10080.0) <= 240.0
+                 )
+                 WHERE observation_rank=1
+                 ORDER BY observed_at_ms",
             )
             .map_err(|_| "unable to read weekly observations".to_string())?;
         let observations = statement
@@ -1162,7 +1475,6 @@ impl Database {
         Ok(observations)
     }
 
-    // harn:assume jitter-safe-weekly-windows ref=window-reconstruction scope=function
     fn window_groups(observations: Vec<QuotaPoint>) -> (Vec<WindowGroup>, usize) {
         let mut groups_by_stream =
             HashMap::<(Option<String>, Option<String>), Vec<WindowGroup>>::new();
@@ -1173,22 +1485,29 @@ impl Database {
                 .or_default();
             let new_reason = groups.last().and_then(|group| {
                 let previous = group.points.last()?;
+                let usage_regressed = current.used_percent
+                    < previous.used_percent - crate::estimator::MATERIAL_USAGE_DECREASE_PERCENT;
+                if !usage_regressed {
+                    return None;
+                }
+                // A reset timestamp can move by several hours when the provider
+                // recalculates the weekly window.  Once that change is paired with
+                // a material usage decrease, it is stronger evidence than the old
+                // schedule and must start a new graph window.
                 let reset_changed = match (group.reset_at_ms, current.reset_at_ms) {
-                    (Some(left), Some(right)) => {
-                        left.abs_diff(right) > RESET_TIMESTAMP_JITTER_MS as u64
+                    (Some(previous_reset), Some(next_reset)) => {
+                        previous_reset.abs_diff(next_reset) > RESET_TIMESTAMP_JITTER_MS as u64
                     }
-                    _ => false,
+                    (Some(_), None) | (None, Some(_)) => true,
+                    (None, None) => false,
                 };
                 if reset_changed {
                     return Some("reported_reset_changed");
                 }
-                if current.used_percent
-                    < previous.used_percent - crate::estimator::MATERIAL_USAGE_DECREASE_PERCENT
-                {
-                    return previous
-                        .reset_at_ms
-                        .is_some_and(|reset| current.observed_at_ms >= reset)
-                        .then_some("scheduled_reset");
+                if group.reset_at_ms.is_some_and(|reset| {
+                    current.observed_at_ms >= reset - RESET_TIMESTAMP_JITTER_MS
+                }) {
+                    return Some("scheduled_reset");
                 }
                 None
             });
@@ -1231,7 +1550,6 @@ impl Database {
         (groups, stale_regressions)
     }
 
-    // harn:assume raw-history-stable-headline ref=history-signal-contract scope=function
     fn rebuild_group(
         transaction: &Transaction<'_>,
         group: &WindowGroup,
@@ -1547,6 +1865,25 @@ impl Database {
             .collect()
     }
 
+    fn latest_chart_heartbeat(&self) -> Result<Option<ChartHeartbeat>, String> {
+        self.connection
+            .query_row(
+                "SELECT timestamp_ms, value_usd, weekly_used_percent
+                 FROM chart_heartbeats
+                 ORDER BY timestamp_ms DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(ChartHeartbeat {
+                        timestamp_ms: row.get(0)?,
+                        value_usd: row.get(1)?,
+                        weekly_used_percent: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| "unable to read latest chart heartbeat".to_string())
+    }
+
     pub fn latest_quota_observation(&self) -> Result<Option<LatestQuotaObservation>, String> {
         self.connection
             .query_row(
@@ -1788,58 +2125,158 @@ impl Database {
         Ok((count.max(0) as u64, coverage, source))
     }
 
-    // harn:assume reliable-range-comparisons ref=range-comparison-selection scope=function
     pub fn history(&self, range: Range) -> Result<HistoryResponse, String> {
-        let latest_timestamp: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT observed_at_ms FROM quota_snapshots
-                 ORDER BY observed_at_ms DESC, id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|_| "unable to identify current weekly history".to_string())?;
-        let Some(latest_timestamp) = latest_timestamp else {
+        let Some(latest) = self.latest_quota_observation()? else {
             return Ok(empty_history(range));
         };
-        let stored = self.stored_points()?;
+        let mut latest_timestamp = latest.observed_at_ms;
+        let mut stored = self.stored_points()?;
+        let active_window_id = self.active_window_id(&latest)?;
+        if let Some(live_heartbeat) = self.latest_chart_heartbeat()? {
+            if let Some(active_window_id) = active_window_id {
+                if let Some(source) = stored.iter().rev().find(|stored| {
+                    stored.window_id == active_window_id
+                        && !stored.point.is_heartbeat
+                        && stored.point.timestamp <= live_heartbeat.timestamp_ms
+                        && stored.point.estimated_weekly_value_usd.is_some()
+                        && matches!(
+                            stored.point.confidence,
+                            Confidence::Medium | Confidence::High
+                        )
+                }) {
+                    if live_heartbeat.timestamp_ms > source.point.timestamp {
+                        let mut heartbeat_point = source.point.clone();
+                        heartbeat_point.timestamp = live_heartbeat.timestamp_ms;
+                        heartbeat_point.raw_estimated_weekly_value_usd = None;
+                        heartbeat_point.observed_cost_usd = None;
+                        heartbeat_point.weekly_used_percent = live_heartbeat
+                            .weekly_used_percent
+                            .or(Some(latest.used_percent));
+                        heartbeat_point.is_heartbeat = true;
+                        heartbeat_point.estimated_weekly_value_usd = live_heartbeat
+                            .value_usd
+                            .or(source.point.estimated_weekly_value_usd);
+                        stored.push(StoredPoint {
+                            point: heartbeat_point,
+                            window_id: source.window_id,
+                        });
+                        stored.sort_by_key(|stored| stored.point.timestamp);
+                        latest_timestamp = latest_timestamp.max(live_heartbeat.timestamp_ms);
+                    }
+                }
+            }
+        }
         let since = latest_timestamp - range.duration_ms();
+        let is_graph_eligible = |point: &HistoryPoint| {
+            point.estimated_weekly_value_usd.is_some()
+                && matches!(point.confidence, Confidence::Medium | Confidence::High)
+        };
+        let is_pending_endpoint = |stored: &StoredPoint| {
+            Some(stored.window_id) == active_window_id
+                && stored.point.is_heartbeat
+                && stored.point.timestamp == latest_timestamp
+                && stored.point.estimated_weekly_value_usd.is_none()
+        };
+        if let Some(active_window_id) = active_window_id {
+            let latest_active_graph_timestamp = stored
+                .iter()
+                .filter(|stored| {
+                    stored.window_id == active_window_id && is_graph_eligible(&stored.point)
+                })
+                .map(|stored| stored.point.timestamp)
+                .max();
+            let has_pending_endpoint = stored.iter().any(|stored| {
+                stored.window_id == active_window_id
+                    && stored.point.is_heartbeat
+                    && stored.point.timestamp == latest_timestamp
+                    && stored.point.estimated_weekly_value_usd.is_none()
+            });
+            if latest_active_graph_timestamp.map_or(true, |timestamp| timestamp < latest_timestamp)
+                && !has_pending_endpoint
+            {
+                let (reset_at, reset_reason) = self
+                    .active_window_metadata(active_window_id)
+                    .map(|(_, reset_at, reset_reason)| (reset_at, Some(reset_reason)))?;
+                // Keep the chart's time axis live while a new window is
+                // calibrating. This endpoint has no estimate and is never
+                // considered estimator evidence.
+                stored.push(StoredPoint {
+                    point: HistoryPoint {
+                        timestamp: latest_timestamp,
+                        estimated_weekly_value_usd: None,
+                        raw_estimated_weekly_value_usd: None,
+                        observed_cost_usd: None,
+                        weekly_used_percent: Some(latest.used_percent),
+                        reset_at,
+                        reset_reason,
+                        is_finalized: false,
+                        is_heartbeat: true,
+                        epoch: Some(active_window_id),
+                        confidence: Confidence::None,
+                        percentage_coverage: None,
+                    },
+                    window_id: active_window_id,
+                });
+                stored.sort_by_key(|stored| stored.point.timestamp);
+            }
+        }
         let has_history_before_range = stored
-            .first()
-            .is_some_and(|stored| stored.point.timestamp <= since);
-        let points = stored
+            .iter()
+            .any(|stored| stored.point.timestamp <= since && is_graph_eligible(&stored.point));
+        let mut points = stored
             .iter()
             .filter(|stored| {
-                stored.point.timestamp >= since && stored.point.timestamp <= latest_timestamp
+                stored.point.timestamp >= since
+                    && stored.point.timestamp <= latest_timestamp
+                    && (is_graph_eligible(&stored.point) || is_pending_endpoint(stored))
             })
-            .map(|stored| stored.point.clone())
+            .map(|stored| {
+                let mut point = stored.point.clone();
+                // The persisted raw estimate remains available for forensic work,
+                // but the graph API must expose the stabilized estimate through the
+                // legacy UI's preferred signal field. Otherwise a one-percent
+                // calibration sample can become a misleading range endpoint.
+                point.raw_estimated_weekly_value_usd = None;
+                point
+            })
             .collect::<Vec<_>>();
-        let active_window = self
-            .latest_quota_observation()?
-            .and_then(|latest| self.active_window_id(&latest).ok().flatten());
-        let current_point = active_window.and_then(|window_id| {
-            stored.iter().rev().find(|stored| {
-                stored.window_id == window_id
-                    && matches!(
-                        stored.point.confidence,
-                        Confidence::Medium | Confidence::High
-                    )
-            })
-        });
-        let baseline_point = current_point.and_then(|current| {
-            stored.iter().find(|candidate| {
-                candidate.point.timestamp >= since
-                    && candidate.point.timestamp < current.point.timestamp
-                    && matches!(
-                        candidate.point.confidence,
-                        Confidence::Medium | Confidence::High
-                    )
-            })
-        });
-        let current = current_point.and_then(|stored| stored.point.estimated_weekly_value_usd);
-        let baseline = baseline_point.and_then(|stored| stored.point.estimated_weekly_value_usd);
-        let baseline_timestamp = baseline_point.map(|stored| stored.point.timestamp);
+        // Longer ranges carry the last mature state to the requested boundary. This
+        // represents the estimate that was in force at the boundary and prevents a
+        // sparse 1W response from being stretched into the same domain as 1D. The
+        // synthetic boundary is explicitly marked as a heartbeat and is never used
+        // as evidence of token activity.
+        if !matches!(range, Range::D1) && !points.is_empty() {
+            if let Some(previous) = stored.iter().rev().find(|stored| {
+                stored.point.timestamp < since
+                    && stored.point.estimated_weekly_value_usd.is_some()
+                    && matches!(stored.point.confidence, Confidence::High)
+            }) {
+                let mut heartbeat = previous.point.clone();
+                heartbeat.timestamp = since;
+                heartbeat.raw_estimated_weekly_value_usd = None;
+                heartbeat.observed_cost_usd = None;
+                heartbeat.weekly_used_percent = None;
+                heartbeat.is_heartbeat = true;
+                points.insert(0, heartbeat);
+            }
+        }
+        let current_point = points.last();
+        let current = current_point.and_then(|point| point.estimated_weekly_value_usd);
+        // A movement inside one weekly quota window is estimator calibration, not a
+        // change in weekly value. Publish a range delta only when the latest endpoint
+        // is high-confidence and a high-confidence endpoint from a different weekly
+        // window exists in the selected range.
+        let baseline_point = current_point
+            .filter(|current| matches!(current.confidence, Confidence::High))
+            .and_then(|current| {
+                points.iter().find(|candidate| {
+                    matches!(candidate.confidence, Confidence::High)
+                        && candidate.epoch != current.epoch
+                })
+            });
+        let baseline = baseline_point.and_then(|point| point.estimated_weekly_value_usd);
+        let baseline_timestamp = baseline_point.map(|point| point.timestamp);
+        let current_timestamp = current_point.map(|point| point.timestamp);
         let delta_value_usd = current
             .zip(baseline)
             .map(|(current, baseline)| current - baseline);
@@ -1853,13 +2290,19 @@ impl Database {
                 baseline_estimated_weekly_value_usd: baseline,
                 baseline_timestamp,
                 current_estimated_weekly_value_usd: current,
+                current_timestamp,
                 delta_value_usd,
                 delta_percent,
                 point_count: points.len(),
                 partial: !has_history_before_range,
+                requested_start_timestamp: Some(since),
+                available_start_timestamp: points.first().map(|point| point.timestamp),
+                available_end_timestamp: points.last().map(|point| point.timestamp),
             },
             bucket: range.bucket().into(),
             points,
+            pricing_rule_version: PRICING_RULE_VERSION.into(),
+            reconstruction_version: RECONSTRUCTION_VERSION.into(),
         })
     }
 
@@ -1925,7 +2368,6 @@ impl Database {
         Ok(())
     }
 
-    // harn:assume reset-checkpoint-recovery ref=reset-checkpoint-storage scope=function
     pub fn reset_all_data(&mut self) -> Result<(), String> {
         let transaction = self
             .connection
@@ -1979,7 +2421,6 @@ impl Database {
             .map_err(|_| "unable to commit checkpoint restore".to_string())
     }
 
-    // harn:assume explicit-full-log-import ref=explicit-full-import scope=function
     pub fn clear_imported_data(&mut self) -> Result<(), String> {
         let transaction = self
             .connection
@@ -2127,13 +2568,16 @@ pub fn hash_account_key(salt: &[u8], identity: &str) -> String {
 mod tests {
     use super::*;
     use crate::collector::CollectionSummary;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    };
 
     static TEST_DATABASE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn database() -> (Database, PathBuf) {
         let path = std::env::temp_dir().join(format!(
-            "nerfify-token-test-{}-{}.db",
+            "nerftrack-token-test-{}-{}.db",
             std::process::id(),
             TEST_DATABASE_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -2143,6 +2587,94 @@ mod tests {
         };
         database.migrate().expect("schema");
         (database, path)
+    }
+
+    struct CurrentDirectoryGuard {
+        original: PathBuf,
+    }
+
+    impl Drop for CurrentDirectoryGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    #[test]
+    fn database_path_is_stable_across_working_directories() {
+        static CURRENT_DIRECTORY_LOCK: Mutex<()> = Mutex::new(());
+        let _lock = CURRENT_DIRECTORY_LOCK
+            .lock()
+            .expect("working-directory lock");
+        let original = std::env::current_dir().expect("current directory");
+        let _guard = CurrentDirectoryGuard {
+            original: original.clone(),
+        };
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repository root")
+            .to_path_buf();
+        let temporary_root =
+            std::env::temp_dir().join(format!("nerftrack-db-cwd-{} (✓)", std::process::id()));
+        let packaged_working_directory = temporary_root.join("NerfTrack.app/Contents/MacOS");
+        fs::create_dir_all(&packaged_working_directory).expect("packaged directory");
+        let subdirectory = repository_root.join("src");
+        let temporary_subdirectory = temporary_root.join("temporary folder (data)");
+        fs::create_dir_all(&temporary_subdirectory).expect("temporary subdirectory");
+
+        let expected_directory = data_directory().expect("platform data directory");
+        let expected_path = database_path().expect("platform database path");
+        for working_directory in [
+            repository_root,
+            subdirectory,
+            temporary_subdirectory,
+            packaged_working_directory,
+        ] {
+            std::env::set_current_dir(&working_directory).expect("change working directory");
+            assert_eq!(
+                data_directory().expect("data directory"),
+                expected_directory
+            );
+            assert_eq!(database_path().expect("database path"), expected_path);
+            assert!(expected_path.ends_with("NerfTrack/nerftrack.db"));
+        }
+        std::env::set_current_dir(&original).expect("restore working directory");
+        let _ = fs::remove_dir_all(temporary_root);
+    }
+
+    #[test]
+    fn discovery_overrides_survive_reload_and_clear() {
+        let (mut database, path) = database();
+        let home = PathBuf::from("/tmp/Codex data (✓)");
+        let executable = PathBuf::from("/tmp/codex (x86_64)");
+        database
+            .save_codex_home_override(Some(&home))
+            .expect("save home override");
+        database
+            .save_codex_binary_override(Some(&executable))
+            .expect("save executable override");
+        drop(database);
+
+        let mut reopened = Database {
+            path: path.clone(),
+            connection: open_connection(&path).expect("reopen database"),
+        };
+        let overrides = reopened
+            .load_discovery_overrides()
+            .expect("load overrides after restart");
+        assert_eq!(overrides.codex_home, Some(home));
+        assert_eq!(overrides.codex_binary, Some(executable));
+        reopened
+            .save_codex_home_override(None)
+            .expect("clear home override");
+        reopened
+            .save_codex_binary_override(None)
+            .expect("clear executable override");
+        let cleared = reopened
+            .load_discovery_overrides()
+            .expect("load cleared overrides");
+        assert!(cleared.codex_home.is_none());
+        assert!(cleared.codex_binary.is_none());
+        let _ = fs::remove_file(path);
     }
 
     fn event(
@@ -2208,6 +2740,116 @@ mod tests {
         // 80 normal input + 20 cached input + 8 output; reasoning is a subset of output.
         assert_eq!(source, "official");
         assert!((cost - ((80.0 * 1.75 + 20.0 * 0.175 + 8.0 * 14.0) / 1_000_000.0)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn gpt_5_6_luna_uses_current_official_rates() {
+        let event = UsageEvent {
+            model: "gpt-5.6-luna".into(),
+            input_tokens: 100_000,
+            output_tokens: 100_000,
+            ..UsageEvent::default()
+        };
+        let (cost, source) = event_cost(&event, &AppSettings::default()).expect("official price");
+        assert_eq!(source, "official");
+        assert!((cost - 0.14).abs() < 1e-12);
+
+        let cached_event = UsageEvent {
+            model: "gpt-5.6-luna".into(),
+            input_tokens: 100_000,
+            cached_input_tokens: 100_000,
+            output_tokens: 100_000,
+            ..UsageEvent::default()
+        };
+        let (cached_cost, _) =
+            event_cost(&cached_event, &AppSettings::default()).expect("official cached price");
+        assert!((cached_cost - 0.122).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gpt_5_6_terra_uses_current_official_rates() {
+        let event = UsageEvent {
+            model: "gpt-5.6-terra".into(),
+            input_tokens: 100_000,
+            output_tokens: 100_000,
+            ..UsageEvent::default()
+        };
+        let (cost, source) = event_cost(&event, &AppSettings::default()).expect("official price");
+        assert_eq!(source, "official");
+        assert!((cost - 1.4).abs() < 1e-12);
+
+        let cached_event = UsageEvent {
+            model: "gpt-5.6-terra".into(),
+            input_tokens: 100_000,
+            cached_input_tokens: 100_000,
+            output_tokens: 100_000,
+            ..UsageEvent::default()
+        };
+        let (cached_cost, _) =
+            event_cost(&cached_event, &AppSettings::default()).expect("official cached price");
+        assert!((cached_cost - 1.22).abs() < 1e-12);
+    }
+
+    #[test]
+    fn duplicate_quota_observations_are_safe_for_existing_databases() {
+        let (mut database, path) = database();
+        database
+            .connection
+            .execute(
+                "CREATE UNIQUE INDEX test_quota_observation_identity
+                 ON quota_snapshots(
+                     COALESCE(account_key, ''),
+                     COALESCE(limit_id, ''),
+                     observed_at_ms,
+                     COALESCE(reset_at_ms, -1),
+                     COALESCE(duration_minutes, -1.0),
+                     COALESCE(used_percent, -1.0)
+                 )",
+                [],
+            )
+            .expect("unique observation index");
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 42.0, Some(10_000)),
+                event(1_000, Some(0.42), 42.0, Some(10_000)),
+            ],
+        );
+        let count: i64 = database
+            .connection
+            .query_row("SELECT count(*) FROM quota_snapshots", [], |row| row.get(0))
+            .expect("quota count");
+        assert_eq!(count, 1);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn weekly_observations_collapse_conflicting_same_second_snapshots() {
+        let (mut database, path) = database();
+        database
+            .connection
+            .execute_batch(
+                "INSERT INTO quota_snapshots (
+                    observed_at_ms, reset_at_ms, duration_minutes, limit_id, used_percent
+                 ) VALUES
+                    (1000, 10000, 10080, 'codex', 10),
+                    (1000, 10000, 10080, 'codex', 20),
+                    (1001, 20000, 10080, 'codex', 5),
+                    (2000, 20000, 10080, 'codex', 6),
+                    (2000, 20000, 10080, 'codex', 7);",
+            )
+            .expect("conflicting quota snapshots");
+        let transaction = database.connection.transaction().expect("transaction");
+        let observations = Database::weekly_observations(&transaction).expect("observations");
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].observed_at_ms, 1001);
+        assert_eq!(observations[0].used_percent, 5.0);
+        assert_eq!(observations[1].observed_at_ms, 2000);
+        assert_eq!(observations[1].used_percent, 7.0);
+        drop(transaction);
+        drop(database);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -2460,7 +3102,7 @@ mod tests {
             .latest_quote()
             .expect("quote")
             .expect("current quote");
-        assert_eq!(quote.estimated_weekly_value_usd, Some(200.0));
+        assert_eq!(quote.estimated_weekly_value_usd, Some(40.0));
         drop(database);
         let _ = fs::remove_file(path);
     }
@@ -2495,7 +3137,7 @@ mod tests {
     }
 
     #[test]
-    fn material_reset_timestamp_change_starts_a_new_window() {
+    fn reset_timestamp_change_without_usage_reset_stays_in_one_window() {
         let (mut database, path) = database();
         persist(
             &mut database,
@@ -2514,7 +3156,36 @@ mod tests {
             .connection
             .query_row("SELECT COUNT(*) FROM epochs", [], |row| row.get(0))
             .expect("windows");
+        assert_eq!(windows, 1);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn material_usage_regression_with_changed_reset_starts_new_window() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000_000, Some(0.0), 10.0, Some(10_000_000)),
+                event(2_000_000, Some(0.4), 11.0, Some(10_000_000)),
+                event(3_000_000, Some(0.0), 0.0, Some(80_000_000)),
+            ],
+        );
+        let windows: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM epochs", [], |row| row.get(0))
+            .expect("windows");
         assert_eq!(windows, 2);
+        let reason: String = database
+            .connection
+            .query_row(
+                "SELECT reset_reason FROM epochs ORDER BY started_at_ms DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("new window reason");
+        assert_eq!(reason, "reported_reset_changed");
         drop(database);
         let _ = fs::remove_file(path);
     }
@@ -2601,7 +3272,7 @@ mod tests {
             .expect("epochs");
         for (timestamp, value, confidence, coverage, window_id) in [
             (1_000, 3.28, "low", 1.0, 1),
-            (2_000, 50.0, "medium", 5.0, 1),
+            (2_000, 50.0, "high", 20.0, 1),
             (10_000, 60.0, "high", 20.0, 2),
         ] {
             database
@@ -2630,9 +3301,208 @@ mod tests {
             history.statistics.baseline_estimated_weekly_value_usd,
             Some(50.0)
         );
-        assert_eq!(history.statistics.delta_value_usd, Some(10.0));
-        assert_eq!(history.points[0].raw_estimated_weekly_value_usd, Some(3.28));
+        assert!((history.statistics.delta_value_usd.unwrap() - 10.0).abs() < 1e-10);
+        assert_eq!(history.points.len(), 2);
+        assert_eq!(history.points[0].timestamp, 2_000);
+        assert_eq!(history.points[0].raw_estimated_weekly_value_usd, None);
+        let persisted_raw: f64 = database
+            .connection
+            .query_row(
+                "SELECT raw_value_usd FROM quotes WHERE timestamp_ms=1000",
+                [],
+                |row| row.get(0),
+            )
+            .expect("persisted forensic raw estimate");
+        assert_eq!(persisted_raw, 3.28);
         assert!(history.statistics.partial);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_suppresses_intra_window_calibration_delta() {
+        let (database, path) = database();
+        database
+            .connection
+            .execute_batch(
+                "INSERT INTO quota_snapshots (
+                    observed_at_ms, reset_at_ms, duration_minutes, limit_id, used_percent
+                 ) VALUES (10000, 20000, 10080, 'codex', 30);
+                 INSERT INTO epochs (
+                    id, limit_id, reset_at_ms, started_at_ms, ended_at_ms, reset_reason
+                 ) VALUES (1, 'codex', 20000, 0, 10000, 'scheduled_reset');
+                 INSERT INTO quotes (
+                    timestamp_ms, value_usd, raw_value_usd, estimated_weekly_value_usd,
+                    confidence, status, is_finalized, algorithm_version,
+                    percentage_coverage, window_id
+                 ) VALUES
+                    (1000, 70, 70, 70, 'high', 'valid', 1,
+                     'nerftrack-token-api-equivalent-v4', 20, 1),
+                    (10000, 90, 90, 90, 'high', 'valid', 1,
+                     'nerftrack-token-api-equivalent-v4', 30, 1);",
+            )
+            .expect("same-window history");
+
+        let history = database.history(Range::D1).expect("history");
+        assert_eq!(history.points.len(), 2);
+        assert_eq!(
+            history.statistics.current_estimated_weekly_value_usd,
+            Some(90.0)
+        );
+        assert_eq!(history.statistics.baseline_estimated_weekly_value_usd, None);
+        assert_eq!(history.statistics.delta_value_usd, None);
+        assert_eq!(history.statistics.delta_percent, None);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn live_heartbeat_extends_history_without_becoming_usage_evidence() {
+        let (mut database, path) = database();
+        database
+            .connection
+            .execute_batch(
+                "INSERT INTO quota_snapshots (
+                    observed_at_ms, reset_at_ms, duration_minutes, limit_id, used_percent
+                 ) VALUES (10000, 20000, 10080, 'codex', 20);
+                 INSERT INTO epochs (
+                    id, limit_id, reset_at_ms, started_at_ms, ended_at_ms, reset_reason
+                 ) VALUES (1, 'codex', 20000, 0, 10000, 'uncertain_reset');
+                 INSERT INTO quotes (
+                    timestamp_ms, value_usd, raw_value_usd, estimated_weekly_value_usd,
+                    confidence, status, is_finalized, algorithm_version,
+                    percentage_coverage, window_id
+                 ) VALUES (9000, 100, 100, 100, 'high', 'valid', 1,
+                    'nerftrack-token-api-equivalent-v4', 20, 1);",
+            )
+            .expect("live heartbeat fixture");
+
+        database
+            .record_chart_heartbeat_at(20_000)
+            .expect("record heartbeat");
+        let history = database.history(Range::D1).expect("history");
+
+        assert_eq!(history.statistics.available_end_timestamp, Some(20_000));
+        assert_eq!(
+            history.points.last().map(|point| point.timestamp),
+            Some(20_000)
+        );
+        assert!(history
+            .points
+            .last()
+            .is_some_and(|point| point.is_heartbeat));
+        assert_eq!(
+            history
+                .points
+                .last()
+                .and_then(|point| point.observed_cost_usd),
+            None
+        );
+        assert_eq!(
+            history
+                .points
+                .last()
+                .and_then(|point| point.estimated_weekly_value_usd),
+            Some(100.0)
+        );
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_advances_to_pending_endpoint_during_new_window_calibration() {
+        let (database, path) = database();
+        database
+            .connection
+            .execute_batch(
+                "INSERT INTO quota_snapshots (
+                    observed_at_ms, reset_at_ms, duration_minutes, limit_id, used_percent
+                 ) VALUES (20000, 30000, 10080, 'codex', 3);
+                 INSERT INTO epochs (
+                    id, limit_id, reset_at_ms, started_at_ms, ended_at_ms, reset_reason
+                 ) VALUES
+                    (1, 'codex', 10000, 0, 9000, 'uncertain_reset'),
+                    (2, 'codex', 30000, 10000, 20000, 'reported_reset_changed');
+                 INSERT INTO quotes (
+                    timestamp_ms, value_usd, raw_value_usd, estimated_weekly_value_usd,
+                    confidence, status, is_finalized, algorithm_version,
+                    percentage_coverage, window_id
+                 ) VALUES
+                    (9000, 100, 100, 100, 'high', 'valid', 1,
+                    'nerftrack-token-api-equivalent-v4', 20, 1),
+                    (19000, 29, 29, 29, 'low', 'valid', 1,
+                    'nerftrack-token-api-equivalent-v4', 3, 2);",
+            )
+            .expect("pending endpoint fixture");
+
+        let latest = database
+            .latest_quota_observation()
+            .expect("latest quota")
+            .expect("quota");
+        assert_eq!(
+            database.active_window_id(&latest).expect("active window"),
+            Some(2)
+        );
+        let history = database.history(Range::D1).expect("history");
+        assert_eq!(history.statistics.available_end_timestamp, Some(20_000));
+        assert_eq!(history.points.len(), 2);
+        assert_eq!(
+            history.points.last().map(|point| point.timestamp),
+            Some(20_000)
+        );
+        assert!(history
+            .points
+            .last()
+            .is_some_and(|point| point.is_heartbeat && point.estimated_weekly_value_usd.is_none()));
+        assert_eq!(history.points.last().and_then(|point| point.epoch), Some(2));
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn weekly_history_carries_prior_mature_state_to_range_boundary() {
+        let (database, path) = database();
+        let latest_timestamp = Range::W1.duration_ms() + 10_000;
+        database
+            .connection
+            .execute(
+                "INSERT INTO quota_snapshots (
+                    observed_at_ms, reset_at_ms, duration_minutes, limit_id, used_percent
+                 ) VALUES (?1, ?2, 10080, 'codex', 30)",
+                params![latest_timestamp, latest_timestamp + Range::W1.duration_ms()],
+            )
+            .expect("latest quota");
+        database
+            .connection
+            .execute_batch(
+                "INSERT INTO epochs (
+                    id, limit_id, reset_at_ms, started_at_ms, ended_at_ms, reset_reason
+                 ) VALUES
+                    (1, 'codex', 9000, 0, 5000, 'scheduled_reset'),
+                    (2, 'codex', 999999999, 10000, 999999999, 'scheduled_reset');",
+            )
+            .expect("epochs");
+        for (timestamp, value, window_id) in [(5_000, 130.0, 1), (latest_timestamp, 90.0, 2)] {
+            database
+                .connection
+                .execute(
+                    "INSERT INTO quotes (
+                        timestamp_ms, value_usd, raw_value_usd, estimated_weekly_value_usd,
+                        confidence, status, is_finalized, algorithm_version,
+                        percentage_coverage, window_id
+                     ) VALUES (?1, ?2, ?2, ?2, 'high', 'valid', 1, ?3, 30, ?4)",
+                    params![timestamp, value, ALGORITHM_VERSION, window_id],
+                )
+                .expect("quote");
+        }
+
+        let history = database.history(Range::W1).expect("history");
+        assert_eq!(history.points.len(), 2);
+        assert_eq!(history.points[0].timestamp, 10_000);
+        assert!(history.points[0].is_heartbeat);
+        assert_eq!(history.points[0].estimated_weekly_value_usd, Some(130.0));
+        assert_eq!(history.statistics.baseline_timestamp, Some(10_000));
+        assert_eq!(history.statistics.delta_value_usd, Some(-40.0));
         drop(database);
         let _ = fs::remove_file(path);
     }

@@ -27,10 +27,12 @@ pub struct AppState {
 
 impl AppState {
     fn new() -> Result<Self, String> {
+        let database = storage::Database::open()?;
+        let overrides = database.load_discovery_overrides()?;
         let state = Self {
-            database: Mutex::new(storage::Database::open()?),
-            codex_home_override: Mutex::new(None),
-            codex_binary_override: Mutex::new(None),
+            database: Mutex::new(database),
+            codex_home_override: Mutex::new(overrides.codex_home),
+            codex_binary_override: Mutex::new(overrides.codex_binary),
             collection_paused: Mutex::new(false),
         };
         Ok(state)
@@ -49,15 +51,8 @@ impl AppState {
             .lock()
             .map_err(|_| "discovery state is unavailable".to_string())?
             .clone();
-        let binary_override = self
-            .codex_binary_override
-            .lock()
-            .map_err(|_| "discovery state is unavailable".to_string())?
-            .clone();
-        let (binary, _) = discovery::discover_codex_binary(binary_override.as_deref());
-        let Some(home) =
-            discovery::discover_codex_home_for_mode(home_override.as_deref(), binary.is_none()).0
-        else {
+        let (home, _) = discovery::discover_codex_home(home_override.as_deref());
+        let Some(home) = home else {
             return Ok(());
         };
         let mut database = self
@@ -67,6 +62,13 @@ impl AppState {
         let previous = database.load_checkpoint_states()?;
         let collection = collector::scan_codex_home_with_state(&home, &previous)?;
         database.persist_collection::<()>(&collection, None, None)?;
+        // Symlinks are deliberately skipped by the collector to avoid recursive
+        // traversal. They are recorded in diagnostics, but do not make the scan
+        // incomplete or suppress the live chart heartbeat.
+        if !collection.interrupted_sources.is_empty() {
+            return Err("Codex data scan completed only partially; see local diagnostics".into());
+        }
+        database.record_chart_heartbeat()?;
         Ok(())
     }
 
@@ -92,15 +94,8 @@ impl AppState {
             .lock()
             .map_err(|_| "discovery state is unavailable".to_string())?
             .clone();
-        let binary_override = self
-            .codex_binary_override
-            .lock()
-            .map_err(|_| "discovery state is unavailable".to_string())?
-            .clone();
-        let (binary, _) = discovery::discover_codex_binary(binary_override.as_deref());
-        let Some(home) =
-            discovery::discover_codex_home_for_mode(home_override.as_deref(), binary.is_none()).0
-        else {
+        let (home, _) = discovery::discover_codex_home(home_override.as_deref());
+        let Some(home) = home else {
             return Ok(());
         };
         let collection = collector::scan_codex_home_with_state(&home, &Default::default())?;
@@ -126,6 +121,9 @@ impl AppState {
             .lock()
             .map_err(|_| "database writer is unavailable".to_string())?
             .persist_collection::<()>(&checkpoints_only, None, None)?;
+        if !collection.interrupted_sources.is_empty() {
+            return Err("Codex data scan completed only partially; see local diagnostics".into());
+        }
         Ok(())
     }
 
@@ -142,25 +140,15 @@ impl AppState {
             .and_then(|path| path.clone());
         let (binary, detected_codex_executable) =
             discovery::discover_codex_binary(binary_override.as_deref());
-        let (home, mut codex_home) =
-            discovery::discover_codex_home_for_mode(home_override.as_deref(), binary.is_none());
-        let detected_gui_home = home
+        let (home, codex_home) = discovery::discover_codex_home(home_override.as_deref());
+        // Derive the integration mode from the selected data root. A GUI
+        // executable must not turn a CLI-only data directory into Desktop Mode.
+        let gui_mode = home
             .as_ref()
-            .map(|path| discovery::is_gui_home(path))
-            .unwrap_or(false);
-        let embedded_gui_binary = binary
-            .as_ref()
-            .map(|path| discovery::is_gui_binary(path))
-            .unwrap_or(false);
-        let explicit_cli_binary =
-            binary_override.is_some() || std::env::var_os("CODEX_BINARY").is_some();
-        let gui_mode = (detected_gui_home || embedded_gui_binary) && !explicit_cli_binary;
-        if gui_mode && codex_home.message == "Auto-detected" {
-            codex_home.message = "Desktop app data detected".into();
-        }
+            .is_some_and(|path| discovery::is_gui_home(path));
         let integration_mode = if gui_mode {
             IntegrationMode::Gui
-        } else if binary.is_some() {
+        } else if home.is_some() && binary.is_some() {
             IntegrationMode::Cli
         } else {
             IntegrationMode::Unknown
@@ -171,7 +159,11 @@ impl AppState {
             detected_codex_executable
         };
         let app_server = discovery::app_server_status_for_mode(binary.is_some(), gui_mode);
-        let configured = home.is_some() && (binary.is_some() || gui_mode);
+        let configured = match integration_mode {
+            IntegrationMode::Gui => home.is_some(),
+            IntegrationMode::Cli => home.is_some() && binary.is_some(),
+            IntegrationMode::Unknown => false,
+        };
         let database = self.database.lock().ok();
         let diagnostics = database
             .as_ref()
@@ -289,8 +281,6 @@ async fn get_current_quote(
 
 #[tauri::command]
 async fn get_current_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
-    // ponytail: polling scans all source names; replace with a file watcher if large histories
-    // make the configured refresh interval measurably slow.
     let reconciliation_failed = state.reconcile().is_err();
     Ok(state.discover_status(reconciliation_failed))
 }
@@ -411,7 +401,35 @@ fn select_codex_home(state: State<'_, AppState>) -> Result<RedactedSelection, St
             status: DiscoveryStatus::missing("No selection made"),
         });
     };
+    let validation = discovery::validate_codex_home(&path);
+    if !matches!(
+        validation,
+        discovery::CodexHomeValidation::Data | discovery::CodexHomeValidation::Empty
+    ) {
+        let message = match validation {
+            discovery::CodexHomeValidation::Inaccessible => "Selected folder is inaccessible",
+            discovery::CodexHomeValidation::Unsupported => {
+                "Selected folder has no supported Codex JSONL data"
+            }
+            discovery::CodexHomeValidation::Data | discovery::CodexHomeValidation::Empty => {
+                "Selected folder is available"
+            }
+        };
+        return Ok(RedactedSelection {
+            selected: false,
+            status: DiscoveryStatus {
+                state: models::DiscoveryState::Unsupported,
+                redacted_location: Some(discovery::redact_path(&path)),
+                message: message.into(),
+            },
+        });
+    }
     let redacted = discovery::redact_path(&path);
+    state
+        .database
+        .lock()
+        .map_err(|_| "database writer is unavailable".to_string())?
+        .save_codex_home_override(Some(&path))?;
     *state
         .codex_home_override
         .lock()
@@ -422,7 +440,12 @@ fn select_codex_home(state: State<'_, AppState>) -> Result<RedactedSelection, St
         status: DiscoveryStatus {
             state: models::DiscoveryState::Selected,
             redacted_location: Some(redacted),
-            message: "Selected".into(),
+            message: if matches!(validation, discovery::CodexHomeValidation::Empty) {
+                "Selected empty data directory; waiting for Codex JSONL"
+            } else {
+                "Selected"
+            }
+            .into(),
         },
     })
 }
@@ -438,17 +461,22 @@ fn select_codex_executable(state: State<'_, AppState>) -> Result<RedactedSelecti
             status: DiscoveryStatus::missing("No selection made"),
         });
     };
-    if !path.is_file() {
+    if discovery::resolve_codex_executable(&path).is_none() {
         return Ok(RedactedSelection {
             selected: false,
             status: DiscoveryStatus {
                 state: models::DiscoveryState::Unsupported,
                 redacted_location: None,
-                message: "Selected item is not a CLI executable".into(),
+                message: "Selected item is not an executable Codex CLI".into(),
             },
         });
     }
     let redacted = discovery::redact_path(&path);
+    state
+        .database
+        .lock()
+        .map_err(|_| "database writer is unavailable".to_string())?
+        .save_codex_binary_override(Some(&path))?;
     *state
         .codex_binary_override
         .lock()
@@ -461,6 +489,28 @@ fn select_codex_executable(state: State<'_, AppState>) -> Result<RedactedSelecti
             message: "Selected".into(),
         },
     })
+}
+
+#[tauri::command]
+fn clear_discovery_overrides(state: State<'_, AppState>) -> Result<AppStatus, String> {
+    {
+        let mut database = state
+            .database
+            .lock()
+            .map_err(|_| "database writer is unavailable".to_string())?;
+        database.save_codex_home_override(None)?;
+        database.save_codex_binary_override(None)?;
+    }
+    *state
+        .codex_home_override
+        .lock()
+        .map_err(|_| "discovery state is unavailable".to_string())? = None;
+    *state
+        .codex_binary_override
+        .lock()
+        .map_err(|_| "discovery state is unavailable".to_string())? = None;
+    let reconciliation_failed = state.reconcile().is_err();
+    Ok(state.discover_status(reconciliation_failed))
 }
 
 #[tauri::command]
@@ -489,7 +539,7 @@ fn update_settings(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let state = AppState::new().expect("Nerfify could not initialize its local database");
+    let state = AppState::new().expect("NerfTrack could not initialize its local database");
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
@@ -506,11 +556,12 @@ pub fn run() {
             retry_detection,
             select_codex_home,
             select_codex_executable,
+            clear_discovery_overrides,
             get_settings,
             update_settings
         ])
         .run(tauri::generate_context!())
-        .expect("Nerfify runtime error");
+        .expect("NerfTrack runtime error");
 }
 
 #[cfg(test)]

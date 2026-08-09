@@ -4,6 +4,15 @@ dist/
 .vite/
 src-tauri/target/
 src-tauri/gen/
+.codex/
+.claude/
+.windsurf/
+.cursor/
+.harn/
+audit-output-*/
+.nerftrack/
+*.sqlite
+*.sqlite3
 *.db
 *.db-shm
 *.db-wal

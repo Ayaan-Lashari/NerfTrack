@@ -7,6 +7,7 @@ interface SetupViewProps {
   onChooseHome: () => void;
   onChooseExecutable: () => void;
   onRetry: () => void;
+  onResetDiscovery: () => void;
   onStart: () => void;
   onSettingChange: (key: keyof AppSettings, value: number | boolean) => void;
 }
@@ -24,7 +25,7 @@ const discoveryCards: Array<{
     icon: 'terminal',
     action: 'Choose executable',
   },
-  { key: 'appServer', title: 'App Server', icon: 'server', action: 'Test connection' },
+  { key: 'appServer', title: 'App Server (CLI only)', icon: 'server' },
 ];
 
 const settingsRows: Array<{
@@ -39,7 +40,7 @@ const settingsRows: Array<{
     key: 'refreshIntervalSeconds',
     icon: 'clock',
     title: 'Refresh interval',
-    description: 'How often Nerfify checks for new Codex usage.',
+    description: 'How often NerfTrack checks for new Codex usage.',
     options: [10, 20, 30],
     suffix: ' seconds',
   },
@@ -51,6 +52,7 @@ export function SetupView({
   onChooseHome,
   onChooseExecutable,
   onRetry,
+  onResetDiscovery,
   onStart,
   onSettingChange,
 }: SetupViewProps) {
@@ -59,7 +61,7 @@ export function SetupView({
   return (
     <section className="setup-page page-shell">
       <header className="page-heading">
-        <h1>Set up Nerfify</h1>
+        <h1>Set up NerfTrack</h1>
         <p>
           {guiMode
             ? 'Connect local Codex desktop data to estimate weekly API-equivalent value from tokens.'
@@ -70,17 +72,9 @@ export function SetupView({
         {discoveryCards.map((card) => {
           const discovery = status[card.key];
           const title =
-            card.key === 'codexExecutable' && guiMode
-              ? 'Codex CLI executable'
-              : card.key === 'appServer' && guiMode
-                ? 'App Server (CLI only)'
-                : card.title;
+            card.key === 'codexExecutable' && guiMode ? 'Codex CLI executable' : card.title;
           const label =
-            card.key === 'codexExecutable' && guiMode
-              ? 'Choose CLI executable'
-              : card.key === 'appServer' && guiMode
-                ? 'Use CLI instead'
-                : card.action;
+            card.key === 'codexExecutable' && guiMode ? 'Choose CLI executable' : card.action;
           const action =
             card.key === 'codexHome'
               ? onChooseHome
@@ -179,6 +173,9 @@ export function SetupView({
         <button className="secondary-button" onClick={onRetry}>
           <Icon name="refresh" size={21} />
           Retry detection
+        </button>
+        <button className="secondary-button" onClick={onResetDiscovery}>
+          Reset saved selections
         </button>
         <button className="help-button">
           <span className="help-circle">?</span>
