@@ -961,7 +961,12 @@ mod tests {
         let home = Path::new(r"C:\Users\Sample User");
         let path = Path::new(r"C:\Users\Sample User\AppData\Roaming\Codex (✓)");
         let redacted = redact_path_with_home(path, Some(home));
-        assert_eq!(redacted, "~/appdata/roaming/codex (✓)");
+        let expected = if cfg!(windows) {
+            "~/AppData/Roaming/Codex (✓)"
+        } else {
+            "~/appdata/roaming/codex (✓)"
+        };
+        assert_eq!(redacted, expected);
         assert!(!redacted.contains("Sample User"));
     }
 
