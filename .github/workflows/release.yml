@@ -98,7 +98,10 @@ jobs:
           set -euo pipefail
           bundle_dir="${ASSET_GLOB%/*}"
           bundle_pattern="${ASSET_GLOB##*/}"
-          mapfile -t matches < <(find "$bundle_dir" -maxdepth 1 -type f -name "$bundle_pattern" -print)
+          matches=()
+          while IFS= read -r -d '' match; do
+            matches[${#matches[@]}]="$match"
+          done < <(find "$bundle_dir" -maxdepth 1 -type f -name "$bundle_pattern" -print0)
           if [[ "${#matches[@]}" -ne 1 ]]; then
             printf 'Expected exactly one installer, found %s:\n' "${#matches[@]}" >&2
             printf '%s\n' "${matches[@]}" >&2
