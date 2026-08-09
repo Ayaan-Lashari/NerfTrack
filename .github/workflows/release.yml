@@ -18,26 +18,28 @@ jobs:
         include:
           - name: macOS ARM64
             os: macos-14
+            platform: macos
             rust_target: aarch64-apple-darwin
-            bundles: app,dmg
+            dmg_arch: aarch64
             bundle_path: 'src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg'
             asset_suffix: macos-arm64.dmg
           - name: macOS Intel x86_64
             os: macos-15-intel
+            platform: macos
             rust_target: x86_64-apple-darwin
-            bundles: app,dmg
+            dmg_arch: x86_64
             bundle_path: 'src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg'
             asset_suffix: macos-x86_64.dmg
           - name: Windows x64
             os: windows-latest
+            platform: windows
             rust_target: x86_64-pc-windows-msvc
-            bundles: nsis
             bundle_path: 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe'
             asset_suffix: windows-x64-setup.exe
           - name: Windows ARM64
             os: windows-11-arm
+            platform: windows
             rust_target: aarch64-pc-windows-msvc
-            bundles: nsis
             bundle_path: 'src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe'
             asset_suffix: windows-arm64-setup.exe
 
@@ -86,8 +88,63 @@ jobs:
           cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
           cargo test --manifest-path src-tauri/Cargo.toml
 
-      - name: Build unsigned installer
-        run: npm run tauri:build -- --target "${{ matrix.rust_target }}" --bundles "${{ matrix.bundles }}"
+      - name: Build macOS app bundle
+        if: matrix.platform == 'macos'
+        run: npm run tauri:build -- --target "${{ matrix.rust_target }}" --bundles app --no-sign
+
+      - name: Seal macOS app bundle
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_bundle="src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/NerfTrack.app"
+          test -d "$app_bundle"
+          /usr/bin/codesign --force --deep --sign - "$app_bundle"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_bundle"
+          test -f "$app_bundle/Contents/_CodeSignature/CodeResources"
+
+      - name: Create macOS DMG from sealed app
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          DMG_ARCH: ${{ matrix.dmg_arch }}
+        run: |
+          set -euo pipefail
+          app_bundle="src-tauri/target/${RUST_TARGET}/release/bundle/macos/NerfTrack.app"
+          dmg_dir="src-tauri/target/${RUST_TARGET}/release/bundle/dmg"
+          dmg_path="$dmg_dir/NerfTrack_${GITHUB_REF_NAME#v}_${DMG_ARCH}.dmg"
+          staging_dir="$(mktemp -d)"
+          test -d "$app_bundle"
+          mkdir -p "$dmg_dir"
+          /usr/bin/ditto "$app_bundle" "$staging_dir/NerfTrack.app"
+          ln -s /Applications "$staging_dir/Applications"
+          /usr/bin/hdiutil create \
+            -volname NerfTrack \
+            -srcfolder "$staging_dir" \
+            -ov \
+            -format UDZO \
+            "$dmg_path"
+          test -s "$dmg_path"
+
+      - name: Verify macOS DMG app signature
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          DMG_ARCH: ${{ matrix.dmg_arch }}
+        run: |
+          set -euo pipefail
+          dmg_path="src-tauri/target/${RUST_TARGET}/release/bundle/dmg/NerfTrack_${GITHUB_REF_NAME#v}_${DMG_ARCH}.dmg"
+          mount_dir="$(mktemp -d)"
+          trap 'hdiutil detach "$mount_dir" >/dev/null 2>&1 || true' EXIT
+          /usr/bin/hdiutil attach "$dmg_path" -readonly -nobrowse -mountpoint "$mount_dir" >/dev/null
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$mount_dir/NerfTrack.app"
+          test -f "$mount_dir/NerfTrack.app/Contents/_CodeSignature/CodeResources"
+
+      - name: Build Windows installer
+        if: matrix.platform == 'windows'
+        run: npm run tauri:build -- --target "${{ matrix.rust_target }}" --bundles nsis
 
       - name: Normalize architecture-specific artifact name
         shell: bash
