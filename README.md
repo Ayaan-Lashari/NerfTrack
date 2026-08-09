@@ -53,9 +53,12 @@ The application database is stored at the platform-native per-user application-d
 
 The database does not depend on the process working directory. No network service or telemetry is required.
 
+## License
+
+NerfTrack's original source code is licensed under the GNU General Public License v3.0 only. See [LICENSE](LICENSE). Third-party components retain their respective licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Current limitations
 
 - The CLI App Server supervisor module is retained as an unintegrated primitive. The status surface explicitly reports that supervision is unavailable in this release; desktop mode does not depend on it.
 - Native Windows builds and Windows ARM64 packaging are verified by the corresponding CI jobs rather than this macOS development machine.
 - Unsigned release artifacts are build outputs only. Signing, notarization, and installer publication require maintainer-controlled release credentials.
-- The project does not currently declare a license. A maintainer must select one before publication.

@@ -1,5 +1,7 @@
 # Third-party notices
 
+NerfTrack's original source code is licensed under GPL-3.0-only. This notice applies only to third-party components and does not change the license of NerfTrack's own source.
+
 ## ccusage
 
 NerfTrack adapts the minimum Codex parsing and pricing behavior from the pinned `ccusage` submodule at commit `31e084afbca3981af97ab6b55abe4f38f451bad4`. The relevant upstream project is MIT licensed. NerfTrack does not depend on the ccusage CLI, terminal reporting, or whole-directory polling implementation, and it does not modify the submodule.
