@@ -496,7 +496,7 @@ fn codex_file_name(path: &Path) -> bool {
             .filter(|extension| !matches!(extension.as_str(), ".bat" | ".cmd"))
             .any(|extension| {
                 name == format!("codex{extension}") || name == format!("codex-cli{extension}")
-            });
+            })
     }
     #[cfg(not(windows))]
     {
