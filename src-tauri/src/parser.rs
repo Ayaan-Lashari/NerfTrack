@@ -377,7 +377,7 @@ pub fn parse_jsonl_line_with_state(
                 &[&["limit_id"], &["limitId"], &["primary", "limit_id"]],
             )
         })
-        .or_else(|| Some("codex".into()).filter(|_| weekly_limit.is_some()));
+        .or_else(|| weekly_limit.is_some().then_some("codex".into()));
     let quota_used_percent = finite_f64(weekly_limit.and_then(|window| window.get("used_percent")));
     let quota_reset_at_ms = weekly_limit
         .and_then(|window| window.get("resets_at"))
