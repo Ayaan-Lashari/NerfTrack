@@ -828,6 +828,9 @@ impl Database {
     }
 
     fn restrict_directory_permissions(&self, directory: &Path) {
+        #[cfg(not(unix))]
+        let _ = directory;
+
         #[cfg(unix)]
         if let Ok(metadata) = fs::metadata(directory) {
             use std::os::unix::fs::PermissionsExt;

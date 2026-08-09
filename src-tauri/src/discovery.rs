@@ -92,6 +92,10 @@ fn redact_path_with_home(path: &Path, home: Option<&Path>) -> String {
     }
     let prefix = format!("{home_value}/");
     if let Some(suffix) = path_value.strip_prefix(&prefix) {
+        if cfg!(windows) {
+            let display_suffix = path_text.get(home_value.len() + 1..).unwrap_or(suffix);
+            return format!("~/{display_suffix}");
+        }
         return format!("~/{suffix}");
     }
     "local path redacted".into()
@@ -487,7 +491,7 @@ fn codex_file_name(path: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        return windows_executable_extensions()
+        windows_executable_extensions()
             .iter()
             .filter(|extension| !matches!(extension.as_str(), ".bat" | ".cmd"))
             .any(|extension| {
