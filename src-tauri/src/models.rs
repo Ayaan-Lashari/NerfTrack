@@ -306,6 +306,8 @@ pub struct AppSettings {
     pub telemetry: bool,
     pub auto_updater: bool,
     #[serde(default)]
+    pub starter_page_seen: bool,
+    #[serde(default)]
     pub custom_pricing: Vec<CustomPriceOverride>,
 }
 
@@ -347,6 +349,7 @@ impl Default for AppSettings {
             local_only: true,
             telemetry: false,
             auto_updater: false,
+            starter_page_seen: false,
             custom_pricing: Vec::new(),
         }
     }
@@ -367,4 +370,28 @@ impl AppSettings {
 pub struct RedactedSelection {
     pub selected: bool,
     pub status: DiscoveryStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppSettings;
+
+    #[test]
+    fn settings_from_before_the_starter_page_defaults_to_unseen() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "refreshIntervalSeconds": 10,
+                "reconciliationIntervalHours": 1,
+                "monitoringGapMinutes": 5,
+                "reducedMotion": false,
+                "appearance": "dark",
+                "currency": "USD",
+                "localOnly": true,
+                "telemetry": false,
+                "autoUpdater": false
+            }"#,
+        )
+        .expect("legacy settings should remain readable");
+        assert!(!settings.starter_page_seen);
+    }
 }

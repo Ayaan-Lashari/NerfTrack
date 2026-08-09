@@ -10,6 +10,7 @@ interface SettingsViewProps {
   onResetAllData: () => Promise<void>;
   onRestoreLastCheckpoint: () => Promise<void>;
   onImportAllData: () => Promise<void>;
+  onOpenStarterPage: () => void;
 }
 
 const advancedRows: Array<{
@@ -64,6 +65,7 @@ export function SettingsView({
   onResetAllData,
   onRestoreLastCheckpoint,
   onImportAllData,
+  onOpenStarterPage,
 }: SettingsViewProps) {
   const [dataAction, setDataAction] = useState<
     'idle' | 'resetting' | 'restoring-checkpoint' | 'importing-all'
@@ -198,7 +200,7 @@ export function SettingsView({
           </div>
           <div className="privacy-check">
             <Icon name="check" size={17} />
-            No auto-updater in V1
+            GitHub Releases checks stay opt-in to configuration
           </div>
           <div className="privacy-check">
             <Icon name="check" size={17} />
@@ -350,6 +352,20 @@ export function SettingsView({
         </div>
         <span className="algorithm-badge">Token estimator v3 · local API-equivalent pricing</span>
       </div>
+      <section className="panel starter-settings-panel" aria-labelledby="starter-settings-heading">
+        <div>
+          <span className="settings-kicker">Community</span>
+          <h2 id="starter-settings-heading">Starter page</h2>
+          <p>
+            Reopen the GitHub support page any time. NerfTrack will remember that you have seen it
+            again after you continue.
+          </p>
+        </div>
+        <button type="button" className="data-action-button" onClick={onOpenStarterPage}>
+          <Icon name="refresh" size={15} />
+          Open starter page again
+        </button>
+      </section>
       <section className="panel data-management-panel" aria-labelledby="data-management-heading">
         <div className="panel-heading">
           <Icon name="history" size={23} />

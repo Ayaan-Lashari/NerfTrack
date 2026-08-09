@@ -35,6 +35,21 @@ describe('NerfTrack app shell', () => {
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
 
+  it('keeps the GitHub update control and starter page accessible from settings', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByRole('button', { name: 'Up to date' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Open starter page again' }));
+
+    expect(screen.getByRole('heading', { name: 'Help NerfTrack keep going.' })).toBeInTheDocument();
+    expect(screen.getByText('Let the resets continue')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Star NerfTrack on GitHub/ })).not.toBeDisabled();
+    expect(screen.queryByRole('button', { name: /skip/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/follow on X/i)).not.toBeInTheDocument();
+  });
+
   it('offers fast checkpoint restore and a separate full log import', async () => {
     const user = userEvent.setup();
     render(<App />);

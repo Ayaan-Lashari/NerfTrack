@@ -15,6 +15,7 @@ import { MetricCard, UsageRing } from './components/MetricCard';
 import { SetupView } from './components/SetupView';
 import { SettingsView } from './components/SettingsView';
 import { SideNav } from './components/SideNav';
+import { StarterPage } from './components/StarterPage';
 import { UsageChart } from './components/UsageChart';
 import {
   getAnnotations,
@@ -34,7 +35,16 @@ import {
   updateSettings,
 } from './lib/commands';
 import { demoQuote, demoStatus } from './lib/fixtures';
+import { GITHUB_REPOSITORY_URL } from './lib/config';
+import {
+  checkForUpdate,
+  CURRENT_APP_VERSION,
+  downloadUpdate,
+  initialUpdateState,
+  installUpdate,
+} from './lib/updater';
 import type { Annotation, DiagnosticsSummary, HistoryResponse } from './domain';
+import type { UpdateCheckResult, UpdateState } from './domain';
 
 const ranges: Range[] = ['1D', '1W', '1M', '3M', '6M'];
 const rangeLabels: Record<Range, string> = {
@@ -159,6 +169,25 @@ function LiveRefreshStatus() {
       {' · data 10s'}
     </span>
   );
+}
+
+function updateStateFromResult(result: UpdateCheckResult): UpdateState {
+  return {
+    status: result.updateAvailable
+      ? 'available'
+      : !GITHUB_REPOSITORY_URL
+        ? 'not-configured'
+        : 'up-to-date',
+    currentVersion: result.currentVersion,
+    latestVersion: result.latestVersion,
+    releaseUrl: result.releaseUrl,
+    assetName: result.assetName,
+    message: result.message,
+  };
+}
+
+function errorMessage(cause: unknown) {
+  return cause instanceof Error ? cause.message : String(cause);
 }
 
 function RangeSelector({ range, onChange }: { range: Range; onChange: (range: Range) => void }) {
@@ -405,6 +434,9 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [loadError, setLoadError] = useState(false);
+  const [starterPageVisible, setStarterPageVisible] = useState(false);
+  const [updateState, setUpdateState] = useState<UpdateState>(initialUpdateState);
+  const updateInFlight = useRef(false);
 
   const refresh = useCallback(async (requestedRange?: Range) => {
     if (refreshInFlight.current) return;
@@ -462,6 +494,82 @@ export default function App() {
     void refresh();
   }, [refresh]);
 
+  const checkForUpdates = useCallback(async () => {
+    if (updateInFlight.current) return;
+    updateInFlight.current = true;
+    setUpdateState((current) => ({
+      ...current,
+      status: 'checking',
+      message: 'Checking GitHub Releases for the latest NerfTrack build…',
+    }));
+    try {
+      const result = await checkForUpdate(GITHUB_REPOSITORY_URL);
+      setUpdateState(updateStateFromResult(result));
+    } catch (cause) {
+      setUpdateState((current) => ({
+        ...current,
+        status: 'failed',
+        message: errorMessage(cause),
+      }));
+    } finally {
+      updateInFlight.current = false;
+    }
+  }, []);
+
+  const handleUpdate = useCallback(async () => {
+    if (updateInFlight.current) return;
+    if (updateState.status !== 'available') {
+      await checkForUpdates();
+      return;
+    }
+    if (!updateState.assetName) {
+      setUpdateState((current) => ({
+        ...current,
+        status: 'failed',
+        message: 'A newer release exists, but it has no compatible Windows or macOS asset.',
+      }));
+      return;
+    }
+    updateInFlight.current = true;
+    setUpdateState((current) => ({
+      ...current,
+      status: 'downloading',
+      message: `Downloading ${current.assetName}…`,
+    }));
+    try {
+      const downloaded = await downloadUpdate(GITHUB_REPOSITORY_URL);
+      setUpdateState((current) => ({
+        ...current,
+        status: 'installing',
+        latestVersion: downloaded.version,
+        assetName: downloaded.assetName,
+        message: 'Download complete. Launching the safe installer…',
+      }));
+      const installed = await installUpdate(downloaded.path);
+      setUpdateState((current) => ({
+        ...current,
+        status: 'installing',
+        message: installed.message,
+      }));
+    } catch (cause) {
+      setUpdateState((current) => ({
+        ...current,
+        status: 'failed',
+        message: errorMessage(cause),
+      }));
+    } finally {
+      updateInFlight.current = false;
+    }
+  }, [checkForUpdates, updateState]);
+
+  useEffect(() => {
+    void checkForUpdates();
+  }, [checkForUpdates]);
+
+  useEffect(() => {
+    if (settings && !settings.starterPageSeen) setStarterPageVisible(true);
+  }, [settings]);
+
   useEffect(() => {
     const timer = window.setInterval(
       () => void refresh(),
@@ -515,6 +623,16 @@ export default function App() {
       throw new Error('save failed');
     }
   };
+
+  const handleStarterPageComplete = async () => {
+    if (!settings) return;
+    const nextSettings = { ...settings, starterPageSeen: true };
+    const savedSettings = await updateSettings(nextSettings);
+    setSettings(savedSettings);
+    setStarterPageVisible(false);
+  };
+
+  const handleOpenStarterPage = () => setStarterPageVisible(true);
 
   const handleResetAllData = async () => {
     await resetAllData();
@@ -615,6 +733,7 @@ export default function App() {
     localOnly: true as const,
     telemetry: false as const,
     autoUpdater: false as const,
+    starterPageSeen: true,
     customPricing: [],
   };
 
@@ -675,6 +794,7 @@ export default function App() {
             onResetAllData={handleResetAllData}
             onRestoreLastCheckpoint={handleRestoreLastCheckpoint}
             onImportAllData={handleImportAllData}
+            onOpenStarterPage={handleOpenStarterPage}
           />
         );
       default:
@@ -702,9 +822,24 @@ export default function App() {
     }
   };
 
+  if (starterPageVisible && settings) {
+    return (
+      <StarterPage
+        version={updateState.currentVersion || CURRENT_APP_VERSION}
+        onComplete={handleStarterPageComplete}
+      />
+    );
+  }
+
   return (
     <div className="app-window">
-      <SideNav active={active} status={status} onNavigate={setActive} />
+      <SideNav
+        active={active}
+        status={status}
+        onNavigate={setActive}
+        updateState={updateState}
+        onUpdate={() => void handleUpdate()}
+      />
       <main className="app-content">
         {loadError && (
           <div className="global-error" role="alert">

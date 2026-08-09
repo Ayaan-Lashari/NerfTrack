@@ -7,6 +7,7 @@ pub mod estimator;
 pub mod models;
 pub mod parser;
 pub mod storage;
+pub mod updater;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -558,7 +559,11 @@ pub fn run() {
             select_codex_executable,
             clear_discovery_overrides,
             get_settings,
-            update_settings
+            update_settings,
+            updater::check_for_update,
+            updater::download_update,
+            updater::install_update,
+            updater::open_external_url
         ])
         .run(tauri::generate_context!())
         .expect("NerfTrack runtime error");

@@ -1,0 +1,165 @@
+name: Release installers
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS ARM64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            bundles: app,dmg
+            bundle_path: 'src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg'
+            asset_suffix: macos-arm64.dmg
+          - name: macOS Intel x86_64
+            os: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            bundles: app,dmg
+            bundle_path: 'src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg'
+            asset_suffix: macos-x86_64.dmg
+          - name: Windows x64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            bundles: nsis
+            bundle_path: 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe'
+            asset_suffix: windows-x64-setup.exe
+          - name: Windows ARM64
+            os: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            bundles: nsis
+            bundle_path: 'src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe'
+            asset_suffix: windows-arm64-setup.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable, checked 2026-07-23
+        with:
+          toolchain: stable
+          target: ${{ matrix.rust_target }}
+          components: rustfmt, clippy
+
+      - name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          node -e "const fs=require('fs'); const version=process.argv[1]; const packageJson=JSON.parse(fs.readFileSync('package.json')); const tauri=JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json')); if (packageJson.version !== version || tauri.version !== version) { console.error({tag: version, package: packageJson.version, tauri: tauri.version}); process.exit(1); }" "$version"
+          cargo_version="$(awk '/^name = "nerftrack"$/{found=1; next} found && /^version = /{print $3; exit}' src-tauri/Cargo.lock | tr -d '"')"
+          test "$cargo_version" = "$version"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend gates
+        run: |
+          npm run format:check
+          npm run lint
+          npm run typecheck
+          npm test -- --run
+          npm run build
+
+      - name: Rust gates
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build unsigned installer
+        run: npm run tauri:build -- --target "${{ matrix.rust_target }}" --bundles "${{ matrix.bundles }}"
+
+      - name: Normalize architecture-specific artifact name
+        shell: bash
+        env:
+          ASSET_GLOB: ${{ matrix.bundle_path }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+        run: |
+          set -euo pipefail
+          bundle_dir="${ASSET_GLOB%/*}"
+          bundle_pattern="${ASSET_GLOB##*/}"
+          mapfile -t matches < <(find "$bundle_dir" -maxdepth 1 -type f -name "$bundle_pattern" -print)
+          if [[ "${#matches[@]}" -ne 1 ]]; then
+            printf 'Expected exactly one installer, found %s:\n' "${#matches[@]}" >&2
+            printf '%s\n' "${matches[@]}" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p release
+          cp "${matches[0]}" "release/NerfTrack-${version}-${ASSET_SUFFIX}"
+          test -s "release/NerfTrack-${version}-${ASSET_SUFFIX}"
+
+      - name: Check patch whitespace
+        run: git diff --check
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.asset_suffix }}
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all architecture artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify complete artifact set
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          expected=(
+            "release/NerfTrack-${version}-macos-arm64.dmg"
+            "release/NerfTrack-${version}-macos-x86_64.dmg"
+            "release/NerfTrack-${version}-windows-x64-setup.exe"
+            "release/NerfTrack-${version}-windows-arm64-setup.exe"
+          )
+          for artifact in "${expected[@]}"; do
+            test -s "$artifact"
+          done
+          actual_count="$(find release -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          test "$actual_count" = "4"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "NerfTrack ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi

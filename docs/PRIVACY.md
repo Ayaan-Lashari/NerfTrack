@@ -1,6 +1,6 @@
 # Privacy model
 
-NerfTrack is local-only by default. It has no telemetry, cloud sync, auto-updater, system tray, or remote account service in V1.
+NerfTrack is local-only by default. It has no telemetry, cloud sync, system tray, or remote account service. The public release configures an optional GitHub Releases updater to check the maintainer's public repository and download release packages; development builds and forks can leave that repository URL empty.
 
 Stored values are aggregate measurements: token counts, normalized model IDs, explicit logged-credit or logged-charge status, quota percentages and reset metadata, timestamps, checkpoints, algorithm versions, and aggregate diagnostic reasons. Raw prompts, code, JSONL lines, account email addresses, raw identifiers, and complete local paths are not returned through DTOs.
 

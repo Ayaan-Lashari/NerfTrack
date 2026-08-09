@@ -41,7 +41,7 @@ Pull requests should:
 - include UI screenshots only when they contain sanitized fixture data; and
 - leave the working tree free of unrelated formatting or generated changes.
 
-CI must pass before merge. Windows ARM64 is currently an experimental, non-blocking preview job; macOS ARM64, macOS Intel x86_64, and Windows Intel x86_64 are the blocking release targets.
+CI must pass before merge. Pull-request CI may keep the Windows ARM64 preview job non-blocking while GitHub runner availability varies, but the tagged release workflow requires successful macOS ARM64, macOS Intel x86_64, Windows x64, and Windows ARM64 builds before publishing any release.
 
 ## Local quality gates
 
@@ -63,7 +63,7 @@ For changes that affect native packaging, also run `npm run tauri:build` on the 
 
 ## Cross-platform development
 
-The blocking release targets are macOS ARM64 and Intel x86_64, and Windows Intel x86_64. Windows ARM64 is an experimental preview target with a non-blocking CI job. Linux packaging and Linux CI are intentionally out of scope for this release.
+The blocking release targets are macOS ARM64 and Intel x86_64, and Windows x64 and ARM64. Linux packaging and Linux CI are intentionally out of scope for this release.
 
 When changing native or filesystem behavior:
 

@@ -23,3 +23,16 @@ audit-output-*/
 coverage/
 playwright-report/
 test-results/
+
+# Release packages and native packaging output
+release/
+artifacts/
+*.app/
+*.dmg
+*.msi
+*.pkg
+*.exe
+*.pdb
+*.dSYM/
+*.zip
+*.tar.gz

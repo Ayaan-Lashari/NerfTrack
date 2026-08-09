@@ -12,6 +12,16 @@ export type AppStatusState =
 
 export type NavKey = 'home' | 'setup' | 'diagnostics' | 'history' | 'settings';
 
+export type UpdateStatus =
+  | 'idle'
+  | 'not-configured'
+  | 'checking'
+  | 'up-to-date'
+  | 'available'
+  | 'downloading'
+  | 'installing'
+  | 'failed';
+
 export interface DiscoveryStatus {
   state: 'auto_detected' | 'selected' | 'missing' | 'unsupported' | 'redacted' | 'not_required';
   redactedLocation: string | null;
@@ -119,6 +129,7 @@ export interface AppSettings extends AdvancedSettings {
   localOnly: true;
   telemetry: false;
   autoUpdater: false;
+  starterPageSeen: boolean;
   customPricing: Array<CustomPriceOverride>;
 }
 
@@ -133,4 +144,33 @@ export interface CustomPriceOverride {
 export interface RedactedSelection {
   selected: boolean;
   status: DiscoveryStatus;
+}
+
+export interface UpdateCheckResult {
+  currentVersion: string;
+  latestVersion: string | null;
+  updateAvailable: boolean;
+  releaseUrl: string | null;
+  assetName: string | null;
+  assetUrl: string | null;
+  message: string;
+}
+
+export interface DownloadedUpdate {
+  version: string;
+  assetName: string;
+  path: string;
+}
+
+export interface InstallUpdateResult {
+  message: string;
+}
+
+export interface UpdateState {
+  status: UpdateStatus;
+  currentVersion: string;
+  latestVersion: string | null;
+  releaseUrl: string | null;
+  assetName: string | null;
+  message: string;
 }
