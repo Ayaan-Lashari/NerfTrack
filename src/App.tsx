@@ -543,7 +543,7 @@ export default function App() {
         status: 'installing',
         latestVersion: downloaded.version,
         assetName: downloaded.assetName,
-        message: 'Download complete. Launching the safe installer…',
+        message: 'Download complete. Applying the update and restarting NerfTrack…',
       }));
       const installed = await installUpdate(downloaded.path);
       setUpdateState((current) => ({
