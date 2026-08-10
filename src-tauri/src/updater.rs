@@ -530,6 +530,9 @@ pub fn install_update(path: String) -> Result<InstallUpdateResult, String> {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let pending_update = crate::storage::data_directory()?.join(".pending-update");
+    std::fs::write(&pending_update, b"update requested")
+        .map_err(|_| "could not record the pending NerfTrack update".to_string())?;
     launch_installer(&path, &extension)
 }
 

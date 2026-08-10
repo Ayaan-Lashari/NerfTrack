@@ -308,6 +308,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub starter_page_seen: bool,
     #[serde(default)]
+    pub installation_marker: String,
+    #[serde(default)]
     pub custom_pricing: Vec<CustomPriceOverride>,
 }
 
@@ -350,12 +352,21 @@ impl Default for AppSettings {
             telemetry: false,
             auto_updater: false,
             starter_page_seen: false,
+            installation_marker: String::new(),
             custom_pricing: Vec::new(),
         }
     }
 }
 
 impl AppSettings {
+    pub fn should_reset_starter_page_for_reinstall(
+        &self,
+        current_installation_marker: &str,
+    ) -> bool {
+        !self.installation_marker.is_empty()
+            && self.installation_marker != current_installation_marker
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.advanced.validate()?;
         for price in &self.custom_pricing {
@@ -393,5 +404,18 @@ mod tests {
         )
         .expect("legacy settings should remain readable");
         assert!(!settings.starter_page_seen);
+        assert!(settings.installation_marker.is_empty());
+    }
+
+    #[test]
+    fn a_reinstall_marker_change_resets_starter_page() {
+        let settings = AppSettings {
+            starter_page_seen: true,
+            installation_marker: "old-install".into(),
+            ..AppSettings::default()
+        };
+
+        assert!(settings.should_reset_starter_page_for_reinstall("new-install"));
+        assert!(!settings.should_reset_starter_page_for_reinstall("old-install"));
     }
 }

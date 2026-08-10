@@ -126,6 +126,7 @@ export const demoSettings: AppSettings = {
   telemetry: false,
   autoUpdater: false,
   starterPageSeen: true,
+  installationMarker: '',
   customPricing: [],
 };
 

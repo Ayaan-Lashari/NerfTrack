@@ -130,6 +130,7 @@ export interface AppSettings extends AdvancedSettings {
   telemetry: false;
   autoUpdater: false;
   starterPageSeen: boolean;
+  installationMarker: string;
   customPricing: Array<CustomPriceOverride>;
 }
 

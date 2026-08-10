@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-The current release line is **0.5.0**. Security triage and fixes target the latest tagged release and the current development branch. Development builds and unsupported platforms are not covered by a support commitment.
+The current release line is **0.5.1**. Security triage and fixes target the latest tagged release and the current development branch. Development builds and unsupported platforms are not covered by a support commitment.
 
 NerfTrack currently targets macOS (ARM64 and Intel x86_64) and Windows (x64 and ARM64). Linux packaging is out of scope for this release. Windows ARM64 builds depend on the public `windows-11-arm` GitHub-hosted runner and are not published unless that target completes successfully.
 

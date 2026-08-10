@@ -734,6 +734,7 @@ export default function App() {
     telemetry: false as const,
     autoUpdater: false as const,
     starterPageSeen: true,
+    installationMarker: '',
     customPricing: [],
   };
 

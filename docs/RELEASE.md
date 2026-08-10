@@ -8,14 +8,14 @@ Signing and notarization are secret-driven release steps and are not part of pul
 
 ## Release workflow
 
-Push a semver tag such as `v0.5.0`. The workflow validates that the tag matches the application manifests, runs the existing frontend and Rust gates, builds with Tauri's native target, normalizes the output names, and creates one GitHub Release only after all four jobs succeed.
+Push a semver tag such as `v0.5.1`. The workflow validates that the tag matches the application manifests, runs the existing frontend and Rust gates, builds with Tauri's native target, normalizes the output names, and creates one GitHub Release only after all four jobs succeed.
 
 The exact asset names are:
 
-- `NerfTrack-0.5.0-macos-arm64.dmg`
-- `NerfTrack-0.5.0-macos-x86_64.dmg`
-- `NerfTrack-0.5.0-windows-x64-setup.exe`
-- `NerfTrack-0.5.0-windows-arm64-setup.exe`
+- `NerfTrack-0.5.1-macos-arm64.dmg`
+- `NerfTrack-0.5.1-macos-x86_64.dmg`
+- `NerfTrack-0.5.1-windows-x64-setup.exe`
+- `NerfTrack-0.5.1-windows-arm64-setup.exe`
 
 The workflow uploads unsigned artifacts. Code signing, macOS notarization, and any signing credentials remain outside the repository and are not required for the public build workflow.
 

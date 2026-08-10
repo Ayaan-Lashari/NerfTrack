@@ -9,8 +9,10 @@ pub mod parser;
 pub mod storage;
 pub mod updater;
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
 use tauri::State;
 
@@ -36,7 +38,34 @@ impl AppState {
             codex_binary_override: Mutex::new(overrides.codex_binary),
             collection_paused: Mutex::new(false),
         };
+        state.sync_installation_state()?;
         Ok(state)
+    }
+
+    fn sync_installation_state(&self) -> Result<(), String> {
+        let current_marker = installation_marker()?;
+        let pending_update = storage::data_directory()?.join(".pending-update");
+        let update_was_requested = pending_update.is_file();
+        if update_was_requested {
+            let _ = fs::remove_file(&pending_update);
+        }
+        let mut database = self
+            .database
+            .lock()
+            .map_err(|_| "database writer is unavailable".to_string())?;
+        let mut settings = database.load_settings()?;
+        let marker_changed = settings.installation_marker != current_marker;
+        let reset_starter_page = !update_was_requested
+            && settings.should_reset_starter_page_for_reinstall(&current_marker);
+
+        if reset_starter_page {
+            settings.starter_page_seen = false;
+        }
+        if marker_changed || reset_starter_page {
+            settings.installation_marker = current_marker;
+            database.save_settings(&settings)?;
+        }
+        Ok(())
     }
 
     fn reconcile(&self) -> Result<(), String> {
@@ -219,6 +248,32 @@ impl AppState {
             data_quality,
         }
     }
+}
+
+fn installation_marker() -> Result<String, String> {
+    let executable = std::env::current_exe()
+        .map_err(|_| "unable to determine the installed NerfTrack executable".to_string())?;
+    let metadata = fs::metadata(&executable)
+        .map_err(|_| "unable to inspect the installed NerfTrack executable".to_string())?;
+    let created = metadata
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|time| time.as_nanos().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|time| time.as_nanos().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    Ok(format!(
+        "{}:{}:{}:{}",
+        executable.display(),
+        created,
+        modified,
+        metadata.len()
+    ))
 }
 
 fn collection_status(
