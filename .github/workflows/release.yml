@@ -4,9 +4,19 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing semver tag to rebuild from this workflow's ref
+        required: true
+        default: v0.5.0
+        type: string
 
 permissions:
   contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 jobs:
   build:
@@ -66,7 +76,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           node -e "const fs=require('fs'); const version=process.argv[1]; const packageJson=JSON.parse(fs.readFileSync('package.json')); const tauri=JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json')); if (packageJson.version !== version || tauri.version !== version) { console.error({tag: version, package: packageJson.version, tauri: tauri.version}); process.exit(1); }" "$version"
           cargo_version="$(awk '/^name = "nerftrack"$/{found=1; next} found && /^version = /{print $3; exit}' src-tauri/Cargo.lock | tr -d '"')"
           test "$cargo_version" = "$version"
@@ -113,7 +123,7 @@ jobs:
           set -euo pipefail
           app_bundle="src-tauri/target/${RUST_TARGET}/release/bundle/macos/NerfTrack.app"
           dmg_dir="src-tauri/target/${RUST_TARGET}/release/bundle/dmg"
-          dmg_path="$dmg_dir/NerfTrack_${GITHUB_REF_NAME#v}_${DMG_ARCH}.dmg"
+          dmg_path="$dmg_dir/NerfTrack_${RELEASE_TAG#v}_${DMG_ARCH}.dmg"
           staging_dir="$(mktemp -d)"
           test -d "$app_bundle"
           mkdir -p "$dmg_dir"
@@ -135,7 +145,7 @@ jobs:
           DMG_ARCH: ${{ matrix.dmg_arch }}
         run: |
           set -euo pipefail
-          dmg_path="src-tauri/target/${RUST_TARGET}/release/bundle/dmg/NerfTrack_${GITHUB_REF_NAME#v}_${DMG_ARCH}.dmg"
+          dmg_path="src-tauri/target/${RUST_TARGET}/release/bundle/dmg/NerfTrack_${RELEASE_TAG#v}_${DMG_ARCH}.dmg"
           mount_dir="$(mktemp -d)"
           trap 'hdiutil detach "$mount_dir" >/dev/null 2>&1 || true' EXIT
           /usr/bin/hdiutil attach "$dmg_path" -readonly -nobrowse -mountpoint "$mount_dir" >/dev/null
@@ -164,7 +174,7 @@ jobs:
             printf '%s\n' "${matches[@]}" >&2
             exit 1
           fi
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           mkdir -p release
           cp "${matches[0]}" "release/NerfTrack-${version}-${ASSET_SUFFIX}"
           test -s "release/NerfTrack-${version}-${ASSET_SUFFIX}"
@@ -197,7 +207,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           expected=(
             "release/NerfTrack-${version}-macos-arm64.dmg"
             "release/NerfTrack-${version}-macos-x86_64.dmg"
@@ -215,11 +225,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" release/* \
+            gh release create "$RELEASE_TAG" release/* \
               --repo "$GITHUB_REPOSITORY" \
-              --title "NerfTrack ${GITHUB_REF_NAME}" \
+              --title "NerfTrack ${RELEASE_TAG}" \
               --generate-notes
           fi
