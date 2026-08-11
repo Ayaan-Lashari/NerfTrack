@@ -7,8 +7,6 @@ interface SetupViewProps {
   onChooseHome: () => void;
   onChooseExecutable: () => void;
   onRetry: () => void;
-  onResetDiscovery: () => void;
-  onStart: () => void;
   onSettingChange: (key: keyof AppSettings, value: number | boolean) => void;
 }
 
@@ -52,8 +50,6 @@ export function SetupView({
   onChooseHome,
   onChooseExecutable,
   onRetry,
-  onResetDiscovery,
-  onStart,
   onSettingChange,
 }: SetupViewProps) {
   const guiMode = status.integrationMode === 'gui';
@@ -166,24 +162,9 @@ export function SetupView({
         </span>
       </div>
       <div className="setup-actions">
-        <button className="primary-button" onClick={onStart}>
-          <Icon name="play" size={21} />
-          Start monitoring
-        </button>
         <button className="secondary-button" onClick={onRetry}>
           <Icon name="refresh" size={21} />
           Retry detection
-        </button>
-        <button className="secondary-button" onClick={onResetDiscovery}>
-          Reset saved selections
-        </button>
-        <button className="help-button">
-          <span className="help-circle">?</span>
-          <span>
-            <strong>Need help?</strong>
-            <small>View troubleshooting guide</small>
-          </span>
-          <Icon name="external" size={17} />
         </button>
       </div>
     </section>

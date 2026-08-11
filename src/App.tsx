@@ -19,7 +19,6 @@ import { StarterPage } from './components/StarterPage';
 import { UsageChart } from './components/UsageChart';
 import {
   getAnnotations,
-  clearDiscoveryOverrides,
   getCurrentQuote,
   getCurrentStatus,
   getDiagnosticsSummary,
@@ -696,15 +695,6 @@ export default function App() {
     }
   };
 
-  const handleResetDiscovery = async () => {
-    try {
-      setStatus(await clearDiscoveryOverrides());
-      await refresh();
-    } catch {
-      setLoadError(true);
-    }
-  };
-
   const displayHistory = useMemo(
     () =>
       history ?? {
@@ -755,8 +745,6 @@ export default function App() {
             onChooseHome={handleChooseHome}
             onChooseExecutable={handleChooseExecutable}
             onRetry={runDetection}
-            onResetDiscovery={handleResetDiscovery}
-            onStart={runDetection}
             onSettingChange={handleSettingChange}
           />
         );

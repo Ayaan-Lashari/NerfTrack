@@ -18,6 +18,12 @@ describe('NerfTrack app shell', () => {
     render(<App />);
     await user.click(await screen.findByRole('button', { name: 'Setup' }));
     expect(screen.getByText('Set up NerfTrack')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry detection' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Start monitoring' })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Reset saved selections' }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Need help/i })).not.toBeInTheDocument();
     const refreshSelect = screen.getByLabelText('Refresh interval');
     await user.selectOptions(refreshSelect, '20');
     expect(refreshSelect).toHaveValue('20');

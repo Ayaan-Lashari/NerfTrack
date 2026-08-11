@@ -59,7 +59,7 @@ svg:focus-visible {
 .app-window {
   display: flex;
   min-height: 100vh;
-  overflow: hidden;
+  overflow: visible;
   background: var(--bg);
 }
 .app-content {
@@ -363,12 +363,17 @@ svg:focus-visible {
 }
 
 .side-nav {
-  position: relative;
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
   width: 264px;
   flex: 0 0 264px;
   flex-direction: column;
+  height: 100vh;
+  max-height: 100vh;
   min-height: 100vh;
+  overflow-y: auto;
   padding: 0 19px;
   background: linear-gradient(180deg, #11171e 0%, #10151b 100%);
   border-right: 1px solid rgba(141, 157, 171, 0.12);
@@ -2153,8 +2158,13 @@ p {
     display: block;
   }
   .side-nav {
+    position: sticky;
+    top: 0;
     width: 100%;
+    height: auto;
+    max-height: none;
     min-height: auto;
+    overflow: visible;
     padding: 0 14px;
     border-right: 0;
     border-bottom: 1px solid var(--border-soft);
