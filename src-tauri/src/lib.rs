@@ -11,8 +11,9 @@ pub mod storage;
 pub mod updater;
 
 use std::fs;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::UNIX_EPOCH;
 
 use tauri::State;
@@ -22,29 +23,176 @@ use crate::models::{
     DiscoveryStatus, IntegrationMode, Range, RedactedSelection,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackgroundPhase {
+    Initializing,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+struct BackgroundSnapshot {
+    phase: BackgroundPhase,
+    reconciliation_in_flight: bool,
+    last_reconciliation_failed: bool,
+}
+
+struct BackgroundWork {
+    phase: BackgroundPhase,
+    reconciliation_in_flight: bool,
+    last_reconciliation_failed: bool,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 pub struct AppState {
-    pub database: Mutex<storage::Database>,
+    pub database: Arc<Mutex<storage::Database>>,
     codex_home_override: Mutex<Option<PathBuf>>,
     codex_binary_override: Mutex<Option<PathBuf>>,
     collection_paused: Mutex<bool>,
+    settings: Mutex<AppSettings>,
+    background: Arc<Mutex<BackgroundWork>>,
 }
 
 impl AppState {
     fn new() -> Result<Self, String> {
-        let mut database = storage::Database::open()?;
-        // Pricing refresh is best-effort: Database::open has already loaded the
-        // last valid local snapshot and built-in fallback rates remain available
-        // when models.dev is offline or temporarily unavailable.
-        let _ = database.refresh_models_dev_pricing();
+        let database = storage::Database::open()?;
         let overrides = database.load_discovery_overrides()?;
         let state = Self {
-            database: Mutex::new(database),
+            database: Arc::new(Mutex::new(database)),
             codex_home_override: Mutex::new(overrides.codex_home),
             codex_binary_override: Mutex::new(overrides.codex_binary),
             collection_paused: Mutex::new(false),
+            settings: Mutex::new(AppSettings::default()),
+            background: Arc::new(Mutex::new(BackgroundWork {
+                phase: BackgroundPhase::Initializing,
+                reconciliation_in_flight: false,
+                last_reconciliation_failed: false,
+            })),
         };
         state.sync_installation_state()?;
+        let settings = state
+            .database
+            .lock()
+            .map_err(|_| "database reader is unavailable".to_string())?
+            .load_settings()?;
+        *state
+            .settings
+            .lock()
+            .map_err(|_| "settings state is unavailable".to_string())? = settings;
+        state.start_background_initialization();
         Ok(state)
+    }
+
+    fn background_snapshot(&self) -> BackgroundSnapshot {
+        self.background
+            .lock()
+            .map(|work| BackgroundSnapshot {
+                phase: work.phase,
+                reconciliation_in_flight: work.reconciliation_in_flight,
+                last_reconciliation_failed: work.last_reconciliation_failed,
+            })
+            .unwrap_or(BackgroundSnapshot {
+                phase: BackgroundPhase::Failed,
+                reconciliation_in_flight: false,
+                last_reconciliation_failed: true,
+            })
+    }
+
+    fn start_background_initialization(&self) {
+        let database = Arc::clone(&self.database);
+        let background = Arc::clone(&self.background);
+        let home_override = self
+            .codex_home_override
+            .lock()
+            .ok()
+            .and_then(|path| path.clone());
+        let spawn_result = thread::Builder::new()
+            .name("nerftrack-background-init".into())
+            .spawn(move || {
+                let result = (|| {
+                    database
+                        .lock()
+                        .map_err(|_| "database writer is unavailable".to_string())?
+                        .initialize_background()?;
+                    Self::reconcile_with_database(&database, home_override.as_deref())
+                })();
+                if let Ok(mut work) = background.lock() {
+                    work.phase = if result.is_ok() {
+                        BackgroundPhase::Ready
+                    } else {
+                        BackgroundPhase::Failed
+                    };
+                    work.last_reconciliation_failed = result.is_err();
+                }
+            });
+        if spawn_result.is_err() {
+            if let Ok(mut work) = self.background.lock() {
+                work.phase = BackgroundPhase::Failed;
+                work.last_reconciliation_failed = true;
+            }
+        }
+    }
+
+    fn request_background_reconcile(&self) {
+        if self
+            .collection_paused
+            .lock()
+            .map(|paused| *paused)
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let home_override = self
+            .codex_home_override
+            .lock()
+            .ok()
+            .and_then(|path| path.clone());
+        let Ok(mut work) = self.background.lock() else {
+            return;
+        };
+        if work.phase == BackgroundPhase::Initializing || work.reconciliation_in_flight {
+            return;
+        }
+        let reinitialize = work.phase == BackgroundPhase::Failed;
+        if reinitialize {
+            work.phase = BackgroundPhase::Initializing;
+        }
+        work.reconciliation_in_flight = true;
+        let database = Arc::clone(&self.database);
+        let background = Arc::clone(&self.background);
+        let spawn_result = thread::Builder::new()
+            .name("nerftrack-background-reconcile".into())
+            .spawn(move || {
+                let result = (|| {
+                    if reinitialize {
+                        database
+                            .lock()
+                            .map_err(|_| "database writer is unavailable".to_string())?
+                            .initialize_background()?;
+                    }
+                    Self::reconcile_with_database(&database, home_override.as_deref())
+                })();
+                if let Ok(mut work) = background.lock() {
+                    work.phase = if result.is_ok() {
+                        BackgroundPhase::Ready
+                    } else {
+                        BackgroundPhase::Failed
+                    };
+                    work.reconciliation_in_flight = false;
+                    work.last_reconciliation_failed = result.is_err();
+                }
+            });
+        if spawn_result.is_err() {
+            work.phase = BackgroundPhase::Failed;
+            work.reconciliation_in_flight = false;
+            work.last_reconciliation_failed = true;
+        }
     }
 
     fn sync_installation_state(&self) -> Result<(), String> {
@@ -73,29 +221,22 @@ impl AppState {
         Ok(())
     }
 
-    fn reconcile(&self) -> Result<(), String> {
-        if *self
-            .collection_paused
-            .lock()
-            .map_err(|_| "collection state is unavailable".to_string())?
-        {
-            return Ok(());
-        }
-        let home_override = self
-            .codex_home_override
-            .lock()
-            .map_err(|_| "discovery state is unavailable".to_string())?
-            .clone();
-        let (home, _) = discovery::discover_codex_home(home_override.as_deref());
+    fn reconcile_with_database(
+        database: &Arc<Mutex<storage::Database>>,
+        home_override: Option<&Path>,
+    ) -> Result<(), String> {
+        let (home, _) = discovery::discover_codex_home(home_override);
         let Some(home) = home else {
             return Ok(());
         };
-        let mut database = self
-            .database
+        let previous = database
+            .lock()
+            .map_err(|_| "database reader is unavailable".to_string())?
+            .load_checkpoint_states()?;
+        let collection = collector::scan_codex_home_with_state(&home, &previous)?;
+        let mut database = database
             .lock()
             .map_err(|_| "database writer is unavailable".to_string())?;
-        let previous = database.load_checkpoint_states()?;
-        let collection = collector::scan_codex_home_with_state(&home, &previous)?;
         database.persist_collection::<()>(&collection, None, None)?;
         // Symlinks are deliberately skipped by the collector to avoid recursive
         // traversal. They are recorded in diagnostics, but do not make the scan
@@ -199,6 +340,24 @@ impl AppState {
             IntegrationMode::Cli => home.is_some() && binary.is_some(),
             IntegrationMode::Unknown => false,
         };
+        let background = self.background_snapshot();
+        if background.phase == BackgroundPhase::Initializing {
+            return AppStatus {
+                state: AppStatusState::Recalibrating,
+                label: "Updating local data".into(),
+                detail: "Repricing history and scanning local Codex logs…".into(),
+                integration_mode,
+                account_state: AccountState::Unknown,
+                connection_quality: ConnectionQuality::Degraded,
+                plan: None,
+                reset_at: None,
+                last_updated_at: Some(now_ms()),
+                codex_home,
+                codex_executable,
+                app_server,
+                data_quality: DataQuality::Partial,
+            };
+        }
         let database = self.database.lock().ok();
         let diagnostics = database
             .as_ref()
@@ -212,11 +371,14 @@ impl AppState {
             .map(|summary| summary.total_events)
             .unwrap_or_default();
         let diagnostics_failed = diagnostics.is_none();
-        let collection_failed = reconciliation_failed || diagnostics_failed;
-        let (state, label, connection_quality, data_quality) =
+        let collection_failed = reconciliation_failed
+            || diagnostics_failed
+            || background.last_reconciliation_failed
+            || background.phase == BackgroundPhase::Failed;
+        let (mut state, mut label, mut connection_quality, mut data_quality) =
             collection_status(configured, collection_failed, total_events);
         let mode = if gui_mode { "Desktop Mode" } else { "CLI Mode" };
-        let detail = if !configured {
+        let mut detail = if !configured {
             "Local Mode".into()
         } else if collection_failed {
             format!("{mode} · unable to read local data")
@@ -228,6 +390,13 @@ impl AppState {
         } else {
             format!("{mode} · waiting for usage")
         };
+        if background.reconciliation_in_flight && !collection_failed {
+            state = AppStatusState::Detecting;
+            label = "Refreshing local data";
+            connection_quality = ConnectionQuality::Degraded;
+            data_quality = DataQuality::Partial;
+            detail = format!("{mode} · importing new usage");
+        }
         AppStatus {
             state,
             label: label.into(),
@@ -241,12 +410,7 @@ impl AppState {
             connection_quality,
             plan: quota.as_ref().and_then(|quota| quota.plan.clone()),
             reset_at: quota.as_ref().and_then(|quota| quota.reset_at_ms),
-            last_updated_at: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|duration| duration.as_millis() as i64)
-                    .unwrap_or_default(),
-            ),
+            last_updated_at: Some(now_ms()),
             codex_home,
             codex_executable,
             app_server,
@@ -342,8 +506,8 @@ async fn get_current_quote(
 
 #[tauri::command]
 async fn get_current_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
-    let reconciliation_failed = state.reconcile().is_err();
-    Ok(state.discover_status(reconciliation_failed))
+    state.request_background_reconcile();
+    Ok(state.discover_status(false))
 }
 
 #[tauri::command]
@@ -396,7 +560,8 @@ fn reset_all_data(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 fn restore_graph_data(state: State<'_, AppState>) -> Result<(), String> {
     state.resume_collection()?;
-    state.reconcile()
+    state.request_background_reconcile();
+    Ok(())
 }
 
 #[tauri::command]
@@ -414,7 +579,8 @@ fn restore_last_checkpoint(state: State<'_, AppState>) -> Result<(), String> {
     state.resume_collection()?;
     // The checkpoint contains the exact pre-reset graph and source offsets. Reconcile once
     // afterward so activity written to the Codex logs since the reset is retained as well.
-    state.reconcile()
+    state.request_background_reconcile();
+    Ok(())
 }
 
 #[tauri::command]
@@ -431,7 +597,8 @@ fn import_all_data(state: State<'_, AppState>) -> Result<(), String> {
     }
     state.resume_collection()?;
     // With all source checkpoints removed, reconciliation reads every available JSONL record.
-    state.reconcile()
+    state.request_background_reconcile();
+    Ok(())
 }
 
 #[tauri::command]
@@ -447,8 +614,8 @@ async fn get_diagnostics_summary(
 
 #[tauri::command]
 fn retry_detection(state: State<'_, AppState>) -> Result<AppStatus, String> {
-    let reconciliation_failed = state.reconcile().is_err();
-    Ok(state.discover_status(reconciliation_failed))
+    state.request_background_reconcile();
+    Ok(state.discover_status(false))
 }
 
 #[tauri::command]
@@ -495,7 +662,7 @@ fn select_codex_home(state: State<'_, AppState>) -> Result<RedactedSelection, St
         .codex_home_override
         .lock()
         .map_err(|_| "discovery state is unavailable".to_string())? = Some(path);
-    state.reconcile()?;
+    state.request_background_reconcile();
     Ok(RedactedSelection {
         selected: true,
         status: DiscoveryStatus {
@@ -570,17 +737,17 @@ fn clear_discovery_overrides(state: State<'_, AppState>) -> Result<AppStatus, St
         .codex_binary_override
         .lock()
         .map_err(|_| "discovery state is unavailable".to_string())? = None;
-    let reconciliation_failed = state.reconcile().is_err();
-    Ok(state.discover_status(reconciliation_failed))
+    state.request_background_reconcile();
+    Ok(state.discover_status(false))
 }
 
 #[tauri::command]
 async fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
     state
-        .database
+        .settings
         .lock()
-        .map_err(|_| "database reader is unavailable".to_string())?
-        .load_settings()
+        .map(|settings| settings.clone())
+        .map_err(|_| "settings state is unavailable".to_string())
 }
 
 #[tauri::command]
@@ -594,7 +761,10 @@ fn update_settings(
         .lock()
         .map_err(|_| "database writer is unavailable".to_string())?;
     database.save_settings(&settings)?;
-    database.rebuild_quotes()?;
+    *state
+        .settings
+        .lock()
+        .map_err(|_| "settings state is unavailable".to_string())? = settings.clone();
     Ok(settings)
 }
 

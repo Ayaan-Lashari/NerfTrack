@@ -480,8 +480,10 @@ impl Database {
             };
             database.migrate()?;
         }
+        // Load the last valid catalog for immediate fallback pricing, but defer
+        // repricing and graph reconstruction until after the Tauri window exists.
+        // A large existing database must not block app startup on any platform.
         database.load_current_pricing_catalog()?;
-        database.rebuild_quotes()?;
         database.restrict_directory_permissions(&directory);
         database.restrict_file_permissions();
         database.record_app_run()?;
@@ -601,7 +603,7 @@ impl Database {
                     .commit()
                     .map_err(|_| "unable to commit models.dev pricing".to_string())?;
                 self.remote_pricing = catalog;
-                self.rebuild_quotes()
+                Ok(())
             }
         }
     }
@@ -958,7 +960,21 @@ impl Database {
         if self.load_settings().is_err() {
             self.save_settings(&AppSettings::default())?;
         }
+        Ok(())
+    }
+
+    /// Refresh pricing and reconcile all derived data after the UI has started.
+    ///
+    /// The network request is best-effort because a valid cached catalog or the
+    /// embedded fallback can still price usage offline. The derived-state check
+    /// always runs so an upgrade from an older pricing rule is completed exactly
+    /// once and then skipped on later launches.
+    pub fn initialize_background(&mut self) -> Result<(), String> {
+        let refresh_error = self.refresh_models_dev_pricing().err();
         self.ensure_derived_state()?;
+        if let Some(error) = refresh_error {
+            eprintln!("models.dev pricing refresh deferred: {error}");
+        }
         Ok(())
     }
 

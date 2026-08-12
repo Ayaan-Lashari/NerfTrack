@@ -3,7 +3,7 @@
 NerfTrack is a local-first Tauri 2 application. React renders typed projections and invokes
 commands; discovery, parsing, collection, persistence, account isolation, pricing, and
 estimation run in Rust. The only routine network request is the public models.dev pricing
-catalog refresh at application startup.
+catalog refresh at application startup, after the window is available.
 
 ```text
 Codex desktop-app or CLI JSONL
@@ -39,6 +39,12 @@ Desktop and CLI records use the same collector, parser, storage, and estimator p
 
 `parser.rs` reads newline-terminated JSONL records, tolerates a partial final line, converts cumulative per-turn token updates into deltas, extracts weekly quota observations, and accepts only explicit logged credits or logged charges as credit sources. It emits fingerprints and normalized model data rather than raw content.
 
+Startup opens and migrates the SQLite schema without rebuilding historical derived data. A
+named Rust background worker then refreshes pricing, reprices historical events, rebuilds the
+graphs, and imports new Codex log data. Status commands never wait for that first rebuild;
+the UI reports `Updating local data` while it is in progress. Later refreshes schedule one
+background reconciliation at a time, so a large JSONL tree cannot freeze the application window.
+
 ## Persistence and continuity
 
 `storage.rs` owns the SQLite schema, WAL, foreign keys, owner-restricted files, migrations, weekly-window rebuilding, measurements, estimates, settings, diagnostics, and DTO query projections. The production database is `nerftrack.db` under the platform-native per-user application-data directory, independent of the process working directory.
@@ -53,6 +59,6 @@ direct OpenAI provider, stores the last valid payload and digest locally, and fa
 embedded catalog if the network is unavailable. Manual overrides are checked first.
 
 When the catalog digest changes, `storage.rs` updates the effective rates on every stored usage
-event and rebuilds all dependent measurements, quotes, epochs, and chart projections. This keeps
-historical graphs and calculations aligned with the current model pricing while retaining the
-source and effective rates used for audit.
+event and rebuilds all dependent measurements, quotes, epochs, and chart projections in the
+startup background worker. This keeps historical graphs and calculations aligned with the
+current model pricing while retaining the source and effective rates used for audit.

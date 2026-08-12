@@ -16,7 +16,7 @@ npm run build
 npm run tauri:build
 ```
 
-The Vite browser mode uses sanitized deterministic fixtures so the dashboard and Setup surfaces are reviewable without a local Codex installation. A Tauri build calls Rust commands and shows setup/empty states until local sources are detected. The database location is platform-native and independent of the current working directory.
+The Vite browser mode uses sanitized deterministic fixtures so the dashboard and Setup surfaces are reviewable without a local Codex installation. A Tauri build opens its window before historical repricing and the first full Codex scan; those tasks run in a platform-neutral Rust background worker and the status surface reports progress. The database location is platform-native and independent of the current working directory.
 
 ## Verification expectations
 

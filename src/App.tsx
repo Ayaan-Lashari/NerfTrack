@@ -441,17 +441,30 @@ export default function App() {
         : ranges.every((item) => historyCache.current[item])
           ? [activeRange.current]
           : ranges;
+      // Settings are served from the startup cache, so load them before any
+      // database-dependent reads. This keeps onboarding available while the
+      // background worker performs a first migration/rebuild.
+      const nextSettings = await getSettings();
+      setSettings(nextSettings);
       // Status reconciliation imports newly written usage before every dependent read.
       // Sequencing it first prevents a refresh from mixing old chart data with new status.
       const nextStatus = await getCurrentStatus();
-      const [nextQuote, nextHistories, nextAnnotations, nextDiagnostics, nextSettings] =
-        await Promise.all([
-          getCurrentQuote(),
-          Promise.all(historyRanges.map(async (item) => [item, await getHistory(item)] as const)),
-          getAnnotations(),
-          getDiagnosticsSummary(),
-          getSettings(),
-        ]);
+      // Startup migration and historical repricing run in the Rust background
+      // worker. Show that state immediately instead of keeping the whole window
+      // behind the initial data-read promise.
+      setStatus(nextStatus);
+      if (nextStatus.state === 'recalibrating') {
+        setIsLoading(false);
+        setQuote(null);
+        setLoadError(false);
+        return;
+      }
+      const [nextQuote, nextHistories, nextAnnotations, nextDiagnostics] = await Promise.all([
+        getCurrentQuote(),
+        Promise.all(historyRanges.map(async (item) => [item, await getHistory(item)] as const)),
+        getAnnotations(),
+        getDiagnosticsSummary(),
+      ]);
       const historyUpdates = Object.fromEntries(nextHistories) as Partial<
         Record<Range, HistoryResponse>
       >;
@@ -461,7 +474,6 @@ export default function App() {
       setHistories((current) => ({ ...current, ...historyUpdates }));
       setAnnotations(nextAnnotations);
       setDiagnostics(nextDiagnostics);
-      setSettings(nextSettings);
       setLoadError(false);
     } catch {
       setQuote(null);
