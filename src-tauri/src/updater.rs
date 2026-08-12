@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use std::{fs as std_fs, io::Read};
 
 use reqwest::{Client, StatusCode, Url};
 use semver::Version;
@@ -11,8 +12,9 @@ use tokio::io::AsyncWriteExt;
 
 const MAX_UPDATE_BYTES: u64 = 1_073_741_824;
 const UPDATE_DIRECTORY: &str = "nerftrack-updates";
+const UPDATE_FAILURE_FILE: &str = ".update-failed";
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const UPDATE_HELPER_ARGUMENT: &str = "--nerftrack-update-helper";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,28 +483,101 @@ fn validate_downloaded_path(path: &str) -> Result<PathBuf, String> {
     Ok(canonical_path)
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn launch_update_helper(
+    executable: &Path,
+    parent_pid: u32,
+    update_path: &Path,
+    target_path: &Path,
+) -> Result<(), String> {
+    let mut helper = Command::new(executable);
+    helper
+        .arg(UPDATE_HELPER_ARGUMENT)
+        .arg(parent_pid.to_string())
+        .arg(update_path)
+        .arg(target_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        helper.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+
+    helper
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "NerfTrack could not start its update helper".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_helper_path() -> Result<PathBuf, String> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(std::env::temp_dir().join(format!(
+        "NerfTrack-update-helper-{}-{timestamp}.exe",
+        std::process::id()
+    )))
+}
+
+#[cfg(target_os = "windows")]
+fn schedule_windows_helper_cleanup() {
+    let Ok(helper_path) = std::env::current_exe() else {
+        return;
+    };
+    let Some(name) = helper_path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    if !name.starts_with("NerfTrack-update-helper-") {
+        return;
+    }
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let command_line = format!(
+        "timeout /t 2 /nobreak >nul & del /f /q \"{}\"",
+        helper_path.display()
+    );
+    let _ = Command::new("cmd")
+        .args(["/D", "/C", &command_line])
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 #[cfg(target_os = "windows")]
 fn launch_installer(
     path: &Path,
     extension: &str,
-    _app: &tauri::AppHandle,
+    app: &tauri::AppHandle,
 ) -> Result<InstallUpdateResult, String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    let mut installer = if extension == "msi" {
-        let mut command = Command::new("msiexec");
-        command.arg("/i").arg(path);
-        command
-    } else {
-        Command::new(path)
-    };
-    installer
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
-        .spawn()
-        .map_err(|_| "Windows could not launch the update installer".to_string())?;
+    if !matches!(extension, "msi" | "exe") {
+        return Err(
+            "NerfTrack can apply Windows updates only from an MSI or NSIS installer".into(),
+        );
+    }
+    let executable = std::env::current_exe()
+        .map_err(|_| "unable to determine the running NerfTrack executable".to_string())?;
+    let helper_path = windows_helper_path()?;
+    std_fs::copy(&executable, &helper_path)
+        .map_err(|_| "could not prepare the NerfTrack update helper".to_string())?;
+    if let Err(error) = launch_update_helper(&helper_path, std::process::id(), path, &executable) {
+        let _ = std_fs::remove_file(&helper_path);
+        return Err(error);
+    }
+    app.exit(0);
     Ok(InstallUpdateResult {
-        message: "Installer launched. Follow its prompts to finish updating NerfTrack.".into(),
+        message: "Update downloaded. NerfTrack is closing, installing the update, and will reopen automatically.".into(),
     })
 }
 
@@ -520,16 +595,7 @@ fn launch_installer(
     let executable = std::env::current_exe()
         .map_err(|_| "unable to determine the running NerfTrack executable".to_string())?;
     let target_bundle = app_bundle_from_executable(&executable)?;
-    Command::new(&executable)
-        .arg(UPDATE_HELPER_ARGUMENT)
-        .arg(std::process::id().to_string())
-        .arg(path)
-        .arg(&target_bundle)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "NerfTrack could not start its update helper".to_string())?;
+    launch_update_helper(&executable, std::process::id(), path, &target_bundle)?;
     app.exit(0);
     Ok(InstallUpdateResult {
         message: "Update downloaded. NerfTrack is closing, replacing itself, and will reopen automatically.".into(),
@@ -554,9 +620,132 @@ pub fn install_update(app: tauri::AppHandle, path: String) -> Result<InstallUpda
         .unwrap_or_default()
         .to_ascii_lowercase();
     let pending_update = crate::storage::data_directory()?.join(".pending-update");
-    std::fs::write(&pending_update, b"update requested")
+    std_fs::write(&pending_update, b"update requested")
         .map_err(|_| "could not record the pending NerfTrack update".to_string())?;
-    launch_installer(&path, &extension, &app)
+    match launch_installer(&path, &extension, &app) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let _ = std_fs::remove_file(&pending_update);
+            Err(error)
+        }
+    }
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = std_fs::File::open(path)
+        .map_err(|_| "could not inspect the installed NerfTrack executable".to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| "could not read the installed NerfTrack executable".to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(target_os = "windows")]
+fn process_is_running(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        #[link_name = "OpenProcess"]
+        fn open_process(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        #[link_name = "GetExitCodeProcess"]
+        fn get_exit_code_process(process: *mut c_void, exit_code: *mut u32) -> i32;
+        #[link_name = "CloseHandle"]
+        fn close_handle(object: *mut c_void) -> i32;
+    }
+
+    let handle = unsafe { open_process(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code = 0_u32;
+    let running =
+        unsafe { get_exit_code_process(handle, &mut exit_code) != 0 } && exit_code == STILL_ACTIVE;
+    unsafe {
+        close_handle(handle);
+    }
+    running
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_process_exit(pid: u32) -> Result<(), String> {
+    for _ in 0..300 {
+        if !process_is_running(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err("NerfTrack did not close in time for the update".into())
+}
+
+#[cfg(target_os = "windows")]
+fn relaunch_windows_app(target_executable: &Path) -> Result<(), String> {
+    Command::new(target_executable)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "Windows could not reopen NerfTrack after updating".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_update(
+    parent_pid: u32,
+    update_path: &Path,
+    target_executable: &Path,
+) -> Result<(), String> {
+    wait_for_process_exit(parent_pid)?;
+    if !target_executable.is_file() {
+        return Err("the installed NerfTrack executable is unavailable".into());
+    }
+    let previous_digest = file_sha256(target_executable)?;
+    let extension = update_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut installer = if extension == "msi" {
+        let mut command = Command::new("msiexec");
+        command
+            .arg("/i")
+            .arg(update_path)
+            .args(["/qn", "/norestart"]);
+        command
+    } else {
+        let install_directory = target_executable.parent().ok_or_else(|| {
+            "the installed NerfTrack executable has no parent directory".to_string()
+        })?;
+        let mut command = Command::new(update_path);
+        // Tauri's release artifacts are NSIS installers. /D must be the final
+        // argument so an update cannot silently install beside the existing app.
+        command.arg("/S");
+        command.arg(format!("/D={}", install_directory.display()));
+        command
+    };
+    let status = installer
+        .status()
+        .map_err(|_| "Windows could not launch the NerfTrack installer".to_string())?;
+    if !status.success() {
+        return Err(format!("the NerfTrack installer exited with {status}"));
+    }
+    let updated_digest = file_sha256(target_executable)?;
+    if updated_digest == previous_digest {
+        return Err("the NerfTrack installer completed without replacing the installed app".into());
+    }
+    let _ = std_fs::remove_file(update_path);
+    relaunch_windows_app(target_executable)
 }
 
 #[cfg(target_os = "macos")]
@@ -583,6 +772,8 @@ fn app_bundle_from_executable(executable: &Path) -> Result<PathBuf, String> {
 fn process_is_running(pid: u32) -> bool {
     Command::new("/bin/kill")
         .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
@@ -730,6 +921,77 @@ fn update_backup_path(target_bundle: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "macos")]
+fn update_staging_path(target_bundle: &Path) -> Result<PathBuf, String> {
+    let parent = target_bundle
+        .parent()
+        .ok_or_else(|| "the NerfTrack app bundle has no parent directory".to_string())?;
+    let name = target_bundle
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "the NerfTrack app bundle has an invalid name".to_string())?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(parent.join(format!(".{name}.update-new-{timestamp}.app")))
+}
+
+#[cfg(target_os = "macos")]
+fn target_parent_is_writable(target_bundle: &Path) -> bool {
+    let Ok(probe) = update_staging_path(target_bundle) else {
+        return false;
+    };
+    let Ok(file) = std_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    else {
+        return false;
+    };
+    drop(file);
+    std_fs::remove_file(probe).is_ok()
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "macos")]
+fn apple_script_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn replace_app_bundle_with_admin(
+    source: &Path,
+    target: &Path,
+    staging: &Path,
+    backup: &Path,
+) -> Result<(), String> {
+    let command = format!(
+        "set -e; /usr/bin/ditto {source} {staging}; /bin/mv {target} {backup}; if ! /bin/mv {staging} {target}; then /bin/mv {backup} {target}; exit 1; fi; /bin/rm -rf {backup}",
+        source = shell_quote(source),
+        staging = shell_quote(staging),
+        target = shell_quote(target),
+        backup = shell_quote(backup),
+    );
+    let script = format!(
+        "do shell script \"{}\" with administrator privileges",
+        apple_script_escape(&command)
+    );
+    let status = Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .status()
+        .map_err(|_| "macOS could not request permission to replace NerfTrack".to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("macOS did not grant permission to replace the NerfTrack app".into())
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn copy_app_bundle(source: &Path, target: &Path) -> Result<(), String> {
     let copied = Command::new("/usr/bin/ditto")
         .arg(source)
@@ -748,18 +1010,36 @@ fn replace_app_bundle(source: &Path, target: &Path) -> Result<(), String> {
     if !is_app_bundle(source) || !is_app_bundle(target) {
         return Err("the NerfTrack update bundle layout is invalid".into());
     }
+    let staging = update_staging_path(target)?;
     let backup = update_backup_path(target)?;
-    std::fs::rename(target, &backup).map_err(|_| {
-        "macOS could not move the current NerfTrack app aside for updating".to_string()
-    })?;
-    if let Err(error) = copy_app_bundle(source, target) {
-        let _ = std::fs::remove_dir_all(target);
+    if !target_parent_is_writable(target) {
+        return replace_app_bundle_with_admin(source, target, &staging, &backup);
+    }
+    if let Err(error) = copy_app_bundle(source, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    if !is_app_bundle(&staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("macOS could not validate the staged NerfTrack app bundle".into());
+    }
+    if let Err(error) = std::fs::rename(target, &backup) {
+        let _ = std::fs::remove_dir_all(&staging);
+        if !target_parent_is_writable(target) {
+            return replace_app_bundle_with_admin(source, target, &staging, &backup);
+        }
+        return Err(format!(
+            "macOS could not move the current NerfTrack app aside for updating: {error}"
+        ));
+    }
+    if let Err(error) = std::fs::rename(&staging, target) {
+        let _ = std::fs::remove_dir_all(&staging);
         let restore_error = std::fs::rename(&backup, target).err();
         return match restore_error {
             Some(restore_error) => Err(format!(
-                "{error}; the previous NerfTrack app could not be restored: {restore_error}"
+                "macOS could not install the staged NerfTrack app: {error}; the previous app could not be restored: {restore_error}"
             )),
-            None => Err(error),
+            None => Err(format!("macOS could not install the staged NerfTrack app: {error}")),
         };
     }
     let _ = std::fs::remove_dir_all(&backup);
@@ -786,6 +1066,13 @@ fn apply_macos_update(
     target_bundle: &Path,
 ) -> Result<(), String> {
     wait_for_process_exit(parent_pid)?;
+    let current_executable = std::env::current_exe()
+        .map_err(|_| "unable to determine the running NerfTrack executable".to_string())?;
+    let executable_name = current_executable
+        .file_name()
+        .ok_or_else(|| "the running NerfTrack executable has no valid name".to_string())?;
+    let target_executable = target_bundle.join("Contents/MacOS").join(executable_name);
+    let previous_digest = file_sha256(&target_executable)?;
     let extension = update_path
         .extension()
         .and_then(|value| value.to_str())
@@ -797,57 +1084,134 @@ fn apply_macos_update(
     {
         let workspace = MacUpdateWorkspace::prepare(update_path, &extension)?;
         let source_bundle = workspace.find_bundle(expected_name)?;
+        let source_executable = source_bundle.join("Contents/MacOS").join(executable_name);
+        let source_digest = file_sha256(&source_executable)?;
+        if source_digest == previous_digest {
+            return Err(
+                "the downloaded NerfTrack app is identical to the installed version".into(),
+            );
+        }
         replace_app_bundle(&source_bundle, target_bundle)?;
     }
+    let updated_digest = file_sha256(&target_executable)?;
+    if updated_digest == previous_digest {
+        return Err("the downloaded NerfTrack app did not replace the installed version".into());
+    }
+    let _ = std_fs::remove_file(update_path);
     relaunch_app(target_bundle)
 }
 
-#[cfg(target_os = "macos")]
-pub fn run_update_helper_if_requested() -> bool {
+fn record_update_failure(message: &str) {
+    let Ok(directory) = crate::storage::data_directory() else {
+        return;
+    };
+    let _ = std_fs::create_dir_all(&directory);
+    let bounded = message.chars().take(512).collect::<String>();
+    let _ = std_fs::write(directory.join(UPDATE_FAILURE_FILE), bounded.as_bytes());
+}
+
+#[tauri::command]
+pub fn consume_update_failure() -> Result<Option<String>, String> {
+    let path = crate::storage::data_directory()?.join(UPDATE_FAILURE_FILE);
+    let message = match std_fs::read_to_string(&path) {
+        Ok(message) => message,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("could not read the previous NerfTrack update failure".into()),
+    };
+    let _ = std_fs::remove_file(path);
+    let message = message.trim().to_string();
+    if message.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(message))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn parse_update_helper_args() -> Result<(u32, PathBuf, PathBuf), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) != Some(UPDATE_HELPER_ARGUMENT) {
+        return Err("the NerfTrack update helper was not requested".into());
+    }
+
+    let parent_pid = args
+        .get(2)
+        .ok_or_else(|| "the update helper did not receive the NerfTrack process ID".to_string())?
+        .parse::<u32>()
+        .map_err(|_| "the update helper received an invalid NerfTrack process ID".to_string())?;
+    let update_path = PathBuf::from(args.get(3).ok_or_else(|| {
+        "the update helper did not receive the downloaded update path".to_string()
+    })?);
+    let target_path = PathBuf::from(args.get(4).ok_or_else(|| {
+        "the update helper did not receive the target NerfTrack installation path".to_string()
+    })?);
+
+    #[cfg(target_os = "macos")]
+    if !is_app_bundle(&target_path) {
+        return Err("the target NerfTrack app bundle is unavailable".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    if !target_path.is_file() {
+        return Err("the installed NerfTrack executable is unavailable".to_string());
+    }
+    Ok((parent_pid, update_path, target_path))
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn relaunch_update_target(target_path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        relaunch_app(target_path)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        relaunch_windows_app(target_path)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn run_update_helper_if_requested() -> bool {
+    if std::env::args().nth(1).as_deref() != Some(UPDATE_HELPER_ARGUMENT) {
         return false;
     }
 
-    let parsed = (|| {
-        let parent_pid = args
-            .get(2)
-            .ok_or_else(|| {
-                "the update helper did not receive the NerfTrack process ID".to_string()
-            })?
-            .parse::<u32>()
-            .map_err(|_| {
-                "the update helper received an invalid NerfTrack process ID".to_string()
-            })?;
-        let update_path = PathBuf::from(args.get(3).ok_or_else(|| {
-            "the update helper did not receive the downloaded update path".to_string()
-        })?);
-        let target_bundle = PathBuf::from(args.get(4).ok_or_else(|| {
-            "the update helper did not receive the target NerfTrack app bundle".to_string()
-        })?);
-        if !is_app_bundle(&target_bundle) {
-            return Err("the target NerfTrack app bundle is unavailable".to_string());
-        }
-        Ok((parent_pid, update_path, target_bundle))
-    })();
-
-    let (parent_pid, update_path, target_bundle) = match parsed {
+    let (parent_pid, update_path, target_path) = match parse_update_helper_args() {
         Ok(values) => values,
         Err(error) => {
-            eprintln!("NerfTrack update failed: {error}");
+            record_update_failure(&error);
+            #[cfg(target_os = "windows")]
+            schedule_windows_helper_cleanup();
             std::process::exit(1);
         }
     };
-    let result = apply_macos_update(parent_pid, &update_path, &target_bundle);
+    let result = (|| {
+        let validated_update =
+            validate_downloaded_path(update_path.to_str().ok_or_else(|| {
+                "the downloaded NerfTrack update path is not valid UTF-8".to_string()
+            })?)?;
+        #[cfg(target_os = "macos")]
+        {
+            apply_macos_update(parent_pid, &validated_update, &target_path)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            apply_windows_update(parent_pid, &validated_update, &target_path)
+        }
+    })();
+
     if let Err(error) = result {
-        eprintln!("NerfTrack update failed: {error}");
-        let _ = relaunch_app(&target_bundle);
+        record_update_failure(&error);
+        let _ = relaunch_update_target(&target_path);
+        #[cfg(target_os = "windows")]
+        schedule_windows_helper_cleanup();
         std::process::exit(1);
     }
+    #[cfg(target_os = "windows")]
+    schedule_windows_helper_cleanup();
     std::process::exit(0);
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn run_update_helper_if_requested() -> bool {
     false
 }
@@ -903,5 +1267,45 @@ mod tests {
     fn strips_a_v_prefix_and_rejects_invalid_release_versions() {
         assert_eq!(release_version("v1.2.3").unwrap(), Version::new(1, 2, 3));
         assert!(release_version("latest").is_err());
+    }
+
+    #[test]
+    fn sanitizes_downloaded_asset_filenames() {
+        assert_eq!(
+            safe_asset_filename("../NerfTrack 0.5.5 (arm64).dmg"),
+            "NerfTrack_0.5.5__arm64_.dmg"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn selects_the_matching_macos_architecture_asset() {
+        let architecture_asset = if cfg!(target_arch = "aarch64") {
+            "NerfTrack-0.5.5-macos-arm64.dmg"
+        } else {
+            "NerfTrack-0.5.5-macos-x86_64.dmg"
+        };
+        let release = GithubRelease {
+            tag_name: "v0.5.5".into(),
+            html_url: "https://github.com/Ayaan-Lashari/NerfTrack/releases/tag/v0.5.5".into(),
+            assets: vec![
+                GithubAsset {
+                    name: "NerfTrack-0.5.5-windows-x64-setup.exe".into(),
+                    browser_download_url: "https://github.com/example/windows.exe".into(),
+                    size: 1,
+                    digest: None,
+                },
+                GithubAsset {
+                    name: architecture_asset.into(),
+                    browser_download_url: "https://github.com/example/macos.dmg".into(),
+                    size: 1,
+                    digest: None,
+                },
+            ],
+        };
+        assert_eq!(
+            select_asset(&release).map(|asset| asset.name.as_str()),
+            Some(architecture_asset)
+        );
     }
 }
