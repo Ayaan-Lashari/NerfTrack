@@ -72,8 +72,8 @@ export const demoQuote: CurrentQuote = {
   confidence: 'high',
   validObservationCount: 6,
   percentageCoverage: 34,
-  pricingSource: 'official',
-  modelStatus: 'official',
+  pricingSource: 'models_dev',
+  modelStatus: 'models_dev',
   note: 'Rolling median of cumulative weekly cost-per-percent estimates.',
 };
 

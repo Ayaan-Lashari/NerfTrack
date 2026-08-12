@@ -294,8 +294,8 @@ function HomeView({
             <h1>Codex Weekly API-equivalent Estimator</h1>
             <p>
               {stableEstimate
-                ? 'Stable estimate from cumulative local usage and verified model rates'
-                : 'Calibrating from cumulative local usage and verified model rates'}
+                ? 'Stable estimate from cumulative local usage and fetched model rates'
+                : 'Calibrating from cumulative local usage and fetched model rates'}
             </p>
           </div>
         </div>
@@ -403,7 +403,7 @@ function HomeView({
       <footer className="app-footer">
         <span>
           <Icon name="info" size={16} />
-          Uses cumulative weekly usage and verified API rates; short-term spikes are filtered.
+          Uses cumulative weekly usage and fetched API rates; short-term spikes are filtered.
         </span>
         <LiveRefreshStatus />
       </footer>

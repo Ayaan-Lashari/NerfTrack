@@ -11,3 +11,10 @@ The adapted behavior is limited to Codex path conventions, JSONL token normaliza
 ## Direct dependencies
 
 NerfTrack uses the Rust crates and npm packages declared in `src-tauri/Cargo.toml` and `package.json`. Their licenses are resolved through their respective package metadata at build time; no signing credentials, private package registries, or generated secrets are committed.
+
+## models.dev pricing catalog
+
+At application startup NerfTrack reads the public [models.dev API catalog](https://models.dev/api.json)
+for current OpenAI model metadata and token prices. The catalog is maintained by the models.dev
+project at [anomalyco/models.dev](https://github.com/anomalyco/models.dev), which is MIT licensed.
+NerfTrack stores the last valid response locally and does not send local usage data to the service.

@@ -14,7 +14,25 @@ Each history point shows the unsmoothed cumulative cost-per-usage estimate for t
 
 ## Pricing and overrides
 
-Built-in rates were verified on 2026-08-08 from OpenAI API model pages:
+On every application launch, NerfTrack requests the public models.dev catalog at
+https://models.dev/api.json. It reads only the direct openai.models section, so a provider's
+OpenRouter resale price is not mistaken for the OpenAI API price. The catalog is downloaded and
+matched locally by model ID; NerfTrack does not send prompts, token counts, account identifiers,
+or usage events to models.dev.
+
+When a valid catalog is received, its complete JSON payload and SHA-256 digest are stored in the
+local database. A changed digest reprices every stored usage event and rebuilds measurements,
+weekly windows, quotes, and history graphs. An HTTP 304 response reuses the cached catalog. If
+models.dev is unavailable or its response fails validation, NerfTrack uses the last valid local
+catalog, then the embedded fallback catalog, while preserving manual overrides.
+
+Pricing precedence is:
+
+1. A matching user override or alias.
+2. A token-priced model in the latest valid models.dev openai.models snapshot.
+3. The embedded OpenAI fallback catalog below.
+
+Built-in fallback rates were verified on 2026-08-08 from OpenAI API model pages:
 
 - [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna): $0.20 input, $0.02 cached input, $1.20 output per 1M text tokens.
 - [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra): $2 input, $0.20 cached input, $12 output per 1M text tokens.
@@ -23,9 +41,17 @@ Built-in rates were verified on 2026-08-08 from OpenAI API model pages:
 - [GPT-5.2-Codex](https://developers.openai.com/api/docs/models/gpt-5.2-codex): $1.75 input, $0.175 cached input, $14 output per 1M tokens.
 - [codex-mini-latest](https://developers.openai.com/api/docs/models/codex-mini-latest): $1.50 input, $0.375 cached input, $6 output per 1M tokens.
 
-The built-in text catalog also covers the currently documented GPT-5.6/5.5/5.4/5.x, GPT-4.1, GPT-4o, o1, o3, o3-mini, and o4-mini text model IDs using the [official model catalog](https://developers.openai.com/api/docs/models/all), [model comparison](https://developers.openai.com/api/docs/models/compare), and [API pricing](https://openai.com/api/pricing/) rates verified on that date. Token logs do not identify audio/image modality tokens, cache writes, or tool-call units, so those non-text charges are intentionally unavailable rather than fabricated.
+The embedded text fallback also covers the currently documented GPT-5.6/5.5/5.4/5.x, GPT-4.1,
+GPT-4o, o1, o3, o3-mini, and o4-mini text model IDs using the [official model catalog](https://developers.openai.com/api/docs/models/all),
+[model comparison](https://developers.openai.com/api/docs/models/compare), and [API pricing](https://openai.com/api/pricing/)
+rates verified on that date. Token logs do not identify audio/image modality tokens, cache writes,
+or tool-call units, so those non-text charges are intentionally unavailable rather than fabricated.
 
-User-provided model overrides are local-only and take precedence over verified built-ins. Each needs a nonempty model ID and finite non-negative input, cached-input, and output rates; an optional alias maps a local model label to the override. A model without a verified rate and override is conspicuously pending with a diagnostic: NerfTrack never guesses a rate or sends model/token data to obtain one.
+User-provided model overrides are local-only and take precedence over both models.dev and the
+embedded fallback. Each needs a nonempty model ID and finite non-negative input, cached-input,
+and output rates; an optional alias maps a local model label to the override. A model without a
+token price in any source remains conspicuously pending with a diagnostic. NerfTrack never guesses
+a rate or sends model/token data to obtain one.
 
 ## Windows, reset safety, and migration
 
@@ -33,4 +59,9 @@ Only 10,080-minute weekly limits are used. Windows are separated by account and 
 
 Range changes are calculated only when both endpoints have medium or high confidence, the baseline lies inside the selected range, and it precedes the current estimate. Otherwise the comparison is unavailable rather than inferred from stale or low-coverage history.
 
-Schema migration 8 preserves raw usage events, quota observations, accounts, settings, user annotations, and checkpoints, but invalidates and rebuilds incompatible derived estimates, measurements, epochs, and charts. The persisted estimator algorithm identifier remains stable across this branding change. All processing and override storage is local; prompts, raw JSONL, credentials, account identifiers, and complete paths are not returned.
+Schema migration 10 preserves raw usage events, quota observations, accounts, settings, user
+annotations, and checkpoints while adding the cached models.dev payload and effective pricing
+audit fields. Pricing changes invalidate and rebuild incompatible derived estimates,
+measurements, epochs, and charts. The persisted estimator algorithm identifier remains stable
+across this pricing-source change. Prompts, raw JSONL, credentials, account identifiers, and
+complete paths are not sent to models.dev or returned through the UI.

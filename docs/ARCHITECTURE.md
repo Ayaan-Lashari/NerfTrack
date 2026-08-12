@@ -1,6 +1,9 @@
 # NerfTrack architecture
 
-NerfTrack is a local-only Tauri 2 application. React renders typed projections and invokes commands; discovery, parsing, collection, persistence, account isolation, and estimation run in Rust.
+NerfTrack is a local-first Tauri 2 application. React renders typed projections and invokes
+commands; discovery, parsing, collection, persistence, account isolation, pricing, and
+estimation run in Rust. The only routine network request is the public models.dev pricing
+catalog refresh at application startup.
 
 ```text
 Codex desktop-app or CLI JSONL
@@ -41,3 +44,15 @@ Desktop and CLI records use the same collector, parser, storage, and estimator p
 `storage.rs` owns the SQLite schema, WAL, foreign keys, owner-restricted files, migrations, weekly-window rebuilding, measurements, estimates, settings, diagnostics, and DTO query projections. The production database is `nerftrack.db` under the platform-native per-user application-data directory, independent of the process working directory.
 
 The database stores accounts, source checkpoints, parsed usage events, quota snapshots, weekly windows, measurements, estimates, annotations, settings, diagnostics, and app-run boundaries. It does not store prompts, raw account identifiers, or raw JSONL lines. `estimator.rs` keeps invalid intervals pending or rejected rather than fabricating zero values.
+
+## Pricing refresh and historical repricing
+
+`pricing.rs` fetches and validates models.dev's public JSON catalog with a bounded timeout and
+payload size, using ETags when available. NerfTrack selects only token-priced entries from the
+direct OpenAI provider, stores the last valid payload and digest locally, and falls back to the
+embedded catalog if the network is unavailable. Manual overrides are checked first.
+
+When the catalog digest changes, `storage.rs` updates the effective rates on every stored usage
+event and rebuilds all dependent measurements, quotes, epochs, and chart projections. This keeps
+historical graphs and calculations aligned with the current model pricing while retaining the
+source and effective rates used for audit.

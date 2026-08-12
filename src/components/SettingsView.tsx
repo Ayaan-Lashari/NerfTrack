@@ -192,7 +192,7 @@ export function SettingsView({
           <h2>Privacy first</h2>
           <p>
             NerfTrack runs locally. No prompts, code, raw account identifiers, or telemetry leave
-            this device.
+            this device; only public pricing metadata is refreshed at launch.
           </p>
           <div className="privacy-check">
             <Icon name="check" size={17} />
@@ -214,12 +214,14 @@ export function SettingsView({
           <h2 id="custom-pricing-heading">Custom API pricing</h2>
         </div>
         <p>
-          Overrides are local only and take precedence over NerfTrack’s verified official model
-          prices. Use them for an unpriced model or a local alias; prices are USD per 1M tokens.
+          Overrides are local only and take precedence over models.dev and NerfTrack’s embedded
+          fallback rates. Use them for an unpriced model or a local alias; prices are USD per 1M
+          tokens.
         </p>
         <p className="settings-note">
-          Built-in rates are sourced from OpenAI’s API model documentation (verified 2026-07-24).
-          Unknown models remain pending until an override is saved.
+          NerfTrack refreshes the public models.dev OpenAI catalog at each launch and caches the
+          last valid response. If it is unavailable, embedded OpenAI fallback rates are used.
+          Unknown models remain pending until a catalog price or override is available.
         </p>
         {detectedModelIds.length > 0 && (
           <div className="detected-models-callout">

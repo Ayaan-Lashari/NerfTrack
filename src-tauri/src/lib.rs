@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod estimator;
 pub mod models;
 pub mod parser;
+pub mod pricing;
 pub mod storage;
 pub mod updater;
 
@@ -30,7 +31,11 @@ pub struct AppState {
 
 impl AppState {
     fn new() -> Result<Self, String> {
-        let database = storage::Database::open()?;
+        let mut database = storage::Database::open()?;
+        // Pricing refresh is best-effort: Database::open has already loaded the
+        // last valid local snapshot and built-in fallback rates remain available
+        // when models.dev is offline or temporarily unavailable.
+        let _ = database.refresh_models_dev_pricing();
         let overrides = database.load_discovery_overrides()?;
         let state = Self {
             database: Mutex::new(database),

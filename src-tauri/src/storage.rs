@@ -13,6 +13,7 @@ use crate::models::{
     ALGORITHM_VERSION, PRICING_RULE_VERSION, RECONSTRUCTION_VERSION,
 };
 use crate::parser::{event_fingerprint, UsageEvent};
+use crate::pricing::{self, PricingCatalog};
 
 const WEEKLY_WINDOW_MINUTES: f64 = 10_080.0;
 const WEEKLY_WINDOW_TOLERANCE_MINUTES: f64 = 240.0;
@@ -189,16 +190,31 @@ fn official_price(model: &str) -> Option<ApiPrice> {
     }
 }
 
-fn event_cost(event: &UsageEvent, settings: &AppSettings) -> Result<(f64, &'static str), String> {
-    let model = event.model.trim().to_ascii_lowercase().replace('/', "-");
+#[derive(Clone, Copy)]
+struct PricedEvent {
+    cost: f64,
+    source: &'static str,
+    effective_input_rate: f64,
+    effective_cached_input_rate: f64,
+    effective_output_rate: f64,
+    input_multiplier: f64,
+    output_multiplier: f64,
+}
+
+fn event_cost(
+    event: &UsageEvent,
+    settings: &AppSettings,
+    remote_pricing: &PricingCatalog,
+) -> Result<PricedEvent, String> {
+    let model = pricing::normalize_model_id(&event.model);
     let custom = settings.custom_pricing.iter().find(|override_price| {
-        override_price.model_id.trim().eq_ignore_ascii_case(&model)
+        pricing::normalize_model_id(&override_price.model_id) == model
             || override_price
                 .alias
                 .as_deref()
-                .is_some_and(|alias| alias.trim().eq_ignore_ascii_case(&model))
+                .is_some_and(|alias| pricing::normalize_model_id(alias) == model)
     });
-    let (price, source) = if let Some(price) = custom {
+    let (price, source, remote_tier) = if let Some(price) = custom {
         (
             ApiPrice {
                 input: price.input_usd_per_million,
@@ -206,31 +222,54 @@ fn event_cost(event: &UsageEvent, settings: &AppSettings) -> Result<(f64, &'stat
                 output: price.output_usd_per_million,
             },
             "custom",
+            None,
+        )
+    } else if let Some(price) = remote_pricing.find(&model) {
+        let remote_tiers = price.long_context_tiers;
+        (
+            ApiPrice {
+                input: price.input,
+                cached_input: price.cached_input,
+                output: price.output,
+            },
+            "models_dev",
+            Some(remote_tiers),
         )
     } else if let Some(price) = official_price(&model) {
-        (price, "official")
+        (price, "official", None)
     } else {
         return Err(format!(
             "unknown API price for model {model}; add a local custom price override"
         ));
     };
-    // Official GPT-5.4/5.5/5.6 long-context rules apply 2x input and 1.5x output
-    // above 272K input tokens. Cache-write token counts are not present in Codex JSONL,
-    // so they remain pending in the cached-input bucket instead of being guessed.
+    // Embedded fallback and custom rates retain the documented GPT-5.4/5.5/5.6
+    // long-context multipliers above 272K input tokens. models.dev tiers are used
+    // directly when present. Cache-write token counts are not present in Codex
+    // JSONL, so they remain pending in the cached-input bucket instead of being guessed.
     let long_context = event.long_context || event.input_tokens > 272_000;
+    let mut input_rate = price.input;
+    let mut cached_input_rate = price.cached_input;
+    let mut output_rate = price.output;
+    let mut multiplier_input = 1.0;
+    let mut multiplier_output = 1.0;
+    let has_remote_tiers = remote_tier.as_ref().is_some_and(|tiers| !tiers.is_empty());
+    let remote_tier = remote_tier
+        .iter()
+        .flatten()
+        .filter(|tier| event.long_context || event.input_tokens > tier.threshold_tokens)
+        .max_by_key(|tier| tier.threshold_tokens);
+    if let Some(tier) = remote_tier {
+        input_rate = tier.input;
+        cached_input_rate = tier.cached_input;
+        output_rate = tier.output;
+    }
     let documented_long_context = model.starts_with("gpt-5.4")
         || model.starts_with("gpt-5.5")
         || model.starts_with("gpt-5.6");
-    let multiplier_input = if long_context && documented_long_context {
-        2.0
-    } else {
-        1.0
-    };
-    let multiplier_output = if long_context && documented_long_context {
-        1.5
-    } else {
-        1.0
-    };
+    if !has_remote_tiers && long_context && documented_long_context {
+        multiplier_input = 2.0;
+        multiplier_output = 1.5;
+    }
     // `input_tokens` includes cached input and `reasoning_tokens` is an output
     // detail in Codex/Responses records. Charge each physical token once.
     let uncached_input = event.input_tokens.saturating_sub(event.cached_input_tokens);
@@ -239,18 +278,29 @@ fn event_cost(event: &UsageEvent, settings: &AppSettings) -> Result<(f64, &'stat
     } else {
         event.reasoning_tokens
     };
-    let cost = (uncached_input as f64 * price.input * multiplier_input
-        + event.cached_input_tokens as f64 * price.cached_input
-        + billed_output as f64 * price.output * multiplier_output)
+    let cost = (uncached_input as f64 * input_rate * multiplier_input
+        + event.cached_input_tokens as f64 * cached_input_rate
+        + billed_output as f64 * output_rate * multiplier_output)
         / 1_000_000.0;
     if cost.is_finite() && cost >= 0.0 {
-        Ok((cost, source))
+        Ok(PricedEvent {
+            cost,
+            source,
+            effective_input_rate: input_rate,
+            effective_cached_input_rate: cached_input_rate,
+            effective_output_rate: output_rate,
+            input_multiplier: multiplier_input,
+            output_multiplier: multiplier_output,
+        })
     } else {
         Err("non-finite token-derived API cost".into())
     }
 }
 
-fn pricing_configuration_digest(settings: &AppSettings) -> Result<String, String> {
+fn pricing_configuration_digest(
+    settings: &AppSettings,
+    remote_pricing: &PricingCatalog,
+) -> Result<String, String> {
     let mut overrides = settings.custom_pricing.clone();
     overrides.sort_by(|left, right| {
         left.model_id
@@ -258,7 +308,8 @@ fn pricing_configuration_digest(settings: &AppSettings) -> Result<String, String
             .cmp(&right.model_id.to_ascii_lowercase())
             .then_with(|| left.alias.cmp(&right.alias))
     });
-    let bytes = serde_json::to_vec(&(PRICING_RULE_VERSION, overrides))
+    let remote_digest = remote_pricing.digest.as_deref().unwrap_or("embedded");
+    let bytes = serde_json::to_vec(&(PRICING_RULE_VERSION, remote_digest, overrides))
         .map_err(|_| "unable to encode pricing configuration".to_string())?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
@@ -272,6 +323,7 @@ struct StoredUsageForPricing {
 pub struct Database {
     pub path: PathBuf,
     connection: Connection,
+    remote_pricing: PricingCatalog,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -404,6 +456,7 @@ impl Database {
             Ok(connection) => Self {
                 path: path.clone(),
                 connection,
+                remote_pricing: PricingCatalog::default(),
             },
             Err(_) if path.exists() => {
                 preserve_database_files(&path)?;
@@ -411,6 +464,7 @@ impl Database {
                     path: path.clone(),
                     connection: open_connection(&path)
                         .map_err(|_| "unable to create clean local database".to_string())?,
+                    remote_pricing: PricingCatalog::default(),
                 }
             }
             Err(error) => return Err(format!("unable to open local database: {error}")),
@@ -422,13 +476,134 @@ impl Database {
                 path: path.clone(),
                 connection: open_connection(&path)
                     .map_err(|_| "unable to create clean local database".to_string())?,
+                remote_pricing: PricingCatalog::default(),
             };
             database.migrate()?;
         }
+        database.load_current_pricing_catalog()?;
+        database.rebuild_quotes()?;
         database.restrict_directory_permissions(&directory);
         database.restrict_file_permissions();
         database.record_app_run()?;
         Ok(database)
+    }
+
+    fn load_current_pricing_catalog(&mut self) -> Result<(), String> {
+        let snapshot: Option<(Option<String>, String)> = self
+            .connection
+            .query_row(
+                "SELECT payload_json, sha256
+                 FROM pricing_snapshots
+                 WHERE source=?1 AND is_current=1
+                 ORDER BY id DESC LIMIT 1",
+                params![pricing::PRICING_SOURCE],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| "unable to read cached models.dev pricing".to_string())?;
+        let Some((Some(payload), digest)) = snapshot else {
+            return Ok(());
+        };
+        let calculated_digest = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        if !calculated_digest.eq_ignore_ascii_case(&digest) {
+            return Ok(());
+        }
+        if let Ok(catalog) = pricing::parse_catalog(&payload, Some(calculated_digest)) {
+            self.remote_pricing = catalog;
+        }
+        Ok(())
+    }
+
+    fn current_models_dev_snapshot(&self) -> Result<Option<(i64, String, Option<String>)>, String> {
+        self.connection
+            .query_row(
+                "SELECT id, sha256, etag
+                 FROM pricing_snapshots
+                 WHERE source=?1 AND is_current=1
+                 ORDER BY id DESC LIMIT 1",
+                params![pricing::PRICING_SOURCE],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| "unable to read models.dev pricing state".to_string())
+    }
+
+    pub fn refresh_models_dev_pricing(&mut self) -> Result<(), String> {
+        let current = if self.remote_pricing.digest.is_some() {
+            self.current_models_dev_snapshot()?
+        } else {
+            None
+        };
+        let current_id = current.as_ref().map(|snapshot| snapshot.0);
+        let etag = current.as_ref().and_then(|snapshot| snapshot.2.as_deref());
+        match pricing::fetch_models_dev(etag)? {
+            pricing::FetchOutcome::NotModified { etag } => {
+                if let Some((snapshot_id, _, _)) = current {
+                    self.connection
+                        .execute(
+                            "UPDATE pricing_snapshots
+                             SET observed_at_ms=?1, etag=COALESCE(?2, etag)
+                             WHERE id=?3",
+                            params![now_ms(), etag, snapshot_id],
+                        )
+                        .map_err(|_| "unable to update models.dev pricing freshness".to_string())?;
+                }
+                Ok(())
+            }
+            pricing::FetchOutcome::Updated {
+                payload,
+                etag,
+                digest,
+                catalog,
+            } => {
+                let transaction = self
+                    .connection
+                    .transaction()
+                    .map_err(|_| "unable to start models.dev pricing transaction".to_string())?;
+                if current
+                    .as_ref()
+                    .is_some_and(|(_, current_digest, _)| current_digest == &digest)
+                {
+                    let current_id = current_id
+                        .ok_or_else(|| "models.dev snapshot identity is missing".to_string())?;
+                    transaction
+                        .execute(
+                            "UPDATE pricing_snapshots
+                             SET observed_at_ms=?1, etag=?2, payload_json=?3, is_current=1
+                             WHERE id=?4",
+                            params![now_ms(), etag, payload, current_id],
+                        )
+                        .map_err(|_| "unable to update cached models.dev pricing".to_string())?;
+                } else {
+                    transaction
+                        .execute(
+                            "UPDATE pricing_snapshots SET is_current=0 WHERE source=?1",
+                            params![pricing::PRICING_SOURCE],
+                        )
+                        .map_err(|_| "unable to rotate models.dev pricing".to_string())?;
+                    transaction
+                        .execute(
+                            "INSERT INTO pricing_snapshots (
+                                source, observed_at_ms, version, etag, sha256, payload_json, is_current
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                            params![
+                                pricing::PRICING_SOURCE,
+                                now_ms(),
+                                "models.dev/api.json",
+                                etag,
+                                digest,
+                                payload
+                            ],
+                        )
+                        .map_err(|_| "unable to store models.dev pricing".to_string())?;
+                }
+                transaction
+                    .commit()
+                    .map_err(|_| "unable to commit models.dev pricing".to_string())?;
+                self.remote_pricing = catalog;
+                self.rebuild_quotes()
+            }
+        }
     }
 
     fn migrate(&mut self) -> Result<(), String> {
@@ -483,6 +658,7 @@ impl Database {
                     version TEXT,
                     etag TEXT,
                     sha256 TEXT NOT NULL,
+                    payload_json TEXT,
                     is_current INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS quota_snapshots (
@@ -585,7 +761,7 @@ impl Database {
                     ON usage_events(account_key, credit_status, timestamp_ms);
                 CREATE INDEX IF NOT EXISTS idx_usage_events_estimation
                     ON usage_events(account_key, timestamp_ms)
-                    WHERE eligible=1 AND pricing_status IN ('official', 'custom');
+                    WHERE eligible=1 AND pricing_status IN ('official', 'custom', 'models_dev');
                 CREATE INDEX IF NOT EXISTS idx_quota_snapshots_account_limit_time
                     ON quota_snapshots(account_key, limit_id, observed_at_ms, id);
                 CREATE INDEX IF NOT EXISTS idx_quota_snapshots_time
@@ -756,6 +932,29 @@ impl Database {
                 )
                 .map_err(|error| format!("pricing and reconstruction migration failed: {error}"))?;
         }
+        if previous_version < 10 {
+            if !self.column_exists("pricing_snapshots", "payload_json")? {
+                self.connection
+                    .execute(
+                        "ALTER TABLE pricing_snapshots ADD COLUMN payload_json TEXT",
+                        [],
+                    )
+                    .map_err(|_| "unable to migrate pricing snapshot payloads".to_string())?;
+            }
+            self.connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     DROP INDEX IF EXISTS idx_usage_events_estimation;
+                     CREATE INDEX idx_usage_events_estimation
+                         ON usage_events(account_key, timestamp_ms)
+                         WHERE eligible=1 AND pricing_status IN ('official', 'custom', 'models_dev');
+                     INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms)
+                         VALUES (10, strftime('%s','now') * 1000);
+                     PRAGMA user_version=10;
+                     COMMIT;",
+                )
+                .map_err(|error| format!("models.dev pricing migration failed: {error}"))?;
+        }
         if self.load_settings().is_err() {
             self.save_settings(&AppSettings::default())?;
         }
@@ -765,10 +964,9 @@ impl Database {
 
     fn ensure_derived_state(&mut self) -> Result<(), String> {
         let settings = self.load_settings()?;
-        let expected_pricing = format!(
-            "{PRICING_RULE_VERSION}:{}",
-            pricing_configuration_digest(&settings)?
-        );
+        let remote_pricing = self.remote_pricing.clone();
+        let pricing_digest = pricing_configuration_digest(&settings, &remote_pricing)?;
+        let expected_pricing = format!("{PRICING_RULE_VERSION}:{}", pricing_digest);
         let pricing_state: Option<String> = self
             .connection
             .query_row(
@@ -796,7 +994,7 @@ impl Database {
             .connection
             .transaction()
             .map_err(|_| "unable to start derived-data rebuild".to_string())?;
-        Self::reprice_usage_events(&transaction, &settings)?;
+        Self::reprice_usage_events(&transaction, &settings, &remote_pricing, &pricing_digest)?;
         Self::rebuild_quotes_in_transaction(&transaction)?;
         Self::set_derived_state(&transaction, "pricing", &expected_pricing)?;
         Self::set_derived_state(&transaction, "reconstruction", RECONSTRUCTION_VERSION)?;
@@ -931,7 +1129,8 @@ impl Database {
         let json = serde_json::to_string(settings)
             .map_err(|_| "unable to serialize settings".to_string())?;
         let previous_digest = self.pricing_configuration_digest()?;
-        let next_digest = pricing_configuration_digest(settings)?;
+        let remote_pricing = self.remote_pricing.clone();
+        let next_digest = pricing_configuration_digest(settings, &remote_pricing)?;
         let transaction = self
             .connection
             .transaction()
@@ -948,7 +1147,7 @@ impl Database {
         // A settings save is the authoritative custom-pricing invalidation path.  The
         // reprice and all dependent reconstruction happen in this same transaction.
         if previous_digest != next_digest {
-            Self::reprice_usage_events(&transaction, settings)?;
+            Self::reprice_usage_events(&transaction, settings, &remote_pricing, &next_digest)?;
             Self::rebuild_quotes_in_transaction(&transaction)?;
             Self::set_derived_state(
                 &transaction,
@@ -965,7 +1164,7 @@ impl Database {
 
     fn pricing_configuration_digest(&self) -> Result<String, String> {
         self.load_settings()
-            .and_then(|settings| pricing_configuration_digest(&settings))
+            .and_then(|settings| pricing_configuration_digest(&settings, &self.remote_pricing))
     }
 
     fn set_derived_state(
@@ -1018,6 +1217,8 @@ impl Database {
         _unused_pricing_snapshot: Option<&P>,
     ) -> Result<usize, String> {
         let settings = self.load_settings()?;
+        let remote_pricing = self.remote_pricing.clone();
+        let pricing_digest = pricing_configuration_digest(&settings, &remote_pricing)?;
         let transaction = self
             .connection
             .transaction()
@@ -1048,7 +1249,14 @@ impl Database {
         let mut inserted = 0;
         let mut earliest_inserted_at_ms = None;
         for event in &collection.events {
-            if Self::persist_event(&transaction, event, account_key, &settings)? {
+            if Self::persist_event(
+                &transaction,
+                event,
+                account_key,
+                &settings,
+                &remote_pricing,
+                &pricing_digest,
+            )? {
                 inserted += 1;
                 earliest_inserted_at_ms = Some(
                     earliest_inserted_at_ms.map_or(event.timestamp_ms, |timestamp: i64| {
@@ -1161,14 +1369,33 @@ impl Database {
         event: &UsageEvent,
         account_key: Option<&str>,
         settings: &AppSettings,
+        remote_pricing: &PricingCatalog,
+        pricing_digest: &str,
     ) -> Result<bool, String> {
-        let pricing = event_cost(event, settings);
-        let pricing_digest = pricing_configuration_digest(settings)?;
-        let (cost_usd, pricing_status, eligible) = match pricing {
-            Ok((cost, source)) => (Some(cost), source, 1_i64),
+        let pricing = event_cost(event, settings, remote_pricing);
+        let (
+            cost_usd,
+            pricing_status,
+            eligible,
+            effective_input_rate,
+            effective_cached_input_rate,
+            effective_output_rate,
+            input_multiplier,
+            output_multiplier,
+        ) = match pricing {
+            Ok(price) => (
+                Some(price.cost),
+                price.source,
+                1_i64,
+                Some(price.effective_input_rate),
+                Some(price.effective_cached_input_rate),
+                Some(price.effective_output_rate),
+                Some(price.input_multiplier),
+                Some(price.output_multiplier),
+            ),
             Err(reason) => {
                 add_diagnostic(transaction, &reason, 1)?;
-                (None, "pending", 0_i64)
+                (None, "pending", 0_i64, None, None, None, None, None)
             }
         };
         let inserted = transaction
@@ -1177,9 +1404,10 @@ impl Database {
                     fingerprint, account_key, timestamp_ms, model_id, original_model_id, input_tokens,
                     cached_input_tokens, output_tokens, reasoning_tokens, long_context, eligible,
                     pricing_status, cost_usd, pricing_rule_version, pricing_source_digest,
-                    quota_reset_at_ms, quota_limit_id
+                    effective_input_rate, effective_cached_input_rate, effective_output_rate,
+                    input_multiplier, output_multiplier, quota_reset_at_ms, quota_limit_id
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17)",
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             )
             .and_then(|mut statement| {
                 statement.execute(params![
@@ -1198,6 +1426,11 @@ impl Database {
                     cost_usd,
                     PRICING_RULE_VERSION,
                     pricing_digest,
+                    effective_input_rate,
+                    effective_cached_input_rate,
+                    effective_output_rate,
+                    input_multiplier,
+                    output_multiplier,
                     event.quota_reset_at_ms,
                     event.quota_limit_id,
                 ])
@@ -1240,12 +1473,20 @@ impl Database {
 
     pub fn rebuild_quotes(&mut self) -> Result<(), String> {
         let settings = self.load_settings()?;
+        let remote_pricing = self.remote_pricing.clone();
+        let pricing_digest = pricing_configuration_digest(&settings, &remote_pricing)?;
         let transaction = self
             .connection
             .transaction()
             .map_err(|_| "unable to start token estimate rebuild".to_string())?;
-        Self::reprice_usage_events(&transaction, &settings)?;
+        Self::reprice_usage_events(&transaction, &settings, &remote_pricing, &pricing_digest)?;
         Self::rebuild_quotes_in_transaction(&transaction)?;
+        Self::set_derived_state(
+            &transaction,
+            "pricing",
+            &format!("{PRICING_RULE_VERSION}:{pricing_digest}"),
+        )?;
+        Self::set_derived_state(&transaction, "reconstruction", RECONSTRUCTION_VERSION)?;
         transaction
             .commit()
             .map_err(|_| "unable to commit token estimate rebuild".to_string())
@@ -1254,6 +1495,8 @@ impl Database {
     fn reprice_usage_events(
         transaction: &Transaction<'_>,
         settings: &AppSettings,
+        remote_pricing: &PricingCatalog,
+        pricing_digest: &str,
     ) -> Result<(), String> {
         let rows = {
             let mut statement = transaction
@@ -1284,20 +1527,30 @@ impl Database {
             rows
         };
         for row in rows {
-            match event_cost(&row.event, settings) {
-                Ok((cost, source)) => {
+            match event_cost(&row.event, settings, remote_pricing) {
+                Ok(price) => {
                     transaction
                         .execute(
                             "UPDATE usage_events
                              SET eligible=1, pricing_status=?2, cost_usd=?3,
-                                 pricing_rule_version=?4, pricing_source_digest=?5
+                                 pricing_rule_version=?4, pricing_source_digest=?5,
+                                 effective_input_rate=?6,
+                                 effective_cached_input_rate=?7,
+                                 effective_output_rate=?8,
+                                 input_multiplier=?9,
+                                 output_multiplier=?10
                              WHERE fingerprint=?1",
                             params![
                                 row.fingerprint,
-                                source,
-                                cost,
+                                price.source,
+                                price.cost,
                                 PRICING_RULE_VERSION,
-                                pricing_configuration_digest(settings)?
+                                pricing_digest,
+                                price.effective_input_rate,
+                                price.effective_cached_input_rate,
+                                price.effective_output_rate,
+                                price.input_multiplier,
+                                price.output_multiplier
                             ],
                         )
                         .map_err(|_| "unable to update repriced usage".to_string())?;
@@ -1307,13 +1560,14 @@ impl Database {
                         .execute(
                             "UPDATE usage_events
                              SET eligible=0, pricing_status='pending', cost_usd=NULL,
-                                 pricing_rule_version=?2, pricing_source_digest=?3
+                                 pricing_rule_version=?2, pricing_source_digest=?3,
+                                 effective_input_rate=NULL,
+                                 effective_cached_input_rate=NULL,
+                                 effective_output_rate=NULL,
+                                 input_multiplier=NULL,
+                                 output_multiplier=NULL
                              WHERE fingerprint=?1",
-                            params![
-                                row.fingerprint,
-                                PRICING_RULE_VERSION,
-                                pricing_configuration_digest(settings)?
-                            ],
+                            params![row.fingerprint, PRICING_RULE_VERSION, pricing_digest],
                         )
                         .map_err(|_| "unable to update pending usage price".to_string())?;
                 }
@@ -1760,7 +2014,7 @@ impl Database {
             .query_row(
                 "SELECT COALESCE(SUM(cost_usd), 0.0)
                  FROM usage_events
-                 WHERE eligible=1 AND pricing_status IN ('official', 'custom')
+                 WHERE eligible=1 AND pricing_status IN ('official', 'custom', 'models_dev')
                    AND timestamp_ms > ?1 AND timestamp_ms <= ?2
                    AND account_key IS ?3
                    AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)",
@@ -1784,7 +2038,7 @@ impl Database {
         transaction
             .query_row(
                 "SELECT COUNT(*) FROM usage_events
-                 WHERE eligible=1 AND pricing_status IN ('official', 'custom')
+                 WHERE eligible=1 AND pricing_status IN ('official', 'custom', 'models_dev')
                    AND timestamp_ms > ?1 AND timestamp_ms <= ?2
                    AND account_key IS ?3
                    AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)",
@@ -1803,7 +2057,7 @@ impl Database {
         let mut statement = transaction
             .prepare(
                 "SELECT DISTINCT pricing_status FROM usage_events
-                 WHERE eligible=1 AND pricing_status IN ('official', 'custom')
+                 WHERE eligible=1 AND pricing_status IN ('official', 'custom', 'models_dev')
                    AND timestamp_ms > ?1 AND timestamp_ms <= ?2
                    AND account_key IS ?3
                    AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)
@@ -2071,7 +2325,7 @@ impl Database {
         self.connection
             .query_row(
                 "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage_events
-                 WHERE eligible=1 AND pricing_status IN ('official', 'custom') AND timestamp_ms >= ?1 AND timestamp_ms <= ?2
+                 WHERE eligible=1 AND pricing_status IN ('official', 'custom', 'models_dev') AND timestamp_ms >= ?1 AND timestamp_ms <= ?2
                    AND account_key IS ?3
                    AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)",
                 params![
@@ -2102,7 +2356,7 @@ impl Database {
                              WHEN COUNT(DISTINCT pricing_status)>1 THEN 'mixed' END
                  FROM usage_events AS event
                  JOIN epochs AS window ON window.id=?1
-                 WHERE event.eligible=1 AND event.pricing_status IN ('official', 'custom')
+                 WHERE event.eligible=1 AND event.pricing_status IN ('official', 'custom', 'models_dev')
                    AND event.timestamp_ms >= window.started_at_ms
                    AND event.timestamp_ms <= COALESCE(window.ended_at_ms, window.started_at_ms)
                    AND event.account_key IS window.account_key
@@ -2445,7 +2699,7 @@ impl Database {
         let priced_events: i64 = self
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM usage_events WHERE eligible=1 AND pricing_status IN ('official', 'custom')",
+                "SELECT COUNT(*) FROM usage_events WHERE eligible=1 AND pricing_status IN ('official', 'custom', 'models_dev')",
                 [],
                 |row| row.get(0),
             )
@@ -2524,7 +2778,7 @@ impl Database {
             model_ids,
             unpriced_model_ids,
             privacy:
-                "Prompts, account identifiers, and full local paths are never stored or returned."
+                "Public models.dev pricing metadata may be fetched at launch; prompts, account identifiers, usage data, and full local paths are never sent or returned."
                     .into(),
         })
     }
@@ -2587,6 +2841,7 @@ mod tests {
         let mut database = Database {
             path: path.clone(),
             connection: open_connection(&path).expect("temporary database"),
+            remote_pricing: PricingCatalog::default(),
         };
         database.migrate().expect("schema");
         (database, path)
@@ -2660,6 +2915,7 @@ mod tests {
         let mut reopened = Database {
             path: path.clone(),
             connection: open_connection(&path).expect("reopen database"),
+            remote_pricing: PricingCatalog::default(),
         };
         let overrides = reopened
             .load_discovery_overrides()
@@ -2739,10 +2995,114 @@ mod tests {
             reasoning_tokens: 3,
             ..UsageEvent::default()
         };
-        let (cost, source) = event_cost(&event, &AppSettings::default()).expect("official price");
+        let priced = event_cost(&event, &AppSettings::default(), &PricingCatalog::default())
+            .expect("official price");
+        let cost = priced.cost;
+        let source = priced.source;
         // 80 normal input + 20 cached input + 8 output; reasoning is a subset of output.
         assert_eq!(source, "official");
         assert!((cost - ((80.0 * 1.75 + 20.0 * 0.175 + 8.0 * 14.0) / 1_000_000.0)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn models_dev_rates_override_embedded_rates_and_custom_prices_still_win() {
+        let remote = pricing::parse_catalog(
+            r#"{"openai":{"models":{"gpt-5.2-codex":{"cost":{"input":9,"cache_read":0.9,"output":11}}}}}"#,
+            Some("remote-digest".into()),
+        )
+        .expect("remote catalog");
+        let event = UsageEvent {
+            model: "gpt-5.2-codex".into(),
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..UsageEvent::default()
+        };
+
+        let remote_price =
+            event_cost(&event, &AppSettings::default(), &remote).expect("models.dev price");
+        assert_eq!(remote_price.source, "models_dev");
+        assert!((remote_price.cost - 20.0).abs() < 1e-12);
+
+        let settings = AppSettings {
+            custom_pricing: vec![crate::models::CustomPriceOverride {
+                model_id: "gpt-5.2-codex".into(),
+                alias: None,
+                input_usd_per_million: 2.0,
+                cached_input_usd_per_million: 0.2,
+                output_usd_per_million: 3.0,
+            }],
+            ..AppSettings::default()
+        };
+        let custom_price = event_cost(&event, &settings, &remote).expect("custom price");
+        assert_eq!(custom_price.source, "custom");
+        assert!((custom_price.cost - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn models_dev_long_context_tier_is_used_without_legacy_multiplier_guessing() {
+        let remote = pricing::parse_catalog(
+            r#"{"openai":{"models":{"gpt-5.6":{"cost":{
+                "input":5,"cache_read":0.5,"output":30,
+                "tiers":[{"tier":{"type":"context","size":272000},
+                "input":10,"cache_read":1,"output":45}]
+            }}}}}"#,
+            Some("tier-digest".into()),
+        )
+        .expect("remote catalog");
+        let event = UsageEvent {
+            model: "gpt-5.6".into(),
+            input_tokens: 300_000,
+            output_tokens: 100_000,
+            ..UsageEvent::default()
+        };
+        let priced = event_cost(&event, &AppSettings::default(), &remote).expect("tier price");
+        assert_eq!(priced.source, "models_dev");
+        assert_eq!(priced.input_multiplier, 1.0);
+        assert_eq!(priced.output_multiplier, 1.0);
+        assert!((priced.cost - 7.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rebuilding_after_a_catalog_change_reprices_historical_events() {
+        let (mut database, path) = database();
+        database.remote_pricing = pricing::parse_catalog(
+            r#"{"openai":{"models":{"gpt-5.2-codex":{"cost":{"input":1,"output":2}}}}}"#,
+            Some("first-digest".into()),
+        )
+        .expect("first catalog");
+        persist(
+            &mut database,
+            vec![event(1_000, Some(1.0), 42.0, Some(10_000))],
+        );
+        let before: (f64, String) = database
+            .connection
+            .query_row(
+                "SELECT cost_usd, pricing_status FROM usage_events LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("initial remote price");
+        assert_eq!(before.1, "models_dev");
+        assert!((before.0 - 1.0).abs() < 1e-12);
+
+        database.remote_pricing = pricing::parse_catalog(
+            r#"{"openai":{"models":{"gpt-5.2-codex":{"cost":{"input":3,"output":4}}}}}"#,
+            Some("second-digest".into()),
+        )
+        .expect("second catalog");
+        database.rebuild_quotes().expect("historical reprice");
+        let after: (f64, String) = database
+            .connection
+            .query_row(
+                "SELECT cost_usd, pricing_status FROM usage_events LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("updated remote price");
+        assert_eq!(after.1, "models_dev");
+        assert!((after.0 - 3.0).abs() < 1e-12);
+        drop(database);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -2753,7 +3113,10 @@ mod tests {
             output_tokens: 100_000,
             ..UsageEvent::default()
         };
-        let (cost, source) = event_cost(&event, &AppSettings::default()).expect("official price");
+        let priced = event_cost(&event, &AppSettings::default(), &PricingCatalog::default())
+            .expect("official price");
+        let cost = priced.cost;
+        let source = priced.source;
         assert_eq!(source, "official");
         assert!((cost - 0.14).abs() < 1e-12);
 
@@ -2764,8 +3127,13 @@ mod tests {
             output_tokens: 100_000,
             ..UsageEvent::default()
         };
-        let (cached_cost, _) =
-            event_cost(&cached_event, &AppSettings::default()).expect("official cached price");
+        let cached_cost = event_cost(
+            &cached_event,
+            &AppSettings::default(),
+            &PricingCatalog::default(),
+        )
+        .expect("official cached price")
+        .cost;
         assert!((cached_cost - 0.122).abs() < 1e-12);
     }
 
@@ -2777,7 +3145,10 @@ mod tests {
             output_tokens: 100_000,
             ..UsageEvent::default()
         };
-        let (cost, source) = event_cost(&event, &AppSettings::default()).expect("official price");
+        let priced = event_cost(&event, &AppSettings::default(), &PricingCatalog::default())
+            .expect("official price");
+        let cost = priced.cost;
+        let source = priced.source;
         assert_eq!(source, "official");
         assert!((cost - 1.4).abs() < 1e-12);
 
@@ -2788,8 +3159,13 @@ mod tests {
             output_tokens: 100_000,
             ..UsageEvent::default()
         };
-        let (cached_cost, _) =
-            event_cost(&cached_event, &AppSettings::default()).expect("official cached price");
+        let cached_cost = event_cost(
+            &cached_event,
+            &AppSettings::default(),
+            &PricingCatalog::default(),
+        )
+        .expect("official cached price")
+        .cost;
         assert!((cached_cost - 1.22).abs() < 1e-12);
     }
 
@@ -3033,7 +3409,7 @@ mod tests {
                 "EXPLAIN QUERY PLAN
                  SELECT COALESCE(SUM(cost_usd), 0.0)
                  FROM usage_events
-                 WHERE eligible=1 AND pricing_status IN ('official', 'custom')
+                 WHERE eligible=1 AND pricing_status IN ('official', 'custom', 'models_dev')
                    AND timestamp_ms > ?1 AND timestamp_ms <= ?2
                    AND account_key IS ?3
                    AND (quota_limit_id IS ?4 OR quota_limit_id IS NULL)",
@@ -3599,6 +3975,7 @@ mod tests {
         let mut reopened = Database {
             path: path.clone(),
             connection: open_connection(&path).expect("reopen database"),
+            remote_pricing: PricingCatalog::default(),
         };
         reopened.migrate().expect("reopen schema");
         reopened.rebuild_quotes().expect("rebuild");

@@ -4,7 +4,7 @@ Date: 2026-08-09
 
 ## Product shape
 
-NerfTrack is a local-only Tauri 2 desktop application with a React/TypeScript frontend and a Rust collector, parser, SQLite store, and weekly API-equivalent estimator. It reads local Codex desktop-app or CLI JSONL through one pipeline and exposes only typed aggregate DTOs.
+NerfTrack is a local-first Tauri 2 desktop application with a React/TypeScript frontend and a Rust collector, parser, SQLite store, pricing refresh, and weekly API-equivalent estimator. It reads local Codex desktop-app or CLI JSONL through one pipeline and exposes only typed aggregate DTOs; the pricing refresh requests only public models.dev metadata.
 
 ## Portability and cleanup scope
 
