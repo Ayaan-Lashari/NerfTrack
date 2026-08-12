@@ -143,7 +143,7 @@ fn release_version(tag: &str) -> Result<Version, String> {
 
 #[cfg(target_os = "windows")]
 fn supported_asset_extension(extension: &str) -> bool {
-    matches!(extension, "msi" | "exe")
+    extension == "exe"
 }
 
 #[cfg(target_os = "macos")]
@@ -561,9 +561,9 @@ fn launch_installer(
     extension: &str,
     app: &tauri::AppHandle,
 ) -> Result<InstallUpdateResult, String> {
-    if !matches!(extension, "msi" | "exe") {
+    if extension != "exe" {
         return Err(
-            "NerfTrack can apply Windows updates only from an MSI or NSIS installer".into(),
+            "NerfTrack can apply Windows updates only from its current-user NSIS installer".into(),
         );
     }
     let executable = std::env::current_exe()
@@ -701,6 +701,59 @@ fn relaunch_windows_app(target_executable: &Path) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_directory_is_writable(directory: &Path) -> bool {
+    if !directory.is_dir() {
+        return false;
+    }
+    let probe = directory.join(format!(
+        ".nerftrack-update-probe-{}.tmp",
+        std::process::id()
+    ));
+    let Ok(file) = std_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    else {
+        return false;
+    };
+    drop(file);
+    std_fs::remove_file(probe).is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_user_install_target(target_executable: &Path) -> Result<PathBuf, String> {
+    let executable_name = target_executable
+        .file_name()
+        .ok_or_else(|| "the NerfTrack executable has no valid name".to_string())?;
+    let current_directory = target_executable
+        .parent()
+        .ok_or_else(|| "the NerfTrack executable has no parent directory".to_string())?;
+    if windows_directory_is_writable(current_directory) {
+        return Ok(target_executable.to_path_buf());
+    }
+
+    let local_app_data = std::env::var_os("LOCALAPPDATA").or_else(|| {
+        std::env::var_os("USERPROFILE").map(|profile| {
+            PathBuf::from(profile)
+                .join("AppData")
+                .join("Local")
+                .into_os_string()
+        })
+    });
+    let local_app_data = local_app_data.map(PathBuf::from).ok_or_else(|| {
+        "Windows could not locate the current user's app-data directory".to_string()
+    })?;
+    let install_directory = local_app_data.join("NerfTrack");
+    std_fs::create_dir_all(&install_directory).map_err(|_| {
+        "Windows could not prepare the current-user NerfTrack directory".to_string()
+    })?;
+    if !windows_directory_is_writable(&install_directory) {
+        return Err("the current-user NerfTrack directory is not writable".into());
+    }
+    Ok(install_directory.join(executable_name))
+}
+
+#[cfg(target_os = "windows")]
 fn apply_windows_update(
     parent_pid: u32,
     update_path: &Path,
@@ -711,41 +764,35 @@ fn apply_windows_update(
         return Err("the installed NerfTrack executable is unavailable".into());
     }
     let previous_digest = file_sha256(target_executable)?;
+    let install_target = windows_user_install_target(target_executable)?;
+    let install_directory = install_target
+        .parent()
+        .ok_or_else(|| "the NerfTrack executable has no parent directory".to_string())?;
     let extension = update_path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.to_ascii_lowercase())
         .unwrap_or_default();
-    let mut installer = if extension == "msi" {
-        let mut command = Command::new("msiexec");
-        command
-            .arg("/i")
-            .arg(update_path)
-            .args(["/qn", "/norestart"]);
-        command
-    } else {
-        let install_directory = target_executable.parent().ok_or_else(|| {
-            "the installed NerfTrack executable has no parent directory".to_string()
-        })?;
-        let mut command = Command::new(update_path);
-        // Tauri's release artifacts are NSIS installers. /D must be the final
-        // argument so an update cannot silently install beside the existing app.
-        command.arg("/S");
-        command.arg(format!("/D={}", install_directory.display()));
-        command
-    };
+    if extension != "exe" {
+        return Err("the downloaded Windows update is not a current-user NSIS installer".into());
+    }
+    let mut installer = Command::new(update_path);
+    // Tauri's release artifacts are current-user NSIS installers. Keep the
+    // destination in a user-writable directory so the update never needs UAC.
+    installer.arg("/S");
+    installer.arg(format!("/D={}", install_directory.display()));
     let status = installer
         .status()
         .map_err(|_| "Windows could not launch the NerfTrack installer".to_string())?;
     if !status.success() {
         return Err(format!("the NerfTrack installer exited with {status}"));
     }
-    let updated_digest = file_sha256(target_executable)?;
+    let updated_digest = file_sha256(&install_target)?;
     if updated_digest == previous_digest {
         return Err("the NerfTrack installer completed without replacing the installed app".into());
     }
     let _ = std_fs::remove_file(update_path);
-    relaunch_windows_app(target_executable)
+    relaunch_windows_app(&install_target)
 }
 
 #[cfg(target_os = "macos")]
@@ -953,42 +1000,18 @@ fn target_parent_is_writable(target_bundle: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
-}
-
-#[cfg(target_os = "macos")]
-fn apple_script_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-#[cfg(target_os = "macos")]
-fn replace_app_bundle_with_admin(
-    source: &Path,
-    target: &Path,
-    staging: &Path,
-    backup: &Path,
-) -> Result<(), String> {
-    let command = format!(
-        "set -e; /usr/bin/ditto {source} {staging}; /bin/mv {target} {backup}; if ! /bin/mv {staging} {target}; then /bin/mv {backup} {target}; exit 1; fi; /bin/rm -rf {backup}",
-        source = shell_quote(source),
-        staging = shell_quote(staging),
-        target = shell_quote(target),
-        backup = shell_quote(backup),
-    );
-    let script = format!(
-        "do shell script \"{}\" with administrator privileges",
-        apple_script_escape(&command)
-    );
-    let status = Command::new("/usr/bin/osascript")
-        .args(["-e", &script])
-        .status()
-        .map_err(|_| "macOS could not request permission to replace NerfTrack".to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("macOS did not grant permission to replace the NerfTrack app".into())
-    }
+fn user_applications_bundle(target_bundle: &Path) -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "macOS could not locate the current user's home directory".to_string())?;
+    let applications = home.join("Applications");
+    std_fs::create_dir_all(&applications)
+        .map_err(|_| "macOS could not create the user Applications directory".to_string())?;
+    let name = target_bundle
+        .file_name()
+        .ok_or_else(|| "the NerfTrack app bundle has an invalid name".to_string())?;
+    Ok(applications.join(name))
 }
 
 #[cfg(target_os = "macos")]
@@ -1007,13 +1030,13 @@ fn copy_app_bundle(source: &Path, target: &Path) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn replace_app_bundle(source: &Path, target: &Path) -> Result<(), String> {
-    if !is_app_bundle(source) || !is_app_bundle(target) {
+    if !is_app_bundle(source) || (target.exists() && !is_app_bundle(target)) {
         return Err("the NerfTrack update bundle layout is invalid".into());
     }
     let staging = update_staging_path(target)?;
     let backup = update_backup_path(target)?;
     if !target_parent_is_writable(target) {
-        return replace_app_bundle_with_admin(source, target, &staging, &backup);
+        return Err("the NerfTrack installation directory is not writable".into());
     }
     if let Err(error) = copy_app_bundle(source, &staging) {
         let _ = std::fs::remove_dir_all(&staging);
@@ -1023,18 +1046,20 @@ fn replace_app_bundle(source: &Path, target: &Path) -> Result<(), String> {
         let _ = std::fs::remove_dir_all(&staging);
         return Err("macOS could not validate the staged NerfTrack app bundle".into());
     }
-    if let Err(error) = std::fs::rename(target, &backup) {
-        let _ = std::fs::remove_dir_all(&staging);
-        if !target_parent_is_writable(target) {
-            return replace_app_bundle_with_admin(source, target, &staging, &backup);
+    let had_existing_target = target.exists();
+    if had_existing_target {
+        if let Err(error) = std::fs::rename(target, &backup) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!(
+                "macOS could not move the current NerfTrack app aside for updating: {error}"
+            ));
         }
-        return Err(format!(
-            "macOS could not move the current NerfTrack app aside for updating: {error}"
-        ));
     }
     if let Err(error) = std::fs::rename(&staging, target) {
         let _ = std::fs::remove_dir_all(&staging);
-        let restore_error = std::fs::rename(&backup, target).err();
+        let restore_error = had_existing_target
+            .then(|| std::fs::rename(&backup, target).err())
+            .flatten();
         return match restore_error {
             Some(restore_error) => Err(format!(
                 "macOS could not install the staged NerfTrack app: {error}; the previous app could not be restored: {restore_error}"
@@ -1042,7 +1067,9 @@ fn replace_app_bundle(source: &Path, target: &Path) -> Result<(), String> {
             None => Err(format!("macOS could not install the staged NerfTrack app: {error}")),
         };
     }
-    let _ = std::fs::remove_dir_all(&backup);
+    if had_existing_target {
+        let _ = std::fs::remove_dir_all(&backup);
+    }
     Ok(())
 }
 
@@ -1071,8 +1098,8 @@ fn apply_macos_update(
     let executable_name = current_executable
         .file_name()
         .ok_or_else(|| "the running NerfTrack executable has no valid name".to_string())?;
-    let target_executable = target_bundle.join("Contents/MacOS").join(executable_name);
-    let previous_digest = file_sha256(&target_executable)?;
+    let current_target_executable = target_bundle.join("Contents/MacOS").join(executable_name);
+    let previous_digest = file_sha256(&current_target_executable)?;
     let extension = update_path
         .extension()
         .and_then(|value| value.to_str())
@@ -1091,14 +1118,22 @@ fn apply_macos_update(
                 "the downloaded NerfTrack app is identical to the installed version".into(),
             );
         }
-        replace_app_bundle(&source_bundle, target_bundle)?;
+        let install_target = if target_parent_is_writable(target_bundle) {
+            target_bundle.to_path_buf()
+        } else {
+            user_applications_bundle(target_bundle)?
+        };
+        replace_app_bundle(&source_bundle, &install_target)?;
+        let updated_executable = install_target.join("Contents/MacOS").join(executable_name);
+        let updated_digest = file_sha256(&updated_executable)?;
+        if updated_digest == previous_digest {
+            return Err(
+                "the downloaded NerfTrack app did not replace the installed version".into(),
+            );
+        }
+        let _ = std_fs::remove_file(update_path);
+        relaunch_app(&install_target)
     }
-    let updated_digest = file_sha256(&target_executable)?;
-    if updated_digest == previous_digest {
-        return Err("the downloaded NerfTrack app did not replace the installed version".into());
-    }
-    let _ = std_fs::remove_file(update_path);
-    relaunch_app(target_bundle)
 }
 
 fn record_update_failure(message: &str) {
