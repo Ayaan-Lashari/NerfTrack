@@ -1,7 +1,7 @@
 {
   "name": "nerftrack",
   "private": true,
-  "version": "0.5.5",
+  "version": "0.6.0",
   "license": "GPL-3.0-only",
   "type": "module",
   "scripts": {
