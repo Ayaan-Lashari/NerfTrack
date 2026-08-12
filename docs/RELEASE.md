@@ -8,14 +8,14 @@ Signing and notarization are secret-driven release steps and are not part of pul
 
 ## Release workflow
 
-Push a semver tag such as `v0.5.0`. The workflow validates that the tag matches the application manifests, runs the existing frontend and Rust gates, builds with Tauri's native target, normalizes the output names, and creates one GitHub Release only after all four jobs succeed.
+Push a semver tag such as `v0.5.2`. The workflow validates that the tag matches the application manifests, runs the existing frontend and Rust gates, builds with Tauri's native target, normalizes the output names, and creates one GitHub Release only after all four jobs succeed.
 
 The exact asset names are:
 
-- `NerfTrack-0.5.0-macos-arm64.dmg`
-- `NerfTrack-0.5.0-macos-x86_64.dmg`
-- `NerfTrack-0.5.0-windows-x64-setup.exe`
-- `NerfTrack-0.5.0-windows-arm64-setup.exe`
+- `NerfTrack-0.5.2-macos-arm64.dmg`
+- `NerfTrack-0.5.2-macos-x86_64.dmg`
+- `NerfTrack-0.5.2-windows-x64-setup.exe`
+- `NerfTrack-0.5.2-windows-arm64-setup.exe`
 
 The workflow uploads unsigned artifacts. Code signing, macOS notarization, and any signing credentials remain outside the repository and are not required for the public build workflow.
 
@@ -24,7 +24,12 @@ The workflow uploads unsigned artifacts. Code signing, macOS notarization, and a
 The desktop app checks only GitHub's `releases/latest` API endpoint for the configured public repository. The release build points `GITHUB_REPOSITORY_URL` in `src/lib/config.ts` at `https://github.com/Ayaan-Lashari/NerfTrack`; forks should change that value before distributing their own builds. The same configured repository is used by the first-run GitHub star page.
 
 The updater also recognizes Tauri-style `x86_64`, `aarch64`, and `x64-setup` names. It compares
-the release tag with the installed version, validates the selected asset and download size/hash,
-then launches Windows MSI/NSIS or macOS package handling from a private temporary directory. A
-missing repository, missing release, invalid tag, unsupported asset, failed download, or unsupported
+the release tag with the installed version and validates the selected asset and download size/hash.
+On macOS, a DMG or ZIP is applied in place: NerfTrack closes, a detached helper waits for the
+process to exit, stages and verifies the new `.app` bundle, requests administrator permission when
+the install directory requires it, cleans up the temporary package, and reopens the updated app.
+Windows uses the same detached-helper flow for its NSIS installer: it waits for NerfTrack to close,
+installs into the running executable's directory, verifies that the executable changed, and
+relaunches it. A failed helper is recorded and shown after the old app is reopened. A missing
+repository, missing release, invalid tag, unsupported asset, failed download, or unsupported
 platform is shown in the Update control rather than interrupting the main UI.
