@@ -309,13 +309,6 @@ function HomeView({
           >
             <Icon name="refresh" size={19} />
           </button>
-          <button
-            className="more-button"
-            aria-label="More chart options"
-            onClick={onResetAnnotations}
-          >
-            <Icon name="more" size={23} />
-          </button>
         </div>
       </header>
       <div className="quote-heading">
