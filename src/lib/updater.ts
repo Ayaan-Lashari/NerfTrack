@@ -65,6 +65,11 @@ export async function installUpdate(path: string) {
   return invoke<InstallUpdateResult>('install_update', { path });
 }
 
+export async function consumeUpdateFailure() {
+  if (!isTauri()) return null;
+  return invoke<string | null>('consume_update_failure');
+}
+
 export async function openExternalUrl(url: string) {
   if (!url.trim()) throw new Error('The NerfTrack GitHub URL has not been configured yet.');
   if (!isTauri()) {
