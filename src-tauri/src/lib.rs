@@ -618,6 +618,7 @@ pub fn run() {
             updater::check_for_update,
             updater::download_update,
             updater::install_update,
+            updater::consume_update_failure,
             updater::open_external_url
         ])
         .run(tauri::generate_context!())

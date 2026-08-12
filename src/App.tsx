@@ -38,6 +38,7 @@ import { demoQuote, demoStatus } from './lib/fixtures';
 import { GITHUB_REPOSITORY_URL } from './lib/config';
 import {
   checkForUpdate,
+  consumeUpdateFailure,
   CURRENT_APP_VERSION,
   downloadUpdate,
   initialUpdateState,
@@ -503,8 +504,20 @@ export default function App() {
       message: 'Checking GitHub Releases for the latest NerfTrack build…',
     }));
     try {
-      const result = await checkForUpdate(GITHUB_REPOSITORY_URL);
-      setUpdateState(updateStateFromResult(result));
+      const [result, previousFailure] = await Promise.all([
+        checkForUpdate(GITHUB_REPOSITORY_URL),
+        consumeUpdateFailure().catch(() => null),
+      ]);
+      const nextState = updateStateFromResult(result);
+      setUpdateState(
+        previousFailure
+          ? {
+              ...nextState,
+              status: 'failed',
+              message: `Previous update attempt failed: ${previousFailure}`,
+            }
+          : nextState,
+      );
     } catch (cause) {
       setUpdateState((current) => ({
         ...current,
