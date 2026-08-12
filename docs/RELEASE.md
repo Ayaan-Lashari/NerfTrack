@@ -25,8 +25,11 @@ The desktop app checks only GitHub's `releases/latest` API endpoint for the conf
 
 The updater also recognizes Tauri-style `x86_64`, `aarch64`, and `x64-setup` names. It compares
 the release tag with the installed version and validates the selected asset and download size/hash.
-On macOS, a DMG or ZIP is applied in place: NerfTrack closes, the helper replaces the exact running
-`.app` bundle, cleans up the temporary package, and reopens the updated app. Windows continues to
-use its native NSIS installer. A missing repository, missing release, invalid tag, unsupported
-asset, failed download, or unsupported platform is shown in the Update control rather than
-interrupting the main UI.
+On macOS, a DMG or ZIP is applied in place: NerfTrack closes, a detached helper waits for the
+process to exit, stages and verifies the new `.app` bundle, requests administrator permission when
+the install directory requires it, cleans up the temporary package, and reopens the updated app.
+Windows uses the same detached-helper flow for its NSIS installer: it waits for NerfTrack to close,
+installs into the running executable's directory, verifies that the executable changed, and
+relaunches it. A failed helper is recorded and shown after the old app is reopened. A missing
+repository, missing release, invalid tag, unsupported asset, failed download, or unsupported
+platform is shown in the Update control rather than interrupting the main UI.
