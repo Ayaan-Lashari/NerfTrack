@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-// This persisted identifier stays stable so a branding change does not invalidate
-// derived data or force an unnecessary rebuild for existing installations.
-pub const ALGORITHM_VERSION: &str = "nerftrack-token-api-equivalent-v4";
+// This persisted identifier changes when token-accounting semantics change so
+// existing derived data is invalidated and rebuilt deterministically.
+pub const ALGORITHM_VERSION: &str = "nerftrack-token-api-equivalent-v5";
 /// This is deliberately independent from the SQLite schema and estimator versions.
 pub const PRICING_RULE_VERSION: &str = "models-dev-openai-pricing-v1";
-pub const RECONSTRUCTION_VERSION: &str = "weekly-window-reconstruction-v4";
+pub const RECONSTRUCTION_VERSION: &str = "weekly-window-reconstruction-v5";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]

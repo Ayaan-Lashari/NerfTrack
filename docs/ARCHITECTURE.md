@@ -37,11 +37,14 @@ The selected home determines the integration mode. A recognized desktop-app root
 
 Desktop and CLI records use the same collector, parser, storage, and estimator pipeline. The collector traverses only real directories, tracks canonical directories, skips recursive links, preserves byte-offset/parser-state checkpoints, and reports unreadable files or partial scans as diagnostics and failed refresh status. Spaces, Unicode, parentheses, and platform path separators are handled through `Path` APIs.
 
-`parser.rs` reads newline-terminated JSONL records, tolerates a partial final line, converts cumulative per-turn token updates into deltas, extracts weekly quota observations, and accepts only explicit logged credits or logged charges as credit sources. It emits fingerprints and normalized model data rather than raw content.
+`parser.rs` reads newline-terminated JSONL records, tolerates a partial final line, converts cumulative per-turn token updates into deltas, extracts weekly quota observations, and tracks `thread_settings_applied` service-tier records in chronological per-rollout/session state. Only `priority` and `fast` are explicit Fast evidence; `default` is Standard and missing/unrecognized tiers remain Unknown. It emits fingerprints and normalized model/speed data rather than raw content. No timing, TPS, current config, provider, or authentication heuristic participates in speed classification.
 
 Startup opens and migrates the SQLite schema without rebuilding historical derived data. A
-named Rust background worker then refreshes pricing, reprices historical events, rebuilds the
-graphs, and imports new Codex log data. Status commands never wait for that first rebuild;
+named Rust background worker then refreshes pricing, reparses all discoverable source JSONL
+rollouts, corrects explicitly evidenced historical speed fields, reprices historical events,
+rebuilds the graphs, and imports new Codex log data. The source scan and every SQLite mutation
+needed for the correction are committed transactionally; failed scans or rebuilds preserve the
+previous graph. Status commands never wait for that first rebuild;
 the UI reports `Updating local data` while it is in progress. Later refreshes schedule one
 background reconciliation at a time, so a large JSONL tree cannot freeze the application window.
 
@@ -49,7 +52,11 @@ background reconciliation at a time, so a large JSONL tree cannot freeze the app
 
 `storage.rs` owns the SQLite schema, WAL, foreign keys, owner-restricted files, migrations, weekly-window rebuilding, measurements, estimates, settings, diagnostics, and DTO query projections. The production database is `nerftrack.db` under the platform-native per-user application-data directory, independent of the process working directory.
 
-The database stores accounts, source checkpoints, parsed usage events, quota snapshots, weekly windows, measurements, estimates, annotations, settings, diagnostics, and app-run boundaries. It does not store prompts, raw account identifiers, or raw JSONL lines. `estimator.rs` keeps invalid intervals pending or rejected rather than fabricating zero values.
+The database stores accounts, source checkpoints, parsed usage events, normalized `speed_mode`,
+`speed_source`, and `fast_multiplier` evidence, quota snapshots, weekly windows, measurements,
+estimates, annotations, settings, diagnostics, and app-run boundaries. It does not store prompts,
+raw account identifiers, or raw JSONL lines. `estimator.rs` keeps invalid intervals pending or
+rejected rather than fabricating zero values.
 
 ## Pricing refresh and historical repricing
 
@@ -58,7 +65,10 @@ payload size, using ETags when available. NerfTrack selects only token-priced en
 direct OpenAI provider, stores the last valid payload and digest locally, and falls back to the
 embedded catalog if the network is unavailable. Manual overrides are checked first.
 
-When the catalog digest changes, `storage.rs` updates the effective rates on every stored usage
-event and rebuilds all dependent measurements, quotes, epochs, and chart projections in the
-startup background worker. This keeps historical graphs and calculations aligned with the
-current model pricing while retaining the source and effective rates used for audit.
+When the catalog digest or estimator algorithm changes, `storage.rs` updates the effective rates
+and explicit Fast multiplier on every stored usage event and rebuilds all dependent measurements,
+quotes, epochs, and chart projections in the startup background worker. The ordinary token API
+cost is multiplied by the persisted Fast multiplier before estimator pairing; the multiplier is
+never reduced for Fast-mode wall-clock speed. This keeps historical graphs and calculations
+aligned with current pricing and explicit rollout evidence while retaining the source and
+effective rates used for audit.

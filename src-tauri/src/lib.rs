@@ -116,10 +116,12 @@ impl AppState {
             .name("nerftrack-background-init".into())
             .spawn(move || {
                 let result = (|| {
+                    let historical_home =
+                        discovery::discover_codex_home(home_override.as_deref()).0;
                     database
                         .lock()
                         .map_err(|_| "database writer is unavailable".to_string())?
-                        .initialize_background()?;
+                        .initialize_background(historical_home.as_deref())?;
                     Self::reconcile_with_database(&database, home_override.as_deref())
                 })();
                 if let Ok(mut work) = background.lock() {
@@ -171,10 +173,12 @@ impl AppState {
             .spawn(move || {
                 let result = (|| {
                     if reinitialize {
+                        let historical_home =
+                            discovery::discover_codex_home(home_override.as_deref()).0;
                         database
                             .lock()
                             .map_err(|_| "database writer is unavailable".to_string())?
-                            .initialize_background()?;
+                            .initialize_background(historical_home.as_deref())?;
                     }
                     Self::reconcile_with_database(&database, home_override.as_deref())
                 })();

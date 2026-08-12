@@ -7,7 +7,58 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Read;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeedMode {
+    Standard,
+    Fast,
+    #[default]
+    Unknown,
+}
+
+impl SpeedMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Fast => "fast",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_stored(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "standard" => Self::Standard,
+            "fast" => Self::Fast,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeedSource {
+    RolloutSetting,
+    #[default]
+    None,
+}
+
+impl SpeedSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RolloutSetting => "rollout_setting",
+            Self::None => "none",
+        }
+    }
+
+    pub fn from_stored(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "rollout_setting" => Self::RolloutSetting,
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct UsageEvent {
     pub timestamp_ms: i64,
     pub model: String,
@@ -24,13 +75,44 @@ pub struct UsageEvent {
     pub custom_alias: bool,
     pub long_context: bool,
     pub long_context_multiplier: f64,
-    pub fast_mode: bool,
-    pub fast_mode_multiplier: f64,
+    pub speed_mode: SpeedMode,
+    pub speed_source: SpeedSource,
+    pub fast_multiplier: f64,
     pub quota_used_percent: Option<f64>,
     pub quota_reset_at_ms: Option<i64>,
     pub quota_window_minutes: Option<f64>,
     pub quota_limit_id: Option<String>,
     pub plan: Option<String>,
+}
+
+impl Default for UsageEvent {
+    fn default() -> Self {
+        Self {
+            timestamp_ms: 0,
+            model: String::new(),
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            request_id: None,
+            turn_id: None,
+            session_id: None,
+            explicit_provider: None,
+            explicit_backend: None,
+            authenticated_official_codex: false,
+            custom_alias: false,
+            long_context: false,
+            long_context_multiplier: 1.0,
+            speed_mode: SpeedMode::Unknown,
+            speed_source: SpeedSource::None,
+            fast_multiplier: 1.0,
+            quota_used_percent: None,
+            quota_reset_at_ms: None,
+            quota_window_minutes: None,
+            quota_limit_id: None,
+            plan: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,6 +129,8 @@ pub struct ParserState {
     pub active_backend: Option<String>,
     pub active_session_id: Option<String>,
     pub active_turn_id: Option<String>,
+    #[serde(default)]
+    pub service_tiers: BTreeMap<String, SpeedMode>,
     pub cumulative: BTreeMap<String, CumulativeTotals>,
 }
 
@@ -184,6 +268,115 @@ fn bool_at(value: &Value, paths: &[&[&str]]) -> bool {
         .unwrap_or(false)
 }
 
+fn normalized_model_id(model: &str) -> String {
+    model.trim().to_ascii_lowercase().replace('/', "-")
+}
+
+fn is_model_family(model: &str, family: &str) -> bool {
+    model == family
+        || model
+            .strip_prefix(family)
+            .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('.'))
+}
+
+/// Fast pricing is evidence-driven. The parser never reads local configuration,
+/// timing data, provider metadata, or any other heuristic to select this mode.
+pub fn fast_multiplier_for_model(model: &str, speed_mode: SpeedMode) -> f64 {
+    if speed_mode != SpeedMode::Fast {
+        return 1.0;
+    }
+    let normalized = normalized_model_id(model);
+    let normalized = normalized.strip_prefix("openai-").unwrap_or(&normalized);
+    if is_model_family(normalized, "gpt-5.4") {
+        2.0
+    } else {
+        // GPT-5.5, GPT-5.6, and explicitly fast unknown/future models all use
+        // the exact 2.5x Fast credit multiplier.
+        2.5
+    }
+}
+
+fn speed_from_service_tier(value: Option<&Value>) -> SpeedMode {
+    match value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("priority") | Some("fast") => SpeedMode::Fast,
+        Some("default") => SpeedMode::Standard,
+        _ => SpeedMode::Unknown,
+    }
+}
+
+fn setting_scope_keys(value: &Value, state: &ParserState) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    for path in [
+        &["session_id"][..],
+        &["sessionId"][..],
+        &["session", "id"][..],
+        &["thread_id"][..],
+        &["threadId"][..],
+        &["thread", "id"][..],
+        &["rollout_id"][..],
+        &["rolloutId"][..],
+        &["payload", "session_id"][..],
+        &["payload", "sessionId"][..],
+        &["payload", "session", "id"][..],
+        &["payload", "thread_id"][..],
+        &["payload", "threadId"][..],
+        &["payload", "thread", "id"][..],
+        &["payload", "rollout_id"][..],
+        &["payload", "rolloutId"][..],
+        &["payload", "thread_settings", "thread_id"][..],
+        &["payload", "thread_settings", "threadId"][..],
+    ] {
+        if let Some(identifier) = nested(value, &[path]).and_then(Value::as_str) {
+            if !identifier.trim().is_empty() {
+                let key = opaque_identifier(identifier);
+                if !identifiers.contains(&key) {
+                    identifiers.push(key);
+                }
+            }
+        }
+    }
+    if identifiers.is_empty() {
+        if let Some(active_session_id) = state.active_session_id.clone() {
+            identifiers.push(active_session_id);
+        } else {
+            identifiers.push("file".into());
+        }
+    }
+    identifiers
+}
+
+fn event_scope_key(session_from_record: Option<&str>, state: &ParserState) -> String {
+    session_from_record
+        .filter(|session| !session.trim().is_empty())
+        .map(opaque_identifier)
+        .or_else(|| state.active_session_id.clone())
+        .unwrap_or_else(|| "file".into())
+}
+
+fn active_speed_for_event(
+    session_from_record: Option<&str>,
+    state: &ParserState,
+) -> (SpeedMode, SpeedSource) {
+    let scope = event_scope_key(session_from_record, state);
+    let mode = state
+        .service_tiers
+        .get(&scope)
+        .copied()
+        .or_else(|| state.service_tiers.get("file").copied())
+        .unwrap_or_default();
+    let source = if matches!(mode, SpeedMode::Fast | SpeedMode::Standard) {
+        SpeedSource::RolloutSetting
+    } else {
+        SpeedSource::None
+    };
+    (mode, source)
+}
+
 fn opaque_identifier(value: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"nerftrack-parser-id:");
@@ -288,9 +481,19 @@ pub fn parse_jsonl_line_with_state(
             &["session_id"],
             &["sessionId"],
             &["session", "id"],
+            &["thread_id"],
+            &["threadId"],
+            &["thread", "id"],
+            &["rollout_id"],
+            &["rolloutId"],
             &["payload", "session_id"],
             &["payload", "sessionId"],
             &["payload", "session", "id"],
+            &["payload", "thread_id"],
+            &["payload", "threadId"],
+            &["payload", "thread", "id"],
+            &["payload", "rollout_id"],
+            &["payload", "rolloutId"],
         ],
     );
     let turn_from_record = string_at(
@@ -319,7 +522,23 @@ pub fn parse_jsonl_line_with_state(
     if let Some(turn_id) = turn_from_record.clone() {
         state.active_turn_id = Some(opaque_identifier(&turn_id));
     }
-    if is_turn_context && usage.is_none() {
+
+    let is_thread_settings_applied = string_at(&value, &[&["payload", "type"]])
+        .is_some_and(|value| value.eq_ignore_ascii_case("thread_settings_applied"));
+    if is_thread_settings_applied {
+        let speed_mode = speed_from_service_tier(nested(
+            &value,
+            &[
+                &["payload", "thread_settings", "service_tier"],
+                &["payload", "thread_settings", "serviceTier"],
+            ],
+        ));
+        for scope in setting_scope_keys(&value, state) {
+            state.service_tiers.insert(scope, speed_mode);
+        }
+    }
+
+    if (is_turn_context || is_thread_settings_applied) && usage.is_none() {
         return Ok(None);
     }
     let usage = usage.unwrap_or(&value);
@@ -414,7 +633,8 @@ pub fn parse_jsonl_line_with_state(
         || quota_limit_id
             .as_deref()
             .is_some_and(|limit| limit.eq_ignore_ascii_case("codex"));
-    let fast_mode = bool_at(&value, &[&["fast_mode"], &["payload", "fast_mode"]]);
+    let (speed_mode, speed_source) = active_speed_for_event(session_from_record.as_deref(), state);
+    let fast_multiplier = fast_multiplier_for_model(&model, speed_mode);
     let long_context = bool_at(&value, &[&["long_context"], &["payload", "long_context"]]);
     Ok(Some(UsageEvent {
         timestamp_ms: timestamp_ms(&value),
@@ -453,17 +673,9 @@ pub fn parse_jsonl_line_with_state(
         .and_then(Value::as_f64)
         .filter(|number| number.is_finite() && *number > 0.0)
         .unwrap_or(1.0),
-        fast_mode,
-        fast_mode_multiplier: nested(
-            &value,
-            &[
-                &["fast_mode_multiplier"],
-                &["payload", "fast_mode_multiplier"],
-            ],
-        )
-        .and_then(Value::as_f64)
-        .filter(|number| number.is_finite() && *number > 0.0)
-        .unwrap_or(1.0),
+        speed_mode,
+        speed_source,
+        fast_multiplier,
         quota_used_percent,
         quota_reset_at_ms,
         quota_window_minutes,
@@ -723,5 +935,154 @@ mod tests {
         )
         .expect("event");
         assert_eq!(event.input_tokens, 10);
+    }
+
+    fn setting_line(session_id: &str, service_tier: Option<&str>) -> String {
+        let tier = service_tier
+            .map(|value| format!(r#","service_tier":"{value}""#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"timestamp":1735689600,"type":"event_msg","payload":{{"type":"thread_settings_applied","session_id":"{session_id}","thread_settings":{{{tier_trim}}}}}}}"#,
+            tier_trim = tier.trim_start_matches(',')
+        )
+    }
+
+    fn token_line(timestamp: i64, model: &str, session_id: &str) -> String {
+        format!(
+            r#"{{"timestamp":{timestamp},"session_id":"{session_id}","model":"{model}","usage":{{"input_tokens":10,"output_tokens":4}}}}"#
+        )
+    }
+
+    #[test]
+    fn priority_and_fast_settings_are_explicit_fast_evidence() {
+        for service_tier in ["priority", "fast"] {
+            let mut state = ParserState::default();
+            assert!(parse_jsonl_line_with_state(
+                &setting_line("s1", Some(service_tier)),
+                &mut state
+            )
+            .expect("setting")
+            .is_none());
+            let event =
+                parse_jsonl_line_with_state(&token_line(1735689660, "gpt-5.5", "s1"), &mut state)
+                    .expect("token")
+                    .expect("event");
+            assert_eq!(event.speed_mode, SpeedMode::Fast);
+            assert_eq!(event.speed_source, SpeedSource::RolloutSetting);
+            assert_eq!(event.fast_multiplier, 2.5);
+        }
+    }
+
+    #[test]
+    fn default_is_standard_and_missing_or_unrecognized_tiers_do_not_infer_fast() {
+        let mut default_state = ParserState::default();
+        parse_jsonl_line_with_state(
+            &setting_line("default", Some("default")),
+            &mut default_state,
+        )
+        .expect("default setting");
+        let standard = parse_jsonl_line_with_state(
+            &token_line(1735689660, "gpt-5.4", "default"),
+            &mut default_state,
+        )
+        .expect("standard token")
+        .expect("event");
+        assert_eq!(standard.speed_mode, SpeedMode::Standard);
+        assert_eq!(standard.speed_source, SpeedSource::RolloutSetting);
+        assert_eq!(standard.fast_multiplier, 1.0);
+
+        let mut missing_state = ParserState::default();
+        let missing = parse_jsonl_line_with_state(
+            &token_line(1735689600, "gpt-5.4", "missing"),
+            &mut missing_state,
+        )
+        .expect("missing token")
+        .expect("event");
+        assert_eq!(missing.speed_mode, SpeedMode::Unknown);
+        assert_eq!(missing.speed_source, SpeedSource::None);
+        assert_eq!(missing.fast_multiplier, 1.0);
+
+        parse_jsonl_line_with_state(&setting_line("unknown", Some("turbo")), &mut missing_state)
+            .expect("unrecognized setting");
+        let unrecognized = parse_jsonl_line_with_state(
+            &token_line(1735689660, "gpt-5.6", "unknown"),
+            &mut missing_state,
+        )
+        .expect("unrecognized token")
+        .expect("event");
+        assert_eq!(unrecognized.speed_mode, SpeedMode::Unknown);
+        assert_eq!(unrecognized.speed_source, SpeedSource::None);
+        assert_eq!(unrecognized.fast_multiplier, 1.0);
+    }
+
+    #[test]
+    fn fast_multiplier_matches_model_families_and_unknown_future_models() {
+        for (model, expected) in [
+            ("gpt-5.4", 2.0),
+            ("gpt-5.4-mini", 2.0),
+            ("gpt-5.5", 2.5),
+            ("gpt-5.6-pro", 2.5),
+            ("gpt-5.7-future", 2.5),
+        ] {
+            assert_eq!(
+                fast_multiplier_for_model(model, SpeedMode::Fast),
+                expected,
+                "{model}"
+            );
+        }
+        assert_eq!(
+            fast_multiplier_for_model("gpt-5.4", SpeedMode::Standard),
+            1.0
+        );
+        assert_eq!(
+            fast_multiplier_for_model("gpt-5.4", SpeedMode::Unknown),
+            1.0
+        );
+    }
+
+    #[test]
+    fn tier_switching_is_scoped_to_the_most_recent_preceding_setting() {
+        let mut state = ParserState::default();
+        let before =
+            parse_jsonl_line_with_state(&token_line(1735689600, "gpt-5.4", "switch"), &mut state)
+                .expect("pre-setting token")
+                .expect("event");
+        assert_eq!(before.speed_mode, SpeedMode::Unknown);
+
+        parse_jsonl_line_with_state(&setting_line("switch", Some("priority")), &mut state)
+            .expect("fast setting");
+        let fast =
+            parse_jsonl_line_with_state(&token_line(1735689660, "gpt-5.4", "switch"), &mut state)
+                .expect("fast token")
+                .expect("event");
+        assert_eq!(fast.speed_mode, SpeedMode::Fast);
+        assert_eq!(fast.fast_multiplier, 2.0);
+
+        parse_jsonl_line_with_state(&setting_line("switch", Some("default")), &mut state)
+            .expect("standard setting");
+        let standard =
+            parse_jsonl_line_with_state(&token_line(1735689720, "gpt-5.5", "switch"), &mut state)
+                .expect("standard token")
+                .expect("event");
+        assert_eq!(standard.speed_mode, SpeedMode::Standard);
+        assert_eq!(standard.fast_multiplier, 1.0);
+    }
+
+    #[test]
+    fn a_tier_setting_does_not_cross_session_boundaries() {
+        let mut state = ParserState::default();
+        parse_jsonl_line_with_state(&setting_line("s1", Some("fast")), &mut state)
+            .expect("session one setting");
+        let session_one =
+            parse_jsonl_line_with_state(&token_line(1735689600, "gpt-5.5", "s1"), &mut state)
+                .expect("session one token")
+                .expect("event");
+        let session_two =
+            parse_jsonl_line_with_state(&token_line(1735689660, "gpt-5.5", "s2"), &mut state)
+                .expect("session two token")
+                .expect("event");
+        assert_eq!(session_one.speed_mode, SpeedMode::Fast);
+        assert_eq!(session_two.speed_mode, SpeedMode::Unknown);
+        assert_eq!(session_two.fast_multiplier, 1.0);
     }
 }

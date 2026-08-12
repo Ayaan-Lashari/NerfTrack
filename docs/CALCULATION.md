@@ -10,6 +10,33 @@ percent_delta = current_weekly_used_percent - previous_weekly_used_percent
 estimated_weekly_api_equivalent_usd = cost_delta_usd / (percent_delta / 100)
 ```
 
+## Explicit Codex Fast-mode accounting
+
+Fast mode is applied only when the rollout contains an explicit
+`payload.type = "thread_settings_applied"` record with a recognized
+`payload.thread_settings.service_tier`. `priority` and `fast` set the active
+rollout/session mode to Fast; `default` sets it to Standard. Missing or
+unrecognized values are Unknown and never become Fast. The parser carries the
+most recent setting forward only to later token events in that same rollout or
+session, so a tier change in one rollout does not reclassify another and events
+before the first setting remain uncorrected.
+
+The normalized event fields are persisted as `speed_mode`, `speed_source`, and
+`fast_multiplier`. The exact Fast multiplier is 2.0x for the GPT-5.4 family and
+2.5x for GPT-5.5, GPT-5.6, and unknown/future models with explicit Fast
+evidence. Standard mode and events without explicit Fast evidence use 1.0x.
+The multiplier is applied after the ordinary token-derived API cost is
+calculated and before cost deltas are paired with quota-percentage deltas:
+
+```text
+effective_cost = ordinary_token_api_cost * fast_multiplier
+```
+
+NerfTrack does not divide this multiplier by Fast-mode generation speed. It
+does not use graph drops, token timing, TPS, the current `config.toml`, provider
+or authentication heuristics, or any other inferred signal for historical
+Fast-mode accounting.
+
 Each history point shows the unsmoothed cumulative cost-per-usage estimate for that observation. The headline remains the median of the latest seven valid cumulative estimates so short-lived noise does not redefine the current projection. Raw interval cost, percentage deltas, cumulative estimates, confidence, and coverage stay local for audit. Zero or negative cost movement, no percentage movement, unknown pricing, or a reset boundary is pending/rejected rather than converted into an estimate.
 
 ## Pricing and overrides
@@ -59,9 +86,14 @@ Only 10,080-minute weekly limits are used. Windows are separated by account and 
 
 Range changes are calculated only when both endpoints have medium or high confidence, the baseline lies inside the selected range, and it precedes the current estimate. Otherwise the comparison is unavailable rather than inferred from stale or low-coverage history.
 
-Schema migration 10 preserves raw usage events, quota observations, accounts, settings, user
-annotations, and checkpoints while adding the cached models.dev payload and effective pricing
-audit fields. Pricing changes invalidate and rebuild incompatible derived estimates,
-measurements, epochs, and charts. The persisted estimator algorithm identifier remains stable
-across this pricing-source change. Prompts, raw JSONL, credentials, account identifiers, and
-complete paths are not sent to models.dev or returned through the UI.
+Schema migration 11 preserves raw usage events, quota observations, accounts, settings, user
+annotations, and checkpoints while adding normalized service-tier evidence and the Fast
+multiplier audit fields. The estimator algorithm version is incremented so existing derived
+estimates are invalidated. On startup NerfTrack reparses every discoverable source JSONL
+rollout, applies explicit historical tier corrections, reprices token events, and rebuilds
+measurements, estimates, windows, and graph points in one SQLite transaction. A failed scan or
+rebuild rolls back the correction and leaves the previous graph intact. Historical records with
+no explicit tier evidence remain uncorrected with an Unknown speed mode and 1.0x multiplier; they
+are never upgraded to Fast. Prompts, raw
+JSONL, credentials, account identifiers, and complete paths are not sent to models.dev or
+returned through the UI.

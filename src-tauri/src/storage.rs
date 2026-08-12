@@ -12,7 +12,9 @@ use crate::models::{
     DiagnosticsSummary, HistoryPoint, HistoryResponse, QuoteStatus, Range, RangeStatistics,
     ALGORITHM_VERSION, PRICING_RULE_VERSION, RECONSTRUCTION_VERSION,
 };
-use crate::parser::{event_fingerprint, UsageEvent};
+use crate::parser::{
+    event_fingerprint, fast_multiplier_for_model, SpeedMode, SpeedSource, UsageEvent,
+};
 use crate::pricing::{self, PricingCatalog};
 
 const WEEKLY_WINDOW_MINUTES: f64 = 10_080.0;
@@ -199,6 +201,15 @@ struct PricedEvent {
     effective_output_rate: f64,
     input_multiplier: f64,
     output_multiplier: f64,
+    fast_multiplier: f64,
+}
+
+fn effective_speed_mode(event: &UsageEvent) -> SpeedMode {
+    if event.speed_mode == SpeedMode::Fast && event.speed_source != SpeedSource::RolloutSetting {
+        SpeedMode::Unknown
+    } else {
+        event.speed_mode
+    }
 }
 
 fn event_cost(
@@ -278,10 +289,12 @@ fn event_cost(
     } else {
         event.reasoning_tokens
     };
-    let cost = (uncached_input as f64 * input_rate * multiplier_input
+    let ordinary_cost = (uncached_input as f64 * input_rate * multiplier_input
         + event.cached_input_tokens as f64 * cached_input_rate
         + billed_output as f64 * output_rate * multiplier_output)
         / 1_000_000.0;
+    let fast_multiplier = fast_multiplier_for_model(&model, effective_speed_mode(event));
+    let cost = ordinary_cost * fast_multiplier;
     if cost.is_finite() && cost >= 0.0 {
         Ok(PricedEvent {
             cost,
@@ -291,6 +304,7 @@ fn event_cost(
             effective_output_rate: output_rate,
             input_multiplier: multiplier_input,
             output_multiplier: multiplier_output,
+            fast_multiplier,
         })
     } else {
         Err("non-finite token-derived API cost".into())
@@ -645,6 +659,9 @@ impl Database {
                     eligible INTEGER NOT NULL DEFAULT 0,
                     pricing_status TEXT NOT NULL DEFAULT 'not_applicable',
                     cost_usd REAL,
+                    speed_mode TEXT NOT NULL DEFAULT 'unknown',
+                    speed_source TEXT NOT NULL DEFAULT 'none',
+                    fast_multiplier REAL NOT NULL DEFAULT 1.0,
                     credits REAL,
                     logged_charge_usd REAL,
                     credit_source TEXT NOT NULL DEFAULT 'unavailable',
@@ -957,6 +974,47 @@ impl Database {
                 )
                 .map_err(|error| format!("models.dev pricing migration failed: {error}"))?;
         }
+        if previous_version < 11 {
+            for (table, column, definition) in [
+                (
+                    "usage_events",
+                    "speed_mode",
+                    "TEXT NOT NULL DEFAULT 'unknown'",
+                ),
+                (
+                    "usage_events",
+                    "speed_source",
+                    "TEXT NOT NULL DEFAULT 'none'",
+                ),
+                (
+                    "usage_events",
+                    "fast_multiplier",
+                    "REAL NOT NULL DEFAULT 1.0",
+                ),
+            ] {
+                if !self.column_exists(table, column)? {
+                    self.connection
+                        .execute(
+                            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                            [],
+                        )
+                        .map_err(|_| format!("unable to migrate {table}.{column}"))?;
+                }
+            }
+            self.connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     DELETE FROM quotes;
+                     DELETE FROM measurements;
+                     DELETE FROM epochs;
+                     DELETE FROM chart_heartbeats;
+                     INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms)
+                         VALUES (11, strftime('%s','now') * 1000);
+                     PRAGMA user_version=11;
+                     COMMIT;",
+                )
+                .map_err(|error| format!("service-tier accounting migration failed: {error}"))?;
+        }
         if self.load_settings().is_err() {
             self.save_settings(&AppSettings::default())?;
         }
@@ -966,57 +1024,16 @@ impl Database {
     /// Refresh pricing and reconcile all derived data after the UI has started.
     ///
     /// The network request is best-effort because a valid cached catalog or the
-    /// embedded fallback can still price usage offline. The derived-state check
-    /// always runs so an upgrade from an older pricing rule is completed exactly
-    /// once and then skipped on later launches.
-    pub fn initialize_background(&mut self) -> Result<(), String> {
+    /// embedded fallback can still price usage offline. Every startup reparses
+    /// discoverable rollout JSONL before rebuilding derived history so explicit
+    /// service-tier evidence can correct old indexed events.
+    pub fn initialize_background(&mut self, historical_home: Option<&Path>) -> Result<(), String> {
         let refresh_error = self.refresh_models_dev_pricing().err();
-        self.ensure_derived_state()?;
+        self.rebuild_quotes_with_historical_sources(historical_home)?;
         if let Some(error) = refresh_error {
             eprintln!("models.dev pricing refresh deferred: {error}");
         }
         Ok(())
-    }
-
-    fn ensure_derived_state(&mut self) -> Result<(), String> {
-        let settings = self.load_settings()?;
-        let remote_pricing = self.remote_pricing.clone();
-        let pricing_digest = pricing_configuration_digest(&settings, &remote_pricing)?;
-        let expected_pricing = format!("{PRICING_RULE_VERSION}:{}", pricing_digest);
-        let pricing_state: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT value FROM derived_state WHERE key='pricing'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|_| "unable to read pricing state".to_string())?;
-        let reconstruction_state: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT value FROM derived_state WHERE key='reconstruction'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|_| "unable to read reconstruction state".to_string())?;
-        if pricing_state.as_deref() == Some(expected_pricing.as_str())
-            && reconstruction_state.as_deref() == Some(RECONSTRUCTION_VERSION)
-        {
-            return Ok(());
-        }
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(|_| "unable to start derived-data rebuild".to_string())?;
-        Self::reprice_usage_events(&transaction, &settings, &remote_pricing, &pricing_digest)?;
-        Self::rebuild_quotes_in_transaction(&transaction)?;
-        Self::set_derived_state(&transaction, "pricing", &expected_pricing)?;
-        Self::set_derived_state(&transaction, "reconstruction", RECONSTRUCTION_VERSION)?;
-        transaction
-            .commit()
-            .map_err(|_| "unable to commit derived-data rebuild".to_string())
     }
 
     fn column_exists(&self, table: &str, column: &str) -> Result<bool, String> {
@@ -1388,6 +1405,14 @@ impl Database {
         remote_pricing: &PricingCatalog,
         pricing_digest: &str,
     ) -> Result<bool, String> {
+        let speed_mode = effective_speed_mode(event);
+        let speed_source = if speed_mode != SpeedMode::Unknown
+            && event.speed_source == SpeedSource::RolloutSetting
+        {
+            SpeedSource::RolloutSetting
+        } else {
+            SpeedSource::None
+        };
         let pricing = event_cost(event, settings, remote_pricing);
         let (
             cost_usd,
@@ -1398,6 +1423,7 @@ impl Database {
             effective_output_rate,
             input_multiplier,
             output_multiplier,
+            fast_multiplier,
         ) = match pricing {
             Ok(price) => (
                 Some(price.cost),
@@ -1408,10 +1434,11 @@ impl Database {
                 Some(price.effective_output_rate),
                 Some(price.input_multiplier),
                 Some(price.output_multiplier),
+                Some(price.fast_multiplier),
             ),
             Err(reason) => {
                 add_diagnostic(transaction, &reason, 1)?;
-                (None, "pending", 0_i64, None, None, None, None, None)
+                (None, "pending", 0_i64, None, None, None, None, None, None)
             }
         };
         let inserted = transaction
@@ -1421,9 +1448,10 @@ impl Database {
                     cached_input_tokens, output_tokens, reasoning_tokens, long_context, eligible,
                     pricing_status, cost_usd, pricing_rule_version, pricing_source_digest,
                     effective_input_rate, effective_cached_input_rate, effective_output_rate,
-                    input_multiplier, output_multiplier, quota_reset_at_ms, quota_limit_id
+                    input_multiplier, output_multiplier, speed_mode, speed_source,
+                    fast_multiplier, quota_reset_at_ms, quota_limit_id
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             )
             .and_then(|mut statement| {
                 statement.execute(params![
@@ -1447,6 +1475,11 @@ impl Database {
                     effective_output_rate,
                     input_multiplier,
                     output_multiplier,
+                    speed_mode.as_str(),
+                    speed_source.as_str(),
+                    fast_multiplier.unwrap_or_else(|| {
+                        fast_multiplier_for_model(&event.model, speed_mode)
+                    }),
                     event.quota_reset_at_ms,
                     event.quota_limit_id,
                 ])
@@ -1487,7 +1520,28 @@ impl Database {
         Ok(inserted == 1)
     }
 
-    pub fn rebuild_quotes(&mut self) -> Result<(), String> {
+    /// Reparse every discoverable rollout before rebuilding all derived data.
+    ///
+    /// The filesystem scan happens before the SQLite transaction. Checkpoints,
+    /// newly discovered events, explicit speed corrections, repricing, and graph
+    /// reconstruction then commit as one unit. A scan or SQL failure therefore
+    /// leaves the previously indexed graph intact.
+    pub fn rebuild_quotes_with_historical_sources(
+        &mut self,
+        historical_home: Option<&Path>,
+    ) -> Result<(), String> {
+        let collection = if let Some(home) = historical_home {
+            let collection = crate::collector::scan_codex_home_with_state(home, &HashMap::new())?;
+            if !collection.interrupted_sources.is_empty() {
+                return Err(
+                    "Codex data scan was incomplete; historical graph rebuild was not committed"
+                        .into(),
+                );
+            }
+            Some(collection)
+        } else {
+            None
+        };
         let settings = self.load_settings()?;
         let remote_pricing = self.remote_pricing.clone();
         let pricing_digest = pricing_configuration_digest(&settings, &remote_pricing)?;
@@ -1495,6 +1549,68 @@ impl Database {
             .connection
             .transaction()
             .map_err(|_| "unable to start token estimate rebuild".to_string())?;
+
+        if let Some(collection) = collection.as_ref() {
+            for checkpoint in &collection.checkpoints {
+                transaction
+                    .execute(
+                        "INSERT INTO source_checkpoints (
+                            source_key, byte_offset, parser_state_json, source_active, updated_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(source_key) DO UPDATE SET
+                            byte_offset=excluded.byte_offset,
+                            parser_state_json=excluded.parser_state_json,
+                            source_active=excluded.source_active,
+                            updated_at_ms=excluded.updated_at_ms",
+                        params![
+                            checkpoint.source_key,
+                            checkpoint.byte_offset as i64,
+                            checkpoint.parser_state_json,
+                            i64::from(checkpoint.source_active),
+                            now_ms()
+                        ],
+                    )
+                    .map_err(|_| "unable to persist historical source checkpoint".to_string())?;
+            }
+            for event in &collection.events {
+                let fingerprint = event_fingerprint(event);
+                let already_indexed: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM usage_events WHERE fingerprint=?1)",
+                        params![fingerprint],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| "unable to inspect historical usage event".to_string())?;
+                if !already_indexed {
+                    Self::persist_event(
+                        &transaction,
+                        event,
+                        None,
+                        &settings,
+                        &remote_pricing,
+                        &pricing_digest,
+                    )?;
+                }
+                if event.speed_source == SpeedSource::RolloutSetting {
+                    Self::update_explicit_speed(&transaction, event)?;
+                }
+            }
+            if collection.stats.partial_line_retries > 0 {
+                add_diagnostic(
+                    &transaction,
+                    "partial final line",
+                    collection.stats.partial_line_retries as i64,
+                )?;
+            }
+            if collection.skipped_symlinks > 0 {
+                add_diagnostic(
+                    &transaction,
+                    "unsafe recursive link skipped",
+                    collection.skipped_symlinks as i64,
+                )?;
+            }
+        }
+
         Self::reprice_usage_events(&transaction, &settings, &remote_pricing, &pricing_digest)?;
         Self::rebuild_quotes_in_transaction(&transaction)?;
         Self::set_derived_state(
@@ -1508,6 +1624,31 @@ impl Database {
             .map_err(|_| "unable to commit token estimate rebuild".to_string())
     }
 
+    pub fn rebuild_quotes(&mut self) -> Result<(), String> {
+        self.rebuild_quotes_with_historical_sources(None)
+    }
+
+    fn update_explicit_speed(
+        transaction: &Transaction<'_>,
+        event: &UsageEvent,
+    ) -> Result<(), String> {
+        let fast_multiplier = fast_multiplier_for_model(&event.model, event.speed_mode);
+        transaction
+            .execute(
+                "UPDATE usage_events
+                 SET speed_mode=?2, speed_source=?3, fast_multiplier=?4
+                 WHERE fingerprint=?1",
+                params![
+                    event_fingerprint(event),
+                    event.speed_mode.as_str(),
+                    event.speed_source.as_str(),
+                    fast_multiplier,
+                ],
+            )
+            .map_err(|_| "unable to update historical service-tier evidence".to_string())?;
+        Ok(())
+    }
+
     fn reprice_usage_events(
         transaction: &Transaction<'_>,
         settings: &AppSettings,
@@ -1518,21 +1659,45 @@ impl Database {
             let mut statement = transaction
                 .prepare(
                     "SELECT fingerprint, COALESCE(original_model_id, model_id), input_tokens,
-                            cached_input_tokens, output_tokens, reasoning_tokens, long_context
+                            cached_input_tokens, output_tokens, reasoning_tokens, long_context,
+                            speed_mode, speed_source
                      FROM usage_events",
                 )
                 .map_err(|_| "unable to read imported usage for repricing".to_string())?;
             let rows = statement
                 .query_map([], |row| {
+                    let model: String = row.get(1)?;
+                    let speed_mode = SpeedMode::from_stored(&row.get::<_, String>(7)?);
+                    let speed_source = SpeedSource::from_stored(&row.get::<_, String>(8)?);
+                    let normalized_speed_mode = if speed_mode == SpeedMode::Fast
+                        && speed_source != SpeedSource::RolloutSetting
+                    {
+                        SpeedMode::Unknown
+                    } else {
+                        speed_mode
+                    };
+                    let normalized_speed_source = if normalized_speed_mode != SpeedMode::Unknown
+                        && speed_source == SpeedSource::RolloutSetting
+                    {
+                        SpeedSource::RolloutSetting
+                    } else {
+                        SpeedSource::None
+                    };
                     Ok(StoredUsageForPricing {
                         fingerprint: row.get(0)?,
                         event: UsageEvent {
-                            model: row.get(1)?,
+                            model: model.clone(),
                             input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
                             cached_input_tokens: row.get::<_, i64>(3)?.max(0) as u64,
                             output_tokens: row.get::<_, i64>(4)?.max(0) as u64,
                             reasoning_tokens: row.get::<_, i64>(5)?.max(0) as u64,
                             long_context: row.get::<_, i64>(6)? != 0,
+                            speed_mode: normalized_speed_mode,
+                            speed_source: normalized_speed_source,
+                            fast_multiplier: fast_multiplier_for_model(
+                                &model,
+                                normalized_speed_mode,
+                            ),
                             ..UsageEvent::default()
                         },
                     })
@@ -1554,7 +1719,10 @@ impl Database {
                                  effective_cached_input_rate=?7,
                                  effective_output_rate=?8,
                                  input_multiplier=?9,
-                                 output_multiplier=?10
+                                 output_multiplier=?10,
+                                 speed_mode=?11,
+                                 speed_source=?12,
+                                 fast_multiplier=?13
                              WHERE fingerprint=?1",
                             params![
                                 row.fingerprint,
@@ -1566,7 +1734,10 @@ impl Database {
                                 price.effective_cached_input_rate,
                                 price.effective_output_rate,
                                 price.input_multiplier,
-                                price.output_multiplier
+                                price.output_multiplier,
+                                row.event.speed_mode.as_str(),
+                                row.event.speed_source.as_str(),
+                                price.fast_multiplier
                             ],
                         )
                         .map_err(|_| "unable to update repriced usage".to_string())?;
@@ -1581,9 +1752,19 @@ impl Database {
                                  effective_cached_input_rate=NULL,
                                  effective_output_rate=NULL,
                                  input_multiplier=NULL,
-                                 output_multiplier=NULL
+                                 output_multiplier=NULL,
+                                 speed_mode=?4,
+                                 speed_source=?5,
+                                 fast_multiplier=?6
                              WHERE fingerprint=?1",
-                            params![row.fingerprint, PRICING_RULE_VERSION, pricing_digest],
+                            params![
+                                row.fingerprint,
+                                PRICING_RULE_VERSION,
+                                pricing_digest,
+                                row.event.speed_mode.as_str(),
+                                row.event.speed_source.as_str(),
+                                row.event.fast_multiplier
+                            ],
                         )
                         .map_err(|_| "unable to update pending usage price".to_string())?;
                 }
@@ -1603,6 +1784,9 @@ impl Database {
         transaction
             .execute("DELETE FROM epochs", [])
             .map_err(|_| "unable to clear stale weekly windows".to_string())?;
+        transaction
+            .execute("DELETE FROM chart_heartbeats", [])
+            .map_err(|_| "unable to clear stale chart heartbeats".to_string())?;
 
         let (groups, stale_regressions) = Self::window_groups(observations);
         if stale_regressions > 0 {
@@ -2993,6 +3177,22 @@ mod tests {
             .expect("persist collection");
     }
 
+    fn historical_home(label: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "nerftrack-tier-rebuild-{label}-{}-{}",
+            std::process::id(),
+            TEST_DATABASE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&home).expect("historical home");
+        home
+    }
+
+    fn write_rollout(home: &Path, contents: &str) -> PathBuf {
+        let path = home.join("rollout.jsonl");
+        fs::write(&path, contents).expect("rollout");
+        path
+    }
+
     #[test]
     fn account_key_is_salted_and_non_reversible() {
         let first = hash_account_key(b"salt-a", " account-primary ");
@@ -3018,6 +3218,71 @@ mod tests {
         // 80 normal input + 20 cached input + 8 output; reasoning is a subset of output.
         assert_eq!(source, "official");
         assert!((cost - ((80.0 * 1.75 + 20.0 * 0.175 + 8.0 * 14.0) / 1_000_000.0)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn explicit_fast_uses_exact_model_family_multipliers() {
+        for (model, expected_multiplier) in [("gpt-5.4", 2.0), ("gpt-5.5", 2.5), ("gpt-5.6", 2.5)] {
+            let standard = event_cost(
+                &UsageEvent {
+                    model: model.into(),
+                    input_tokens: 1_000_000,
+                    speed_mode: SpeedMode::Standard,
+                    ..UsageEvent::default()
+                },
+                &AppSettings::default(),
+                &PricingCatalog::default(),
+            )
+            .expect("standard price");
+            let fast = event_cost(
+                &UsageEvent {
+                    model: model.into(),
+                    input_tokens: 1_000_000,
+                    speed_mode: SpeedMode::Fast,
+                    speed_source: SpeedSource::RolloutSetting,
+                    ..UsageEvent::default()
+                },
+                &AppSettings::default(),
+                &PricingCatalog::default(),
+            )
+            .expect("fast price");
+            assert_eq!(fast.fast_multiplier, expected_multiplier);
+            assert_eq!(fast.cost, standard.cost * expected_multiplier);
+        }
+    }
+
+    #[test]
+    fn explicitly_fast_unknown_future_models_use_two_point_five_times() {
+        let remote = pricing::parse_catalog(
+            r#"{"openai":{"models":{"gpt-5.7-future":{"cost":{"input":3,"output":9}}}}}"#,
+            Some("future-model".into()),
+        )
+        .expect("future catalog");
+        let standard = event_cost(
+            &UsageEvent {
+                model: "gpt-5.7-future".into(),
+                input_tokens: 1_000_000,
+                speed_mode: SpeedMode::Standard,
+                ..UsageEvent::default()
+            },
+            &AppSettings::default(),
+            &remote,
+        )
+        .expect("standard future price");
+        let fast = event_cost(
+            &UsageEvent {
+                model: "gpt-5.7-future".into(),
+                input_tokens: 1_000_000,
+                speed_mode: SpeedMode::Fast,
+                speed_source: SpeedSource::RolloutSetting,
+                ..UsageEvent::default()
+            },
+            &AppSettings::default(),
+            &remote,
+        )
+        .expect("fast future price");
+        assert_eq!(fast.fast_multiplier, 2.5);
+        assert_eq!(fast.cost, standard.cost * 2.5);
     }
 
     #[test]
@@ -3119,6 +3384,240 @@ mod tests {
         assert!((after.0 - 3.0).abs() < 1e-12);
         drop(database);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn historical_rebuild_corrects_indexed_fast_records_and_graph_measurements() {
+        let (mut database, path) = database();
+        let home = historical_home("explicit-fast");
+        let first = r#"{"timestamp":1000,"request_id":"r1","session_id":"s1","model":"gpt-5.5","usage":{"input_tokens":1000000,"output_tokens":0},"rate_limits":{"limit_id":"codex","primary":{"used_percent":42.0,"window_minutes":10080,"resets_at":100000}}}"#;
+        let second = r#"{"timestamp":2000,"request_id":"r2","session_id":"s1","model":"gpt-5.5","usage":{"input_tokens":1000000,"output_tokens":0},"rate_limits":{"limit_id":"codex","primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":100000}}}"#;
+        let initial_first = crate::parser::parse_jsonl_line(first).expect("initial event");
+        persist(&mut database, vec![initial_first]);
+        let before: f64 = database
+            .connection
+            .query_row(
+                "SELECT cost_usd FROM usage_events WHERE timestamp_ms=1000000",
+                [],
+                |row| row.get(0),
+            )
+            .expect("initial cost");
+        assert_eq!(before, 10.0);
+
+        write_rollout(
+            &home,
+            &format!(
+                "{}\n{}\n{}\n",
+                r#"{"timestamp":900,"type":"event_msg","payload":{"type":"thread_settings_applied","session_id":"s1","thread_settings":{"service_tier":"fast"}}}"#,
+                first,
+                second
+            ),
+        );
+        database
+            .rebuild_quotes_with_historical_sources(Some(&home))
+            .expect("historical fast rebuild");
+
+        let corrected: (f64, String, String, f64) = database
+            .connection
+            .query_row(
+                "SELECT cost_usd, speed_mode, speed_source, fast_multiplier
+                 FROM usage_events WHERE timestamp_ms=1000000",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("corrected cost");
+        assert_eq!(corrected.0, 25.0);
+        assert_eq!(corrected.1, "fast");
+        assert_eq!(corrected.2, "rollout_setting");
+        assert_eq!(corrected.3, 2.5);
+        let measurement_delta: f64 = database
+            .connection
+            .query_row(
+                "SELECT cost_delta_usd FROM measurements WHERE status='valid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("corrected measurement");
+        assert_eq!(measurement_delta, 25.0);
+        let quote_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM quotes", [], |row| row.get(0))
+            .expect("corrected graph");
+        assert_eq!(quote_count, 1);
+
+        drop(database);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn historical_records_without_tier_evidence_and_standard_estimates_stay_unchanged() {
+        let (mut database, path) = database();
+        let home = historical_home("standard-unchanged");
+        let first = r#"{"timestamp":1000,"request_id":"r1","session_id":"s1","model":"gpt-5.5","usage":{"input_tokens":1000000,"output_tokens":0},"rate_limits":{"limit_id":"codex","primary":{"used_percent":42.0,"window_minutes":10080,"resets_at":100000}}}"#;
+        let second = r#"{"timestamp":2000,"request_id":"r2","session_id":"s1","model":"gpt-5.5","usage":{"input_tokens":1000000,"output_tokens":0},"rate_limits":{"limit_id":"codex","primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":100000}}}"#;
+        let initial = vec![
+            crate::parser::parse_jsonl_line(first).expect("first event"),
+            crate::parser::parse_jsonl_line(second).expect("second event"),
+        ];
+        persist(&mut database, initial);
+        write_rollout(&home, &format!("{first}\n{second}\n"));
+        let before: (f64, f64, f64) = database
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT cost_usd FROM usage_events WHERE timestamp_ms=1000000),
+                    (SELECT cost_delta_usd FROM measurements WHERE status='valid'),
+                    (SELECT value_usd FROM quotes ORDER BY timestamp_ms DESC LIMIT 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("standard baseline");
+
+        database
+            .rebuild_quotes_with_historical_sources(Some(&home))
+            .expect("standard rebuild");
+        let after: (f64, f64, f64, String, String, f64) = database
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT cost_usd FROM usage_events WHERE timestamp_ms=1000000),
+                    (SELECT cost_delta_usd FROM measurements WHERE status='valid'),
+                    (SELECT value_usd FROM quotes ORDER BY timestamp_ms DESC LIMIT 1),
+                    (SELECT speed_mode FROM usage_events WHERE timestamp_ms=1000000),
+                    (SELECT speed_source FROM usage_events WHERE timestamp_ms=1000000),
+                    (SELECT fast_multiplier FROM usage_events WHERE timestamp_ms=1000000)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("standard result");
+        assert_eq!((after.0, after.1, after.2), before);
+        assert_eq!(after.3, "unknown");
+        assert_eq!(after.4, "none");
+        assert_eq!(after.5, 1.0);
+
+        drop(database);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn existing_standard_mode_estimates_remain_unchanged_after_rebuild() {
+        let (mut database, path) = database();
+        let mut first = event(1_000, Some(1.0), 42.0, Some(100_000));
+        first.speed_mode = SpeedMode::Standard;
+        first.speed_source = SpeedSource::RolloutSetting;
+        let mut second = event(2_000, Some(1.0), 43.0, Some(100_000));
+        second.speed_mode = SpeedMode::Standard;
+        second.speed_source = SpeedSource::RolloutSetting;
+        persist(&mut database, vec![first, second]);
+        let before: (f64, f64, f64) = database
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT cost_usd FROM usage_events ORDER BY timestamp_ms LIMIT 1),
+                    (SELECT cost_delta_usd FROM measurements WHERE status='valid'),
+                    (SELECT value_usd FROM quotes ORDER BY timestamp_ms DESC LIMIT 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("standard baseline");
+        database.rebuild_quotes().expect("standard rebuild");
+        let after: (f64, f64, f64) = database
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT cost_usd FROM usage_events ORDER BY timestamp_ms LIMIT 1),
+                    (SELECT cost_delta_usd FROM measurements WHERE status='valid'),
+                    (SELECT value_usd FROM quotes ORDER BY timestamp_ms DESC LIMIT 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("standard result");
+        assert_eq!(after, before);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn historical_rebuild_failure_rolls_back_graph_and_speed_updates() {
+        let (mut database, path) = database();
+        let home = historical_home("transactional");
+        let first = r#"{"timestamp":1000,"request_id":"r1","session_id":"s1","model":"gpt-5.5","usage":{"input_tokens":1000000,"output_tokens":0},"rate_limits":{"limit_id":"codex","primary":{"used_percent":42.0,"window_minutes":10080,"resets_at":100000}}}"#;
+        let second = r#"{"timestamp":2000,"request_id":"r2","session_id":"s1","model":"gpt-5.5","usage":{"input_tokens":1000000,"output_tokens":0},"rate_limits":{"limit_id":"codex","primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":100000}}}"#;
+        persist(
+            &mut database,
+            vec![
+                crate::parser::parse_jsonl_line(first).expect("first event"),
+                crate::parser::parse_jsonl_line(second).expect("second event"),
+            ],
+        );
+        write_rollout(
+            &home,
+            &format!(
+                "{}\n{}\n{}\n",
+                r#"{"timestamp":900,"type":"event_msg","payload":{"type":"thread_settings_applied","session_id":"s1","thread_settings":{"service_tier":"priority"}}}"#,
+                first,
+                second
+            ),
+        );
+        let before: (f64, String, i64, f64) = database
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT cost_usd FROM usage_events WHERE timestamp_ms=1000000),
+                    (SELECT speed_mode FROM usage_events WHERE timestamp_ms=1000000),
+                    (SELECT COUNT(*) FROM quotes),
+                    (SELECT value_usd FROM quotes ORDER BY timestamp_ms DESC LIMIT 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("transaction baseline");
+        database
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_historical_speed_update
+                 BEFORE UPDATE OF speed_mode ON usage_events
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected historical rebuild failure');
+                 END;",
+            )
+            .expect("failure trigger");
+
+        assert!(database
+            .rebuild_quotes_with_historical_sources(Some(&home))
+            .is_err());
+        database
+            .connection
+            .execute_batch("DROP TRIGGER fail_historical_speed_update;")
+            .expect("drop failure trigger");
+
+        let after: (f64, String, i64, f64) = database
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT cost_usd FROM usage_events WHERE timestamp_ms=1000000),
+                    (SELECT speed_mode FROM usage_events WHERE timestamp_ms=1000000),
+                    (SELECT COUNT(*) FROM quotes),
+                    (SELECT value_usd FROM quotes ORDER BY timestamp_ms DESC LIMIT 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("transaction result");
+        assert_eq!(after, before);
+
+        drop(database);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -3732,9 +4231,9 @@ mod tests {
                     percentage_coverage, window_id
                  ) VALUES
                     (1000, 70, 70, 70, 'high', 'valid', 1,
-                     'nerftrack-token-api-equivalent-v4', 20, 1),
+                     'nerftrack-token-api-equivalent-v5', 20, 1),
                     (10000, 90, 90, 90, 'high', 'valid', 1,
-                     'nerftrack-token-api-equivalent-v4', 30, 1);",
+                     'nerftrack-token-api-equivalent-v5', 30, 1);",
             )
             .expect("same-window history");
 
@@ -3768,7 +4267,7 @@ mod tests {
                     confidence, status, is_finalized, algorithm_version,
                     percentage_coverage, window_id
                  ) VALUES (9000, 100, 100, 100, 'high', 'valid', 1,
-                    'nerftrack-token-api-equivalent-v4', 20, 1);",
+                    'nerftrack-token-api-equivalent-v5', 20, 1);",
             )
             .expect("live heartbeat fixture");
 
@@ -3824,9 +4323,9 @@ mod tests {
                     percentage_coverage, window_id
                  ) VALUES
                     (9000, 100, 100, 100, 'high', 'valid', 1,
-                    'nerftrack-token-api-equivalent-v4', 20, 1),
+                    'nerftrack-token-api-equivalent-v5', 20, 1),
                     (19000, 29, 29, 29, 'low', 'valid', 1,
-                    'nerftrack-token-api-equivalent-v4', 3, 2);",
+                    'nerftrack-token-api-equivalent-v5', 3, 2);",
             )
             .expect("pending endpoint fixture");
 
