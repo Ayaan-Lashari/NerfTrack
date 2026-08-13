@@ -144,7 +144,7 @@ describe('UsageChart', () => {
 
     fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 200 }));
     fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 800 }));
-    expect(chart.closest('.usage-chart')).toHaveClass('chart-neutral');
+    expect(chart.closest('.usage-chart')).toHaveClass('chart-positive');
   });
 
   it('marks interpolation across an epoch boundary as ineligible', () => {

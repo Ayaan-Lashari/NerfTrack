@@ -1,6 +1,6 @@
 [package]
 name = "nerftrack"
-version = "0.6.2"
+version = "1.0.0"
 description = "NerfTrack local Codex usage monitor"
 authors = ["NerfTrack"]
 license = "GPL-3.0-only"

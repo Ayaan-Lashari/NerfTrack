@@ -35,11 +35,7 @@ import {
 } from './lib/commands';
 import { demoQuote, demoStatus } from './lib/fixtures';
 import { GITHUB_REPOSITORY_URL } from './lib/config';
-import {
-  compareHistoryPoints,
-  comparisonUnavailableMessage,
-  getChartEstimate,
-} from './lib/comparison';
+import { getChartEstimate } from './lib/comparison';
 import {
   checkForUpdate,
   consumeUpdateFailure,
@@ -244,34 +240,16 @@ export function HomeView({
     ? getChartEstimate(scrubbed.point)
     : (quote?.estimatedWeeklyValueUsd ?? null);
   const stableEstimate = hasStableEstimate(quote) && !scrubbed;
-  const scrubComparison = scrubbed ? compareHistoryPoints(scrubbed.point, scrubbed.anchor) : null;
   const comparisonValue =
-    scrubbed?.anchor && scrubComparison?.eligible
-      ? scrubComparison.anchorValueUsd
-      : stableEstimate
-        ? (history.statistics.baselineEstimatedWeeklyValueUsd ?? null)
-        : null;
-  const displayChange = scrubbed
-    ? scrubComparison?.eligible
-      ? scrubComparison.deltaValueUsd
-      : null
-    : displayValue !== null && comparisonValue !== null
-      ? displayValue - comparisonValue
+    stableEstimate || scrubbed
+      ? scrubbed?.anchor
+        ? getChartEstimate(scrubbed.anchor)
+        : (history.statistics.baselineEstimatedWeeklyValueUsd ?? null)
       : null;
-  const displayPercent = scrubbed
-    ? scrubComparison?.eligible
-      ? scrubComparison.deltaPercent
-      : null
-    : displayChange !== null && comparisonValue
-      ? (displayChange / comparisonValue) * 100
-      : null;
-  const comparisonMessage =
-    scrubbed?.anchor &&
-    scrubComparison &&
-    !scrubComparison.eligible &&
-    scrubComparison.reason !== 'valid'
-      ? comparisonUnavailableMessage(scrubComparison.reason)
-      : null;
+  const displayChange =
+    displayValue !== null && comparisonValue !== null ? displayValue - comparisonValue : null;
+  const displayPercent =
+    displayChange !== null && comparisonValue ? (displayChange / comparisonValue) * 100 : null;
   const signalPoints = history.points.filter((point) => getChartEstimate(point) !== null);
   const availableHistoryStart = signalPoints[0]?.timestamp ?? null;
   const availableHistoryEnd = signalPoints.at(-1)?.timestamp ?? null;
@@ -336,29 +314,14 @@ export function HomeView({
         <strong className={isEmpty || (!stableEstimate && !scrubbed) ? 'empty-value' : ''}>
           {stableEstimate || scrubbed ? formatEstimatedUsd(displayValue) : 'Calibrating'}
         </strong>
-        {comparisonMessage && <p className="muted-state">{comparisonMessage}</p>}
-        {!comparisonMessage && !isEmpty && (stableEstimate || scrubbed) && (
-          <p
-            className={
-              scrubbed && !scrubbed.anchor
-                ? 'muted-state'
-                : displayChange !== null && displayChange < 0
-                  ? 'negative'
-                  : 'positive'
-            }
-          >
-            {scrubbed && !scrubbed.anchor ? (
-              <span>{comparisonLabel}</span>
-            ) : (
-              <>
-                {formatSignedUsd(displayChange)}{' '}
-                {displayPercent !== null ? `(${formatPercent(displayPercent)})` : ''}{' '}
-                <span>{comparisonLabel}</span>
-              </>
-            )}
+        {!isEmpty && (stableEstimate || scrubbed) && (
+          <p className={displayChange !== null && displayChange < 0 ? 'negative' : 'positive'}>
+            {formatSignedUsd(displayChange)}{' '}
+            {displayPercent !== null ? `(${formatPercent(displayPercent)})` : ''}{' '}
+            <span>{comparisonLabel}</span>
           </p>
         )}
-        {!comparisonMessage && (isEmpty || (!stableEstimate && !scrubbed)) && (
+        {(isEmpty || (!stableEstimate && !scrubbed)) && (
           <p className="muted-state">{calibrationNote(quote)}</p>
         )}
       </div>

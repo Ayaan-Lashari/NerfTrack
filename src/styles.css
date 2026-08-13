@@ -734,9 +734,6 @@ p {
   position: relative;
   width: 100%;
 }
-.usage-chart.chart-neutral {
-  --chart-color: #9aa5ad;
-}
 .chart-value-label {
   display: flex;
   align-items: baseline;
@@ -975,9 +972,6 @@ p {
 }
 .chart-crosshair-held circle {
   filter: drop-shadow(0 0 4px rgba(92, 240, 122, 0.48));
-}
-.chart-neutral .chart-crosshair-held circle {
-  filter: drop-shadow(0 0 4px rgba(154, 165, 173, 0.34));
 }
 .reduced-motion .chart-line {
   transition: none;

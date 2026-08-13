@@ -1,10 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Annotation, HistoryPoint, Range } from '../domain';
-import {
-  compareHistoryPoints,
-  getChartEstimate,
-  isComparisonEligiblePoint,
-} from '../lib/comparison';
+import { getChartEstimate, isComparisonEligiblePoint } from '../lib/comparison';
 import { formatYAxisTick, getChartYAxisScale, yAxisValueToY } from '../lib/chartScale';
 import { Icon } from './Icons';
 
@@ -482,24 +478,16 @@ export function UsageChart({
       : {
           y: yAxisValueToY(baselineEstimatedWeeklyValueUsd, yAxisScale, plotTop, plotBottom),
         };
-  const manualComparisonActive = Boolean(
-    anchorPoint && selected && (selection?.source === 'held' || selection?.source === 'locked'),
-  );
-  const dragComparison = manualComparisonActive
-    ? compareHistoryPoints(selected, anchorPoint)
-    : null;
-  const dragChange = dragComparison?.eligible ? dragComparison.deltaValueUsd : null;
-  const chartTone = manualComparisonActive
-    ? dragComparison?.eligible
-      ? (dragChange ?? 0) < 0
-        ? 'negative'
-        : 'positive'
-      : 'neutral'
-    : (changeValueUsd ?? 0) < 0
-      ? 'negative'
-      : 'positive';
-  const chartColor =
-    chartTone === 'negative' ? '#ff5d73' : chartTone === 'neutral' ? '#9aa5ad' : '#5cf07a';
+  const dragChange =
+    anchorPoint &&
+    historySignal(anchorPoint) != null &&
+    selected &&
+    historySignal(selected) != null &&
+    (selection?.source === 'held' || selection?.source === 'locked')
+      ? (historySignal(selected) ?? 0) - (historySignal(anchorPoint) ?? 0)
+      : null;
+  const isNegative = (dragChange ?? changeValueUsd ?? 0) < 0;
+  const chartColor = isNegative ? '#ff5d73' : '#5cf07a';
 
   const selectPoint = (index: number) => {
     const point = points[index];
@@ -590,7 +578,9 @@ export function UsageChart({
 
   return (
     <div
-      className={`usage-chart chart-${chartTone} ${reducedMotion ? 'reduced-motion' : ''}`}
+      className={`usage-chart chart-${isNegative ? 'negative' : 'positive'} ${
+        reducedMotion ? 'reduced-motion' : ''
+      }`}
       style={{ '--chart-color': chartColor } as React.CSSProperties}
     >
       <div className="chart-value-label">

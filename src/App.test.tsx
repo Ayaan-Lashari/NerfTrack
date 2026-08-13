@@ -197,7 +197,7 @@ describe('NerfTrack app shell', () => {
     );
   });
 
-  it('suppresses a same-window calibration percentage and uses neutral styling', () => {
+  it('shows a same-window calibration difference without neutral styling', () => {
     const chart = renderHomeWithHistory(
       customHistory([
         historyPoint({ estimatedWeeklyValueUsd: 94.35, percentageCoverage: 9 }),
@@ -212,13 +212,15 @@ describe('NerfTrack app shell', () => {
     fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 0 }));
     fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 1000 }));
 
-    expect(screen.getByText('Comparison unavailable · estimator calibration')).toBeInTheDocument();
-    expect(screen.queryByText(/\([+−]\d+\.\d{2}%\)/)).not.toBeInTheDocument();
-    expect(chart.closest('.usage-chart')).toHaveClass('chart-neutral');
+    expect(screen.getByText('Selected range').parentElement).toHaveTextContent(
+      /[+−]\$\d+\.\d{2} \([+−]\d+\.\d{2}%\)/,
+    );
+    expect(screen.queryByText(/Comparison unavailable/)).not.toBeInTheDocument();
+    expect(chart.closest('.usage-chart')).toHaveClass('chart-positive');
     expect(screen.getByText('≈$158')).toBeInTheDocument();
   });
 
-  it('rejects an immature cross-window anchor without falling back to backend baseline', () => {
+  it('shows a difference for an immature cross-window anchor', () => {
     const chart = renderHomeWithHistory(
       customHistory([
         historyPoint({
@@ -238,15 +240,14 @@ describe('NerfTrack app shell', () => {
     fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 0 }));
     fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 1000 }));
 
-    expect(
-      screen.getByText('Comparison unavailable · endpoints need mature history'),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/\([+−]\d+\.\d{2}%\)/)).not.toBeInTheDocument();
-    expect(screen.queryByText('Selected range')).not.toBeInTheDocument();
-    expect(chart.closest('.usage-chart')).toHaveClass('chart-neutral');
+    expect(screen.getByText('Selected range').parentElement).toHaveTextContent(
+      /[+−]\$\d+\.\d{2} \([+−]\d+\.\d{2}%\)/,
+    );
+    expect(screen.queryByText(/Comparison unavailable/)).not.toBeInTheDocument();
+    expect(chart.closest('.usage-chart')).toHaveClass('chart-positive');
   });
 
-  it('does not treat a hover without an anchor as a selected-range comparison', () => {
+  it('shows a difference when hovering without an anchor', () => {
     const chart = renderHomeWithHistory(
       customHistory([
         historyPoint({ estimatedWeeklyValueUsd: 100 }),
@@ -262,7 +263,7 @@ describe('NerfTrack app shell', () => {
     fireEvent(chart, hoverEvent);
 
     expect(screen.queryByText('Selected range')).not.toBeInTheDocument();
-    expect(screen.queryByText(/\([+−]\d+\.\d{2}%\)/)).not.toBeInTheDocument();
+    expect(screen.getByText(/\(\+1900\.00%\)/)).toBeInTheDocument();
     expect(screen.queryByText(/Comparison unavailable/)).not.toBeInTheDocument();
   });
 
