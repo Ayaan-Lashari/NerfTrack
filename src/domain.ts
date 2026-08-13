@@ -75,6 +75,10 @@ export interface HistoryPoint {
   epoch: number | null;
   confidence: Confidence;
   percentageCoverage: number | null;
+  /** True when the chart created this point between stored observations. */
+  isSynthetic?: boolean;
+  /** Conservative metadata for manual endpoint comparisons. */
+  comparisonEligible?: boolean;
 }
 
 export interface RangeStatistics {

@@ -2259,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "nerftrack"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "chrono",
  "dirs",

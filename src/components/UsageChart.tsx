@@ -1,5 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Annotation, HistoryPoint, Range } from '../domain';
+import {
+  compareHistoryPoints,
+  getChartEstimate,
+  isComparisonEligiblePoint,
+} from '../lib/comparison';
+import { formatYAxisTick, getChartYAxisScale, yAxisValueToY } from '../lib/chartScale';
 import { Icon } from './Icons';
 
 interface UsageChartProps {
@@ -106,6 +112,18 @@ function interpolateNullable(left: number | null, right: number | null, ratio: n
   return left + (right - left) * ratio;
 }
 
+const confidenceRank: Record<HistoryPoint['confidence'], number> = {
+  none: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+};
+
+function conservativeConfidence(left: HistoryPoint, right: HistoryPoint) {
+  const rank = Math.min(confidenceRank[left.confidence], confidenceRank[right.confidence]);
+  return (['none', 'low', 'medium', 'high'] as const)[rank];
+}
+
 function interpolatePoint(points: HistoryPoint[], timestamp: number): HistoryPoint | null {
   if (!points.length) return null;
   if (timestamp < points[0].timestamp) return null;
@@ -127,7 +145,27 @@ function interpolatePoint(points: HistoryPoint[], timestamp: number): HistoryPoi
   const duration = Math.max(right.timestamp - left.timestamp, 1);
   const ratio = Math.max(0, Math.min(1, (timestamp - left.timestamp) / duration));
   const nearest = ratio < 0.5 ? left : right;
-  if (left.epoch !== right.epoch) return nearest;
+  const sameEpoch = left.epoch !== null && left.epoch === right.epoch;
+  const comparisonEligible =
+    sameEpoch && isComparisonEligiblePoint(left) && isComparisonEligiblePoint(right);
+
+  if (!sameEpoch) {
+    return {
+      ...nearest,
+      timestamp,
+      isFinalized: left.isFinalized && right.isFinalized,
+      isHeartbeat: left.isHeartbeat || right.isHeartbeat,
+      epoch: null,
+      confidence: conservativeConfidence(left, right),
+      percentageCoverage: interpolateNullable(
+        left.percentageCoverage,
+        right.percentageCoverage,
+        ratio,
+      ),
+      isSynthetic: true,
+      comparisonEligible: false,
+    };
+  }
 
   return {
     timestamp,
@@ -146,19 +184,21 @@ function interpolatePoint(points: HistoryPoint[], timestamp: number): HistoryPoi
     resetAt: nearest.resetAt,
     resetReason: nearest.resetReason,
     isFinalized: left.isFinalized && right.isFinalized,
-    isHeartbeat: nearest.isHeartbeat,
-    epoch: nearest.epoch,
-    confidence: nearest.confidence,
+    isHeartbeat: left.isHeartbeat || right.isHeartbeat,
+    epoch: left.epoch,
+    confidence: conservativeConfidence(left, right),
     percentageCoverage: interpolateNullable(
       left.percentageCoverage,
       right.percentageCoverage,
       ratio,
     ),
+    isSynthetic: true,
+    comparisonEligible,
   };
 }
 
 function historySignal(point: HistoryPoint) {
-  return point.rawEstimatedWeeklyValueUsd ?? point.estimatedWeeklyValueUsd;
+  return getChartEstimate(point);
 }
 
 function findNoUsageGaps(points: HistoryPoint[], thresholdMs: number) {
@@ -316,17 +356,7 @@ export function UsageChart({
     setAnnotationHover(null);
   }, [range]);
 
-  const values = useMemo(
-    () => points.map(historySignal).filter((value): value is number => value !== null),
-    [points],
-  );
-  const bounds = useMemo(() => {
-    if (!values.length) return { min: 0, max: 1 };
-    const minValue = Math.min(...values);
-    const maxValue = Math.max(...values);
-    const padding = Math.max((maxValue - minValue) * 0.12, maxValue * 0.04, 1);
-    return { min: Math.max(0, minValue - padding), max: maxValue + padding };
-  }, [values]);
+  const yAxisScale = useMemo(() => getChartYAxisScale(points), [points]);
 
   const signalPoints = useMemo(
     () => points.filter((point) => historySignal(point) !== null),
@@ -349,17 +379,14 @@ export function UsageChart({
     [noUsageGaps, rangeEnd, rangeStart],
   );
   const coordinates = useMemo(() => {
-    const valueRange = Math.max(bounds.max - bounds.min, 1);
-    return points.map((point) => ({
-      x: timestampToX(timeline, point.timestamp),
-      y:
-        historySignal(point) === null
-          ? plotBottom
-          : plotTop +
-            ((bounds.max - (historySignal(point) ?? bounds.min)) / valueRange) *
-              (plotBottom - plotTop),
-    }));
-  }, [bounds.max, bounds.min, points, timeline]);
+    return points.map((point) => {
+      const value = historySignal(point);
+      return {
+        x: timestampToX(timeline, point.timestamp),
+        y: value === null ? plotBottom : yAxisValueToY(value, yAxisScale, plotTop, plotBottom),
+      };
+    });
+  }, [points, timeline, yAxisScale]);
   const gapStartingAt = useMemo(
     () => new Set(noUsageGaps.map((gap) => gap.startTimestamp)),
     [noUsageGaps],
@@ -440,39 +467,39 @@ export function UsageChart({
   const selectedCoordinate = selection?.coordinate ?? null;
   const anchorCoordinate = useMemo(() => {
     if (!anchorPoint || points.length === 0) return null;
-    const valueRange = Math.max(bounds.max - bounds.min, 1);
+    const value = historySignal(anchorPoint);
     return {
       x: timestampToX(timeline, anchorPoint.timestamp),
-      y:
-        historySignal(anchorPoint) === null
-          ? plotBottom
-          : plotTop +
-            ((bounds.max - (historySignal(anchorPoint) ?? bounds.min)) / valueRange) *
-              (plotBottom - plotTop),
+      y: value === null ? plotBottom : yAxisValueToY(value, yAxisScale, plotTop, plotBottom),
     };
-  }, [anchorPoint, bounds.max, bounds.min, points.length, timeline]);
+  }, [anchorPoint, points.length, timeline, yAxisScale]);
   const baselineCoordinate =
     baselineEstimatedWeeklyValueUsd === null ||
-    baselineEstimatedWeeklyValueUsd < bounds.min ||
-    baselineEstimatedWeeklyValueUsd > bounds.max
+    !Number.isFinite(baselineEstimatedWeeklyValueUsd) ||
+    baselineEstimatedWeeklyValueUsd < yAxisScale.lowerBound ||
+    baselineEstimatedWeeklyValueUsd > yAxisScale.upperBound
       ? null
       : {
-          y:
-            plotTop +
-            ((bounds.max - baselineEstimatedWeeklyValueUsd) /
-              Math.max(bounds.max - bounds.min, 1)) *
-              (plotBottom - plotTop),
+          y: yAxisValueToY(baselineEstimatedWeeklyValueUsd, yAxisScale, plotTop, plotBottom),
         };
-  const dragChange =
-    anchorPoint &&
-    historySignal(anchorPoint) != null &&
-    selected &&
-    historySignal(selected) != null &&
-    (selection?.source === 'held' || selection?.source === 'locked')
-      ? (historySignal(selected) ?? 0) - (historySignal(anchorPoint) ?? 0)
-      : null;
-  const isNegative = (dragChange ?? changeValueUsd ?? 0) < 0;
-  const chartColor = isNegative ? '#ff5d73' : '#5cf07a';
+  const manualComparisonActive = Boolean(
+    anchorPoint && selected && (selection?.source === 'held' || selection?.source === 'locked'),
+  );
+  const dragComparison = manualComparisonActive
+    ? compareHistoryPoints(selected, anchorPoint)
+    : null;
+  const dragChange = dragComparison?.eligible ? dragComparison.deltaValueUsd : null;
+  const chartTone = manualComparisonActive
+    ? dragComparison?.eligible
+      ? (dragChange ?? 0) < 0
+        ? 'negative'
+        : 'positive'
+      : 'neutral'
+    : (changeValueUsd ?? 0) < 0
+      ? 'negative'
+      : 'positive';
+  const chartColor =
+    chartTone === 'negative' ? '#ff5d73' : chartTone === 'neutral' ? '#9aa5ad' : '#5cf07a';
 
   const selectPoint = (index: number) => {
     const point = points[index];
@@ -508,13 +535,8 @@ export function UsageChart({
     const timestamp = timelinePosition.timestamp;
     const point = interpolatePoint(points, timestamp);
     if (!point) return null;
-    const valueRange = Math.max(bounds.max - bounds.min, 1);
-    const y =
-      historySignal(point) === null
-        ? plotBottom
-        : plotTop +
-          ((bounds.max - (historySignal(point) ?? bounds.min)) / valueRange) *
-            (plotBottom - plotTop);
+    const value = historySignal(point);
+    const y = value === null ? plotBottom : yAxisValueToY(value, yAxisScale, plotTop, plotBottom);
     setSelection({
       point,
       coordinate: { x, y },
@@ -564,20 +586,11 @@ export function UsageChart({
     }
   };
 
-  const gridValues = [
-    bounds.max,
-    bounds.max - (bounds.max - bounds.min) / 4,
-    bounds.min + (bounds.max - bounds.min) / 2,
-    bounds.min + (bounds.max - bounds.min) / 4,
-    bounds.min,
-  ];
   const labelRatios = [0, 0.25, 0.5, 0.75, 1];
 
   return (
     <div
-      className={`usage-chart chart-${isNegative ? 'negative' : 'positive'} ${
-        reducedMotion ? 'reduced-motion' : ''
-      }`}
+      className={`usage-chart chart-${chartTone} ${reducedMotion ? 'reduced-motion' : ''}`}
       style={{ '--chart-color': chartColor } as React.CSSProperties}
     >
       <div className="chart-value-label">
@@ -693,11 +706,11 @@ export function UsageChart({
               <stop offset="1" stopColor={chartColor} stopOpacity="0" />
             </linearGradient>
           </defs>
-          {gridValues.map((_, index) => {
-            const y = plotTop + (index / 4) * (plotBottom - plotTop);
+          {yAxisScale.ticks.map((value) => {
+            const y = yAxisValueToY(value, yAxisScale, plotTop, plotBottom);
             return (
               <line
-                key={`grid-${index}`}
+                key={`grid-${value}`}
                 className="chart-grid"
                 x1={plotLeft}
                 x2={plotRight}
@@ -838,11 +851,11 @@ export function UsageChart({
             y1={plotBottom}
             y2={plotBottom}
           />
-          {gridValues.map((value, index) => {
-            const y = plotTop + (index / 4) * (plotBottom - plotTop);
+          {yAxisScale.ticks.map((value) => {
+            const y = yAxisValueToY(value, yAxisScale, plotTop, plotBottom);
             return (
-              <text key={`y-${index}`} className="chart-y-label" x="963" y={y + 4}>
-                ${Math.round(value)}
+              <text key={`y-${value}`} className="chart-y-label" x="963" y={y + 4}>
+                {formatYAxisTick(value)}
               </text>
             );
           })}

@@ -6,6 +6,15 @@ Pull-request CI runs the frontend, Rust, and Tauri packaging smoke checks on `ma
 
 Signing and notarization are secret-driven release steps and are not part of pull-request CI. Certificates, API keys, signing identities, generated local databases, and audit snapshots must never be committed or uploaded. NerfTrack's original source code is licensed under GPL-3.0-only; third-party components retain their respective licenses.
 
+## 0.6.2 — 2026-08-13
+
+- Replaced truncated chart scaling with a zero-based adaptive USD axis using exact, evenly spaced tick values.
+- Prevented manual scrubbing from presenting same-window estimator calibration, immature endpoints, heartbeat data, or unsafe interpolation as growth.
+- Preserved valid mature cross-window comparisons, backend range statistics, Fast-mode accounting, pricing, raw logs, and historical database rows.
+- Added regression coverage for comparison eligibility, interpolation metadata, neutral styling, and adaptive axis scales.
+
+Validation: frontend tests, typecheck, lint, Rust tests, production build, and the four-platform release workflow gates.
+
 ## Release workflow
 
 Push a semver tag such as `v0.5.2`. The workflow validates that the tag matches the application manifests, runs the existing frontend and Rust gates, builds with Tauri's native target, normalizes the output names, and creates one GitHub Release only after all four jobs succeed.

@@ -1,8 +1,27 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
+import type { HistoryPoint } from '../domain';
 import { UsageChart } from './UsageChart';
 import { demoAnnotations, getDemoHistory } from '../lib/fixtures';
+
+function historyPoint(overrides: Partial<HistoryPoint> = {}): HistoryPoint {
+  return {
+    timestamp: 0,
+    estimatedWeeklyValueUsd: 100,
+    rawEstimatedWeeklyValueUsd: 999,
+    observedCostUsd: 1,
+    weeklyUsedPercent: 20,
+    resetAt: null,
+    resetReason: null,
+    isFinalized: true,
+    isHeartbeat: false,
+    epoch: 1,
+    confidence: 'high',
+    percentageCoverage: 20,
+    ...overrides,
+  };
+}
 
 describe('UsageChart', () => {
   it('supports keyboard nearest-point scrubbing', async () => {
@@ -46,7 +65,7 @@ describe('UsageChart', () => {
       y: 0,
       toJSON: () => ({}),
     });
-    fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 100 }));
+    fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 400 }));
     expect(chart).toHaveAttribute('aria-grabbed', 'true');
     fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 900 }));
     fireEvent(chart, new MouseEvent('pointerup', { bubbles: true, clientX: 900 }));
@@ -125,7 +144,123 @@ describe('UsageChart', () => {
 
     fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 200 }));
     fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 800 }));
+    expect(chart.closest('.usage-chart')).toHaveClass('chart-neutral');
+  });
+
+  it('marks interpolation across an epoch boundary as ineligible', () => {
+    const onScrub = vi.fn();
+    render(
+      <UsageChart
+        points={[
+          historyPoint({ estimatedWeeklyValueUsd: 100, epoch: 1 }),
+          historyPoint({
+            timestamp: 3_600_000,
+            estimatedWeeklyValueUsd: 200,
+            epoch: 2,
+          }),
+        ]}
+        annotations={[]}
+        range="1D"
+        reducedMotion={false}
+        onScrub={onScrub}
+      />,
+    );
+    const chart = screen.getByRole('img', { name: /Estimated weekly API-equivalent value/ });
+    vi.spyOn(chart, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 1000,
+      height: 308,
+      right: 1000,
+      bottom: 308,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    const hoverEvent = new MouseEvent('pointermove', { bubbles: true, clientX: 500 });
+    Object.defineProperty(hoverEvent, 'pointerType', { value: 'mouse' });
+    fireEvent(chart, hoverEvent);
+
+    const interpolated = onScrub.mock.calls.at(-1)?.[0];
+    expect(interpolated.isSynthetic).toBe(true);
+    expect(interpolated.comparisonEligible).toBe(false);
+    expect(interpolated.epoch).toBeNull();
+  });
+
+  it('does not inherit high confidence from only one interpolation bracket', () => {
+    const onScrub = vi.fn();
+    render(
+      <UsageChart
+        points={[
+          historyPoint({ confidence: 'high', percentageCoverage: 20 }),
+          historyPoint({
+            timestamp: 3_600_000,
+            estimatedWeeklyValueUsd: 200,
+            confidence: 'medium',
+            percentageCoverage: 30,
+          }),
+        ]}
+        annotations={[]}
+        range="1D"
+        reducedMotion={false}
+        onScrub={onScrub}
+      />,
+    );
+    const chart = screen.getByRole('img', { name: /Estimated weekly API-equivalent value/ });
+    vi.spyOn(chart, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 1000,
+      height: 308,
+      right: 1000,
+      bottom: 308,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    const hoverEvent = new MouseEvent('pointermove', { bubbles: true, clientX: 500 });
+    Object.defineProperty(hoverEvent, 'pointerType', { value: 'mouse' });
+    fireEvent(chart, hoverEvent);
+
+    const interpolated = onScrub.mock.calls.at(-1)?.[0];
+    expect(interpolated.confidence).toBe('medium');
+    expect(interpolated.comparisonEligible).toBe(true);
+  });
+
+  it('keeps a mature cross-window drag comparison valid', () => {
+    const onScrub = vi.fn();
+    const points = [
+      historyPoint({ estimatedWeeklyValueUsd: 100, epoch: 1 }),
+      historyPoint({ timestamp: 3_600_000, estimatedWeeklyValueUsd: 100, epoch: 1 }),
+      historyPoint({ timestamp: 7_200_000, estimatedWeeklyValueUsd: 200, epoch: 2 }),
+      historyPoint({ timestamp: 10_800_000, estimatedWeeklyValueUsd: 200, epoch: 2 }),
+    ];
+    render(
+      <UsageChart
+        points={points}
+        annotations={[]}
+        range="1D"
+        reducedMotion={false}
+        onScrub={onScrub}
+      />,
+    );
+    const chart = screen.getByRole('img', { name: /Estimated weekly API-equivalent value/ });
+    vi.spyOn(chart, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 1000,
+      height: 308,
+      right: 1000,
+      bottom: 308,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 100 }));
+    fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 900 }));
+
     expect(chart.closest('.usage-chart')).toHaveClass('chart-positive');
+    expect(onScrub.mock.calls.at(-1)?.[1]).not.toBeNull();
   });
 
   it('breaks the rendered path between weekly quota epochs', () => {
@@ -265,7 +400,7 @@ describe('UsageChart', () => {
     expect(screen.getByRole('tooltip')).toHaveTextContent('Reset changed');
   });
 
-  it('plots raw estimates and excludes comparison baselines from axis bounds', () => {
+  it('plots stabilized estimates and excludes comparison baselines from axis bounds', () => {
     const points = getDemoHistory('1D')
       .points.slice(0, 2)
       .map((point, index) => ({
@@ -285,8 +420,44 @@ describe('UsageChart', () => {
 
     const path = document.querySelector('.chart-line')?.getAttribute('d') ?? '';
     const yCoordinates = [...path.matchAll(/[ML] [\d.]+ ([\d.]+)/g)].map((match) => match[1]);
-    expect(new Set(yCoordinates).size).toBe(2);
+    expect(new Set(yCoordinates).size).toBe(1);
     expect(screen.queryByText('$-1000')).not.toBeInTheDocument();
+  });
+
+  it('renders a zero-based adaptive axis with exact, evenly spaced ticks', () => {
+    render(
+      <UsageChart
+        points={[
+          historyPoint({ timestamp: 0, estimatedWeeklyValueUsd: 100 }),
+          historyPoint({ timestamp: 3_600_000, estimatedWeeklyValueUsd: 161 }),
+          historyPoint({ timestamp: 7_200_000, estimatedWeeklyValueUsd: 148 }),
+        ]}
+        annotations={[]}
+        range="1D"
+        reducedMotion={false}
+        baselineEstimatedWeeklyValueUsd={999}
+      />,
+    );
+
+    const labels = [...document.querySelectorAll('.chart-y-label')];
+    expect(labels.map((label) => label.textContent)).toEqual([
+      '$0',
+      '$30',
+      '$60',
+      '$90',
+      '$120',
+      '$150',
+      '$180',
+    ]);
+    expect(labels.every((label) => Number(label.textContent?.slice(1)) % 30 === 0)).toBe(true);
+
+    const positions = labels.map((label) => Number(label.getAttribute('y')));
+    const spacing = positions[1] - positions[0];
+    expect(spacing).toBeLessThan(0);
+    positions.slice(2).forEach((position, index) => {
+      expect(position - positions[index + 1]).toBeCloseTo(spacing, 10);
+    });
+    expect(labels[0].getAttribute('y')).not.toBe(labels.at(-1)?.getAttribute('y'));
   });
 
   it('renders fixture API-equivalent values with a manual reset boundary', () => {

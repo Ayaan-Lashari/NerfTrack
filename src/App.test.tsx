@@ -1,7 +1,76 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
-import App from './App';
+import App, { HomeView } from './App';
+import type { HistoryPoint, HistoryResponse } from './domain';
+import { demoQuote, demoStatus } from './lib/fixtures';
+
+function historyPoint(overrides: Partial<HistoryPoint> = {}): HistoryPoint {
+  return {
+    timestamp: 0,
+    estimatedWeeklyValueUsd: 100,
+    rawEstimatedWeeklyValueUsd: 999,
+    observedCostUsd: 1,
+    weeklyUsedPercent: 20,
+    resetAt: null,
+    resetReason: null,
+    isFinalized: true,
+    isHeartbeat: false,
+    epoch: 1,
+    confidence: 'high',
+    percentageCoverage: 20,
+    ...overrides,
+  };
+}
+
+function customHistory(points: HistoryPoint[], baseline = 10): HistoryResponse {
+  return {
+    points,
+    statistics: {
+      range: '1D',
+      baselineEstimatedWeeklyValueUsd: baseline,
+      baselineTimestamp: points[0]?.timestamp ?? null,
+      currentEstimatedWeeklyValueUsd: points.at(-1)?.estimatedWeeklyValueUsd ?? null,
+      deltaValueUsd: null,
+      deltaPercent: null,
+      pointCount: points.length,
+      partial: false,
+    },
+    bucket: '5m',
+  };
+}
+
+function renderHomeWithHistory(history: HistoryResponse) {
+  render(
+    <HomeView
+      status={demoStatus}
+      quote={demoQuote}
+      history={history}
+      annotations={[]}
+      range="1D"
+      reducedMotion={false}
+      isRefreshing={false}
+      onRefresh={vi.fn()}
+      onRangeChange={vi.fn()}
+      onResetAnnotations={vi.fn()}
+    />,
+  );
+  const chart = screen.getByRole('img', {
+    name: /Estimated weekly API-equivalent value/,
+  });
+  vi.spyOn(chart, 'getBoundingClientRect').mockReturnValue({
+    left: 0,
+    top: 0,
+    width: 1000,
+    height: 308,
+    right: 1000,
+    bottom: 308,
+    x: 0,
+    y: 0,
+    toJSON: () => ({}),
+  });
+  return chart;
+}
 
 describe('NerfTrack app shell', () => {
   it('renders the dashboard reference surface with a non-zero quote', async () => {
@@ -120,12 +189,81 @@ describe('NerfTrack app shell', () => {
       toJSON: () => ({}),
     });
 
-    fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 100 }));
+    fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 400 }));
     fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 900 }));
 
     expect(screen.getByText('Selected range').parentElement).toHaveTextContent(
       /[+−]\$\d+\.\d{2} \([+−]\d+\.\d{2}%\)/,
     );
+  });
+
+  it('suppresses a same-window calibration percentage and uses neutral styling', () => {
+    const chart = renderHomeWithHistory(
+      customHistory([
+        historyPoint({ estimatedWeeklyValueUsd: 94.35, percentageCoverage: 9 }),
+        historyPoint({
+          timestamp: 3_600_000,
+          estimatedWeeklyValueUsd: 158.04,
+          percentageCoverage: 53,
+        }),
+      ]),
+    );
+
+    fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 0 }));
+    fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 1000 }));
+
+    expect(screen.getByText('Comparison unavailable · estimator calibration')).toBeInTheDocument();
+    expect(screen.queryByText(/\([+−]\d+\.\d{2}%\)/)).not.toBeInTheDocument();
+    expect(chart.closest('.usage-chart')).toHaveClass('chart-neutral');
+    expect(screen.getByText('≈$158')).toBeInTheDocument();
+  });
+
+  it('rejects an immature cross-window anchor without falling back to backend baseline', () => {
+    const chart = renderHomeWithHistory(
+      customHistory([
+        historyPoint({
+          estimatedWeeklyValueUsd: 72.62,
+          confidence: 'medium',
+          percentageCoverage: 8,
+        }),
+        historyPoint({
+          timestamp: 3_600_000,
+          epoch: 2,
+          estimatedWeeklyValueUsd: 160.84,
+          percentageCoverage: 51,
+        }),
+      ]),
+    );
+
+    fireEvent(chart, new MouseEvent('pointerdown', { bubbles: true, clientX: 0 }));
+    fireEvent(chart, new MouseEvent('pointermove', { bubbles: true, clientX: 1000 }));
+
+    expect(
+      screen.getByText('Comparison unavailable · endpoints need mature history'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/\([+−]\d+\.\d{2}%\)/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Selected range')).not.toBeInTheDocument();
+    expect(chart.closest('.usage-chart')).toHaveClass('chart-neutral');
+  });
+
+  it('does not treat a hover without an anchor as a selected-range comparison', () => {
+    const chart = renderHomeWithHistory(
+      customHistory([
+        historyPoint({ estimatedWeeklyValueUsd: 100 }),
+        historyPoint({
+          timestamp: 3_600_000,
+          epoch: 2,
+          estimatedWeeklyValueUsd: 200,
+        }),
+      ]),
+    );
+    const hoverEvent = new MouseEvent('pointermove', { bubbles: true, clientX: 1000 });
+    Object.defineProperty(hoverEvent, 'pointerType', { value: 'mouse' });
+    fireEvent(chart, hoverEvent);
+
+    expect(screen.queryByText('Selected range')).not.toBeInTheDocument();
+    expect(screen.queryByText(/\([+−]\d+\.\d{2}%\)/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Comparison unavailable/)).not.toBeInTheDocument();
   });
 
   it('switches cached ranges without remounting the chart or keeping a weekly label', async () => {

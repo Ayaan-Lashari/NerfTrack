@@ -36,6 +36,11 @@ import {
 import { demoQuote, demoStatus } from './lib/fixtures';
 import { GITHUB_REPOSITORY_URL } from './lib/config';
 import {
+  compareHistoryPoints,
+  comparisonUnavailableMessage,
+  getChartEstimate,
+} from './lib/comparison';
+import {
   checkForUpdate,
   consumeUpdateFailure,
   CURRENT_APP_VERSION,
@@ -208,7 +213,7 @@ function RangeSelector({ range, onChange }: { range: Range; onChange: (range: Ra
   );
 }
 
-function HomeView({
+export function HomeView({
   status,
   quote,
   history,
@@ -236,23 +241,38 @@ function HomeView({
     anchor: HistoryPoint | null;
   } | null>(null);
   const displayValue = scrubbed
-    ? (scrubbed.point.rawEstimatedWeeklyValueUsd ?? scrubbed.point.estimatedWeeklyValueUsd)
+    ? getChartEstimate(scrubbed.point)
     : (quote?.estimatedWeeklyValueUsd ?? null);
   const stableEstimate = hasStableEstimate(quote) && !scrubbed;
+  const scrubComparison = scrubbed ? compareHistoryPoints(scrubbed.point, scrubbed.anchor) : null;
   const comparisonValue =
-    stableEstimate || scrubbed
-      ? (scrubbed?.anchor?.rawEstimatedWeeklyValueUsd ??
-        scrubbed?.anchor?.estimatedWeeklyValueUsd ??
-        history.statistics.baselineEstimatedWeeklyValueUsd ??
-        null)
+    scrubbed?.anchor && scrubComparison?.eligible
+      ? scrubComparison.anchorValueUsd
+      : stableEstimate
+        ? (history.statistics.baselineEstimatedWeeklyValueUsd ?? null)
+        : null;
+  const displayChange = scrubbed
+    ? scrubComparison?.eligible
+      ? scrubComparison.deltaValueUsd
+      : null
+    : displayValue !== null && comparisonValue !== null
+      ? displayValue - comparisonValue
       : null;
-  const displayChange =
-    displayValue !== null && comparisonValue !== null ? displayValue - comparisonValue : null;
-  const displayPercent =
-    displayChange !== null && comparisonValue ? (displayChange / comparisonValue) * 100 : null;
-  const signalPoints = history.points.filter(
-    (point) => (point.rawEstimatedWeeklyValueUsd ?? point.estimatedWeeklyValueUsd) !== null,
-  );
+  const displayPercent = scrubbed
+    ? scrubComparison?.eligible
+      ? scrubComparison.deltaPercent
+      : null
+    : displayChange !== null && comparisonValue
+      ? (displayChange / comparisonValue) * 100
+      : null;
+  const comparisonMessage =
+    scrubbed?.anchor &&
+    scrubComparison &&
+    !scrubComparison.eligible &&
+    scrubComparison.reason !== 'valid'
+      ? comparisonUnavailableMessage(scrubComparison.reason)
+      : null;
+  const signalPoints = history.points.filter((point) => getChartEstimate(point) !== null);
   const availableHistoryStart = signalPoints[0]?.timestamp ?? null;
   const availableHistoryEnd = signalPoints.at(-1)?.timestamp ?? null;
   const usesAvailableHistory =
@@ -316,14 +336,29 @@ function HomeView({
         <strong className={isEmpty || (!stableEstimate && !scrubbed) ? 'empty-value' : ''}>
           {stableEstimate || scrubbed ? formatEstimatedUsd(displayValue) : 'Calibrating'}
         </strong>
-        {!isEmpty && (stableEstimate || scrubbed) && (
-          <p className={displayChange !== null && displayChange < 0 ? 'negative' : 'positive'}>
-            {formatSignedUsd(displayChange)}{' '}
-            {displayPercent !== null ? `(${formatPercent(displayPercent)})` : ''}{' '}
-            <span>{comparisonLabel}</span>
+        {comparisonMessage && <p className="muted-state">{comparisonMessage}</p>}
+        {!comparisonMessage && !isEmpty && (stableEstimate || scrubbed) && (
+          <p
+            className={
+              scrubbed && !scrubbed.anchor
+                ? 'muted-state'
+                : displayChange !== null && displayChange < 0
+                  ? 'negative'
+                  : 'positive'
+            }
+          >
+            {scrubbed && !scrubbed.anchor ? (
+              <span>{comparisonLabel}</span>
+            ) : (
+              <>
+                {formatSignedUsd(displayChange)}{' '}
+                {displayPercent !== null ? `(${formatPercent(displayPercent)})` : ''}{' '}
+                <span>{comparisonLabel}</span>
+              </>
+            )}
           </p>
         )}
-        {(isEmpty || (!stableEstimate && !scrubbed)) && (
+        {!comparisonMessage && (isEmpty || (!stableEstimate && !scrubbed)) && (
           <p className="muted-state">{calibrationNote(quote)}</p>
         )}
       </div>
