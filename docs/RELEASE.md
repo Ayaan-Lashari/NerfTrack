@@ -6,6 +6,13 @@ Pull-request CI runs the frontend, Rust, and Tauri packaging smoke checks on `ma
 
 Signing and notarization are secret-driven release steps and are not part of pull-request CI. Certificates, API keys, signing identities, generated local databases, and audit snapshots must never be committed or uploaded. NerfTrack's original source code is licensed under GPL-3.0-only; third-party components retain their respective licenses.
 
+## 1.1.0 — 2026-08-14
+
+- Reduced the release executable and app bundle through symbol stripping and single-unit release code generation.
+- Preserved application behavior, functionality, data formats, and supported packaging targets.
+
+Validation: frontend tests, typecheck, lint, formatting, production build, Rust tests, Tauri app build, installation, ad-hoc signing, and installed bundle verification.
+
 ## 1.0.0 — 2026-08-13
 
 - First public-ready, non-beta NerfTrack release, with a stable experience for general use.
