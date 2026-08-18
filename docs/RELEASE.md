@@ -6,6 +6,14 @@ Pull-request CI runs the frontend, Rust, and Tauri packaging smoke checks on `ma
 
 Signing and notarization are secret-driven release steps and are not part of pull-request CI. Certificates, API keys, signing identities, generated local databases, and audit snapshots must never be committed or uploaded. NerfTrack's original source code is licensed under GPL-3.0-only; third-party components retain their respective licenses.
 
+## 1.1.1 — 2026-08-18
+
+- Added a clear option to continue onboarding without starring the GitHub repository.
+- Prevented the onboarding action from waiting on the startup indexing database lock, so the window remains responsive during large local-data rebuilds.
+- Added an in-app `Indexing local data` progress state while startup repricing and log scanning finish.
+
+Validation: frontend tests, typecheck, lint, formatting, production build, Rust tests, Clippy, Tauri app build, installation, ad-hoc signing, and installed bundle verification.
+
 ## 1.1.0 — 2026-08-14
 
 - Reduced the release executable and app bundle through symbol stripping and single-unit release code generation.

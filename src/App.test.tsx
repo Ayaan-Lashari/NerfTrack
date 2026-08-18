@@ -121,7 +121,7 @@ describe('NerfTrack app shell', () => {
     expect(screen.getByRole('heading', { name: 'Help NerfTrack keep going.' })).toBeInTheDocument();
     expect(screen.getByText('Let the resets continue')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Star NerfTrack on GitHub/ })).not.toBeDisabled();
-    expect(screen.queryByRole('button', { name: /skip/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue without starring' })).toBeInTheDocument();
     expect(screen.queryByText(/follow on X/i)).not.toBeInTheDocument();
   });
 

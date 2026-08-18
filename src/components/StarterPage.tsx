@@ -32,7 +32,7 @@ export function StarterPage({ version, onComplete }: StarterPageProps) {
   };
 
   const continueToApp = async () => {
-    if (!githubOpened || busy) return;
+    if (busy) return;
     setError(null);
     setBusy(true);
     try {
@@ -94,6 +94,24 @@ export function StarterPage({ version, onComplete }: StarterPageProps) {
                 {error}
               </p>
             )}
+          </div>
+
+          <div className="starter-skip">
+            <span className="starter-skip-face" aria-hidden="true">
+              ☹
+            </span>
+            <span className="starter-skip-copy">
+              <strong>Not ready to star?</strong>
+              <small>The little star will be sad, but you can still continue.</small>
+            </span>
+            <button
+              type="button"
+              className="starter-skip-button"
+              disabled={busy}
+              onClick={() => void continueToApp()}
+            >
+              Continue without starring
+            </button>
           </div>
         </div>
 

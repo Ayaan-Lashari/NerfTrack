@@ -167,6 +167,60 @@ svg:focus-visible {
   max-width: 470px;
   margin-top: 34px;
 }
+.starter-skip {
+  display: flex;
+  max-width: 470px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+  padding: 12px 2px 0;
+  color: #818b87;
+}
+.starter-skip-face {
+  flex: 0 0 auto;
+  color: #6f7b75;
+  font-size: 21px;
+  line-height: 1;
+}
+.starter-skip-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 3px;
+}
+.starter-skip-copy strong {
+  color: #a4afa9;
+  font-size: 12px;
+  font-weight: 600;
+}
+.starter-skip-copy small {
+  color: #747f79;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.starter-skip-button {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  color: #a6b2aa;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(30, 38, 35, 0.62);
+  border: 1px solid rgba(137, 153, 143, 0.22);
+  border-radius: 7px;
+  transition:
+    color 160ms ease,
+    background 160ms ease,
+    border-color 160ms ease;
+}
+.starter-skip-button:hover:not(:disabled) {
+  color: #d0d8d2;
+  background: rgba(47, 58, 52, 0.8);
+  border-color: rgba(164, 180, 169, 0.42);
+}
+.starter-skip-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
 .starter-github-button {
   display: grid;
   width: 100%;
@@ -360,6 +414,39 @@ svg:focus-visible {
   font-size: 13px;
   background: rgba(103, 35, 33, 0.86);
   border-bottom: 1px solid rgba(255, 92, 82, 0.42);
+}
+.indexing-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 18px 34px 0;
+  padding: 12px 15px;
+  color: #d9f5df;
+  background: rgba(30, 73, 47, 0.38);
+  border: 1px solid rgba(92, 240, 122, 0.26);
+  border-radius: 10px;
+}
+.indexing-banner > span:last-child {
+  display: grid;
+  gap: 3px;
+}
+.indexing-banner strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+.indexing-banner small {
+  color: #a7c3ad;
+  font-size: 12px;
+  line-height: 1.35;
+}
+.indexing-spinner {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  border: 2px solid rgba(92, 240, 122, 0.2);
+  border-top-color: var(--green);
+  border-radius: 50%;
+  animation: spin 800ms linear infinite;
 }
 
 .side-nav {
@@ -2233,6 +2320,9 @@ p {
   .starter-continue-button {
     width: 100%;
     justify-content: center;
+  }
+  .indexing-banner {
+    margin: 14px 20px 0;
   }
   .page-shell {
     padding: 31px 20px 25px;

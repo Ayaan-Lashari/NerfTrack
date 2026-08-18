@@ -172,6 +172,18 @@ function LiveRefreshStatus() {
   );
 }
 
+function LocalIndexingBanner({ detail }: { detail: string }) {
+  return (
+    <div className="indexing-banner" role="status" aria-live="polite">
+      <span className="indexing-spinner" aria-hidden="true" />
+      <span>
+        <strong>Indexing local data</strong>
+        <small>{detail} You can keep using NerfTrack while this finishes.</small>
+      </span>
+    </div>
+  );
+}
+
 function updateStateFromResult(result: UpdateCheckResult): UpdateState {
   return {
     status: result.updateAvailable
@@ -645,6 +657,7 @@ export default function App() {
     const savedSettings = await updateSettings(nextSettings);
     setSettings(savedSettings);
     setStarterPageVisible(false);
+    void refresh();
   };
 
   const handleOpenStarterPage = () => setStarterPageVisible(true);
@@ -846,6 +859,7 @@ export default function App() {
         onUpdate={() => void handleUpdate()}
       />
       <main className="app-content">
+        {status.state === 'recalibrating' && <LocalIndexingBanner detail={status.detail} />}
         {loadError && (
           <div className="global-error" role="alert">
             Local state is unavailable. Check the Diagnostics and Setup pages, then retry detection.

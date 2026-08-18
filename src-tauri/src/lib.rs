@@ -55,7 +55,7 @@ pub struct AppState {
     codex_home_override: Mutex<Option<PathBuf>>,
     codex_binary_override: Mutex<Option<PathBuf>>,
     collection_paused: Mutex<bool>,
-    settings: Mutex<AppSettings>,
+    settings: Arc<Mutex<AppSettings>>,
     background: Arc<Mutex<BackgroundWork>>,
 }
 
@@ -68,7 +68,7 @@ impl AppState {
             codex_home_override: Mutex::new(overrides.codex_home),
             codex_binary_override: Mutex::new(overrides.codex_binary),
             collection_paused: Mutex::new(false),
-            settings: Mutex::new(AppSettings::default()),
+            settings: Arc::new(Mutex::new(AppSettings::default())),
             background: Arc::new(Mutex::new(BackgroundWork {
                 phase: BackgroundPhase::Initializing,
                 reconciliation_in_flight: false,
@@ -348,7 +348,7 @@ impl AppState {
         if background.phase == BackgroundPhase::Initializing {
             return AppStatus {
                 state: AppStatusState::Recalibrating,
-                label: "Updating local data".into(),
+                label: "Indexing local data".into(),
                 detail: "Repricing history and scanning local Codex logs…".into(),
                 integration_mode,
                 account_state: AccountState::Unknown,
@@ -754,21 +754,58 @@ async fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String>
         .map_err(|_| "settings state is unavailable".to_string())
 }
 
+fn persist_settings_async(state: &AppState) -> Result<(), String> {
+    let database = Arc::clone(&state.database);
+    let settings = Arc::clone(&state.settings);
+    thread::Builder::new()
+        .name("nerftrack-settings-persist".into())
+        .spawn(move || {
+            let result = (|| {
+                let mut database = database
+                    .lock()
+                    .map_err(|_| "database writer is unavailable".to_string())?;
+                let settings = settings
+                    .lock()
+                    .map_err(|_| "settings state is unavailable".to_string())?
+                    .clone();
+                database.save_settings(&settings)
+            })();
+            if let Err(error) = result {
+                eprintln!("unable to persist settings after startup indexing: {error}");
+            }
+        })
+        .map(|_| ())
+        .map_err(|_| "unable to queue settings persistence".to_string())
+}
+
 #[tauri::command]
 fn update_settings(
     state: State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<AppSettings, String> {
     settings.validate()?;
-    let mut database = state
-        .database
-        .lock()
-        .map_err(|_| "database writer is unavailable".to_string())?;
-    database.save_settings(&settings)?;
-    *state
-        .settings
-        .lock()
-        .map_err(|_| "settings state is unavailable".to_string())? = settings.clone();
+    match state.database.try_lock() {
+        Ok(mut database) => {
+            database.save_settings(&settings)?;
+            *state
+                .settings
+                .lock()
+                .map_err(|_| "settings state is unavailable".to_string())? = settings.clone();
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // Startup indexing owns the database mutex for the expensive rebuild. Keep the
+            // command responsive and let the persistence worker save the newest in-memory
+            // settings after indexing releases the database.
+            *state
+                .settings
+                .lock()
+                .map_err(|_| "settings state is unavailable".to_string())? = settings.clone();
+            persist_settings_async(&state)?;
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err("database writer is unavailable".to_string());
+        }
+    }
     Ok(settings)
 }
 
