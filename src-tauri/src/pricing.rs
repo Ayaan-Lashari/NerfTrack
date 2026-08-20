@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 
 pub const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
 pub const PRICING_SOURCE: &str = "models_dev";
+pub const CODEX_AUTO_REVIEW_MODEL_ID: &str = "codex-auto-review";
+pub const CODEX_AUTO_REVIEW_API_MODEL_ID: &str = "gpt-5.6-luna";
 
 const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -38,11 +40,16 @@ pub struct PricingCatalog {
 impl PricingCatalog {
     pub fn find(&self, model: &str) -> Option<RemotePrice> {
         let normalized = normalize_model_id(model);
-        self.models.get(&normalized).cloned().or_else(|| {
-            normalized
-                .strip_prefix("openai-")
-                .and_then(|unprefixed| self.models.get(unprefixed).cloned())
-        })
+        let canonical = canonical_api_model_id(&normalized);
+        self.models
+            .get(&canonical)
+            .cloned()
+            .or_else(|| self.models.get(&normalized).cloned())
+            .or_else(|| {
+                normalized
+                    .strip_prefix("openai-")
+                    .and_then(|unprefixed| self.models.get(unprefixed).cloned())
+            })
     }
 }
 
@@ -60,6 +67,19 @@ pub enum FetchOutcome {
 
 pub fn normalize_model_id(model: &str) -> String {
     model.trim().to_ascii_lowercase().replace('/', "-")
+}
+
+/// Codex records the internal Auto Review worker name rather than the public
+/// API model name. Keep the feature label for diagnostics, but price it as the
+/// current GPT-5.6 Luna model.
+pub fn canonical_api_model_id(model: &str) -> String {
+    let normalized = normalize_model_id(model);
+    let unprefixed = normalized.strip_prefix("openai-").unwrap_or(&normalized);
+    if unprefixed == CODEX_AUTO_REVIEW_MODEL_ID {
+        CODEX_AUTO_REVIEW_API_MODEL_ID.into()
+    } else {
+        unprefixed.into()
+    }
 }
 
 pub fn parse_catalog(json: &str, digest: Option<String>) -> Result<PricingCatalog, String> {
@@ -306,5 +326,22 @@ mod tests {
         )
         .expect_err("catalog should be rejected");
         assert!(error.contains("no token-priced"));
+    }
+
+    #[test]
+    fn resolves_codex_auto_review_to_the_public_gpt_5_6_luna_catalog_entry() {
+        let catalog = parse_catalog(
+            r#"{"openai":{"models":{"gpt-5.6-luna":{"cost":{"input":0.2,"cache_read":0.02,"output":1.2}}}}}"#,
+            None,
+        )
+        .expect("catalog should parse");
+        let price = catalog.find(CODEX_AUTO_REVIEW_MODEL_ID).expect("model");
+        assert_eq!(price.input, 0.2);
+        assert_eq!(price.cached_input, 0.02);
+        assert_eq!(price.output, 1.2);
+        assert_eq!(
+            canonical_api_model_id(CODEX_AUTO_REVIEW_MODEL_ID),
+            "gpt-5.6-luna"
+        );
     }
 }

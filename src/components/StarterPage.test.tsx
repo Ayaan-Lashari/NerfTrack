@@ -8,7 +8,7 @@ describe('StarterPage', () => {
     const user = userEvent.setup();
     const onComplete = vi.fn().mockResolvedValue(undefined);
 
-    render(<StarterPage version="1.1.1" onComplete={onComplete} />);
+    render(<StarterPage version="1.1.2" onComplete={onComplete} />);
 
     const skipButton = screen.getByRole('button', { name: 'Continue without starring' });
     expect(skipButton).toBeEnabled();

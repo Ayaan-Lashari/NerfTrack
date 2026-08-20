@@ -59,10 +59,16 @@ Pricing precedence is:
 2. A token-priced model in the latest valid models.dev openai.models snapshot.
 3. The embedded OpenAI fallback catalog below.
 
-Built-in fallback rates were verified on 2026-08-08 from OpenAI API model pages:
+Built-in fallback rates were verified on 2026-08-20 from OpenAI API model pages:
 
 - [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna): $0.20 input, $0.02 cached input, $1.20 output per 1M text tokens.
 - [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra): $2 input, $0.20 cached input, $12 output per 1M text tokens.
+
+Codex Auto Review records use the internal model ID `codex-auto-review`. NerfTrack
+maps that label to GPT-5.6 Luna, so Auto Review receives Luna's full input,
+cached-input, and output rates in both the live import path and the historical
+reprice/rebuild path. This mapping remains available when the remote catalog is
+offline and is used for future records as well as records already stored.
 
 - [GPT-5.3-Codex](https://developers.openai.com/api/docs/models/gpt-5.3-codex): $1.75 input, $0.175 cached input, $14 output per 1M tokens.
 - [GPT-5.2-Codex](https://developers.openai.com/api/docs/models/gpt-5.2-codex): $1.75 input, $0.175 cached input, $14 output per 1M tokens.
@@ -89,11 +95,13 @@ Range changes are calculated only when both endpoints have medium or high confid
 Schema migration 11 preserves raw usage events, quota observations, accounts, settings, user
 annotations, and checkpoints while adding normalized service-tier evidence and the Fast
 multiplier audit fields. The estimator algorithm version is incremented so existing derived
-estimates are invalidated. On startup NerfTrack reparses every discoverable source JSONL
-rollout, applies explicit historical tier corrections, reprices token events, and rebuilds
-measurements, estimates, windows, and graph points in one SQLite transaction. A failed scan or
-rebuild rolls back the correction and leaves the previous graph intact. Historical records with
-no explicit tier evidence remain uncorrected with an Unknown speed mode and 1.0x multiplier; they
-are never upgraded to Fast. Prompts, raw
+estimates are invalidated. On startup NerfTrack compares the pricing digest, estimator versions,
+and installed-bundle marker with the last completed rebuild. Only when one changes does it
+reparse every discoverable source JSONL rollout, apply explicit historical tier corrections,
+reprice token events, and rebuild measurements, estimates, windows, and graph points in one
+SQLite transaction; otherwise the existing graph is retained and checkpointed collection handles
+new records. A failed scan or rebuild rolls back the correction and leaves the previous graph
+intact. Historical records with no explicit tier evidence remain uncorrected with an Unknown speed
+mode and 1.0x multiplier; they are never upgraded to Fast. Prompts, raw
 JSONL, credentials, account identifiers, and complete paths are not sent to models.dev or
 returned through the UI.

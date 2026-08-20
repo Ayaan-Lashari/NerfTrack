@@ -268,10 +268,6 @@ fn bool_at(value: &Value, paths: &[&[&str]]) -> bool {
         .unwrap_or(false)
 }
 
-fn normalized_model_id(model: &str) -> String {
-    model.trim().to_ascii_lowercase().replace('/', "-")
-}
-
 fn is_model_family(model: &str, family: &str) -> bool {
     model == family
         || model
@@ -285,9 +281,8 @@ pub fn fast_multiplier_for_model(model: &str, speed_mode: SpeedMode) -> f64 {
     if speed_mode != SpeedMode::Fast {
         return 1.0;
     }
-    let normalized = normalized_model_id(model);
-    let normalized = normalized.strip_prefix("openai-").unwrap_or(&normalized);
-    if is_model_family(normalized, "gpt-5.4") {
+    let normalized = crate::pricing::canonical_api_model_id(model);
+    if is_model_family(&normalized, "gpt-5.4") {
         2.0
     } else {
         // GPT-5.5, GPT-5.6, and explicitly fast unknown/future models all use
@@ -1020,6 +1015,7 @@ mod tests {
         for (model, expected) in [
             ("gpt-5.4", 2.0),
             ("gpt-5.4-mini", 2.0),
+            ("codex-auto-review", 2.5),
             ("gpt-5.5", 2.5),
             ("gpt-5.6-pro", 2.5),
             ("gpt-5.7-future", 2.5),

@@ -82,10 +82,11 @@ struct ApiPrice {
     output: f64,
 }
 
-// Verified 2026-08-08 from OpenAI's official model catalog and pricing pages;
+// Verified 2026-08-20 from OpenAI's official model catalog and pricing pages;
 // see docs/CALCULATION.md for the source links. Rates are USD / 1M text tokens.
 fn official_price(model: &str) -> Option<ApiPrice> {
-    match model.trim().to_ascii_lowercase().as_str() {
+    let model = pricing::canonical_api_model_id(model);
+    match model.as_str() {
         "gpt-5.6" | "gpt-5.6-sol" | "chat-latest" => Some(ApiPrice {
             input: 5.0,
             cached_input: 0.5,
@@ -218,12 +219,13 @@ fn event_cost(
     remote_pricing: &PricingCatalog,
 ) -> Result<PricedEvent, String> {
     let model = pricing::normalize_model_id(&event.model);
+    let canonical_model = pricing::canonical_api_model_id(&model);
     let custom = settings.custom_pricing.iter().find(|override_price| {
-        pricing::normalize_model_id(&override_price.model_id) == model
+        pricing::canonical_api_model_id(&override_price.model_id) == canonical_model
             || override_price
                 .alias
                 .as_deref()
-                .is_some_and(|alias| pricing::normalize_model_id(alias) == model)
+                .is_some_and(|alias| pricing::canonical_api_model_id(alias) == canonical_model)
     });
     let (price, source, remote_tier) = if let Some(price) = custom {
         (
@@ -246,7 +248,7 @@ fn event_cost(
             "models_dev",
             Some(remote_tiers),
         )
-    } else if let Some(price) = official_price(&model) {
+    } else if let Some(price) = official_price(&canonical_model) {
         (price, "official", None)
     } else {
         return Err(format!(
@@ -274,12 +276,13 @@ fn event_cost(
         cached_input_rate = tier.cached_input;
         output_rate = tier.output;
     }
-    let documented_long_context = model.starts_with("gpt-5.4")
-        || model.starts_with("gpt-5.5")
-        || model.starts_with("gpt-5.6");
+    let documented_long_context = canonical_model.starts_with("gpt-5.4")
+        || canonical_model.starts_with("gpt-5.5")
+        || canonical_model.starts_with("gpt-5.6");
     if !has_remote_tiers && long_context && documented_long_context {
         multiplier_input = 2.0;
         multiplier_output = 1.5;
+        cached_input_rate *= multiplier_input;
     }
     // `input_tokens` includes cached input and `reasoning_tokens` is an output
     // detail in Codex/Responses records. Charge each physical token once.
@@ -1021,19 +1024,49 @@ impl Database {
         Ok(())
     }
 
-    /// Refresh pricing and reconcile all derived data after the UI has started.
+    /// Refresh pricing and reconcile derived data after the UI has started.
     ///
     /// The network request is best-effort because a valid cached catalog or the
-    /// embedded fallback can still price usage offline. Every startup reparses
-    /// discoverable rollout JSONL before rebuilding derived history so explicit
-    /// service-tier evidence can correct old indexed events.
+    /// embedded fallback can still price usage offline. Historical source
+    /// reindexing is conditional: a normal launch keeps the existing graph and
+    /// the caller's checkpointed reconciliation imports only new records.
     pub fn initialize_background(&mut self, historical_home: Option<&Path>) -> Result<(), String> {
         let refresh_error = self.refresh_models_dev_pricing().err();
-        self.rebuild_quotes_with_historical_sources(historical_home)?;
+        self.finish_background_initialization(historical_home)?;
         if let Some(error) = refresh_error {
             eprintln!("models.dev pricing refresh deferred: {error}");
         }
         Ok(())
+    }
+
+    fn finish_background_initialization(
+        &mut self,
+        historical_home: Option<&Path>,
+    ) -> Result<(), String> {
+        let settings = self.load_settings()?;
+        let remote_pricing = self.remote_pricing.clone();
+        let pricing_digest = pricing_configuration_digest(&settings, &remote_pricing)?;
+        let pricing_state = format!("{PRICING_RULE_VERSION}:{pricing_digest}");
+        if self.historical_rebuild_required(&settings, &pricing_state)? {
+            self.rebuild_quotes_with_historical_sources(historical_home)?;
+        }
+        Ok(())
+    }
+
+    fn historical_rebuild_required(
+        &self,
+        settings: &AppSettings,
+        pricing_state: &str,
+    ) -> Result<bool, String> {
+        if self.load_derived_state("pricing")?.as_deref() != Some(pricing_state)
+            || self.load_derived_state("reconstruction")?.as_deref() != Some(RECONSTRUCTION_VERSION)
+            || self.load_derived_state("algorithm")?.as_deref() != Some(ALGORITHM_VERSION)
+            || self.load_derived_state("installation_marker")?.as_deref()
+                != Some(settings.installation_marker.as_str())
+        {
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn column_exists(&self, table: &str, column: &str) -> Result<bool, String> {
@@ -1211,6 +1244,17 @@ impl Database {
             params![key, value, now_ms()],
         ).map_err(|_| "unable to record derived-data state".to_string())?;
         Ok(())
+    }
+
+    fn load_derived_state(&self, key: &str) -> Result<Option<String>, String> {
+        self.connection
+            .query_row(
+                "SELECT value FROM derived_state WHERE key=?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "unable to read derived-data state".to_string())
     }
 
     pub fn load_checkpoints(&self) -> Result<HashMap<String, u64>, String> {
@@ -1619,6 +1663,12 @@ impl Database {
             &format!("{PRICING_RULE_VERSION}:{pricing_digest}"),
         )?;
         Self::set_derived_state(&transaction, "reconstruction", RECONSTRUCTION_VERSION)?;
+        Self::set_derived_state(&transaction, "algorithm", ALGORITHM_VERSION)?;
+        Self::set_derived_state(
+            &transaction,
+            "installation_marker",
+            &settings.installation_marker,
+        )?;
         transaction
             .commit()
             .map_err(|_| "unable to commit token estimate rebuild".to_string())
@@ -3221,6 +3271,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_auto_review_uses_gpt_5_6_luna_rates() {
+        let event = UsageEvent {
+            model: "codex-auto-review".into(),
+            input_tokens: 200_000,
+            cached_input_tokens: 40_000,
+            output_tokens: 100_000,
+            ..UsageEvent::default()
+        };
+        let priced = event_cost(&event, &AppSettings::default(), &PricingCatalog::default())
+            .expect("official Luna price");
+        assert_eq!(priced.source, "official");
+        assert_eq!(priced.effective_input_rate, 0.2);
+        assert_eq!(priced.effective_cached_input_rate, 0.02);
+        assert_eq!(priced.effective_output_rate, 1.2);
+        assert!((priced.cost - 0.1528).abs() < 1e-12);
+    }
+
+    #[test]
+    fn codex_auto_review_applies_luna_long_context_multipliers() {
+        let event = UsageEvent {
+            model: "codex-auto-review".into(),
+            input_tokens: 300_000,
+            cached_input_tokens: 100_000,
+            output_tokens: 100_000,
+            ..UsageEvent::default()
+        };
+        let priced = event_cost(&event, &AppSettings::default(), &PricingCatalog::default())
+            .expect("official Luna price");
+        assert_eq!(priced.input_multiplier, 2.0);
+        assert_eq!(priced.output_multiplier, 1.5);
+        assert_eq!(priced.effective_cached_input_rate, 0.04);
+        assert!((priced.cost - 0.264).abs() < 1e-12);
+    }
+
+    #[test]
     fn explicit_fast_uses_exact_model_family_multipliers() {
         for (model, expected_multiplier) in [("gpt-5.4", 2.0), ("gpt-5.5", 2.5), ("gpt-5.6", 2.5)] {
             let standard = event_cost(
@@ -3382,6 +3467,181 @@ mod tests {
             .expect("updated remote price");
         assert_eq!(after.1, "models_dev");
         assert!((after.0 - 3.0).abs() < 1e-12);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn normal_background_initialization_preserves_existing_graph_and_waits_for_incremental_scan() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 10.0, Some(10_000)),
+                event(2_000, Some(0.2), 11.0, Some(10_000)),
+            ],
+        );
+        database.rebuild_quotes().expect("initial derived state");
+        let before_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
+            .expect("initial event count");
+        let before_quote = database
+            .latest_quote()
+            .expect("initial quote")
+            .and_then(|quote| quote.estimated_weekly_value_usd);
+
+        let home = historical_home("startup-preserves-graph");
+        write_rollout(
+            &home,
+            r#"{"timestamp":3000,"request_id":"new-after-open","model":"gpt-5.6-luna","usage":{"input_tokens":1000,"output_tokens":1000}}"#,
+        );
+        database
+            .finish_background_initialization(Some(&home))
+            .expect("unchanged startup state");
+
+        let after_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
+            .expect("event count after unchanged startup");
+        let checkpoint_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM source_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .expect("checkpoint count after unchanged startup");
+        let after_quote = database
+            .latest_quote()
+            .expect("quote after unchanged startup")
+            .and_then(|quote| quote.estimated_weekly_value_usd);
+        assert_eq!(after_count, before_count);
+        assert_eq!(checkpoint_count, 0);
+        assert_eq!(after_quote, before_quote);
+
+        drop(database);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn historical_rebuild_gate_tracks_pricing_and_installation_changes() {
+        let (mut database, path) = database();
+        persist(
+            &mut database,
+            vec![
+                event(1_000, Some(0.0), 10.0, Some(10_000)),
+                event(2_000, Some(0.2), 11.0, Some(10_000)),
+            ],
+        );
+        database.rebuild_quotes().expect("initial derived state");
+        let settings = database.load_settings().expect("settings");
+        let default_digest = pricing_configuration_digest(&settings, &PricingCatalog::default())
+            .expect("default pricing digest");
+        let default_state = format!("{PRICING_RULE_VERSION}:{default_digest}");
+        assert!(!database
+            .historical_rebuild_required(&settings, &default_state)
+            .expect("unchanged rebuild gate"));
+
+        database.remote_pricing = pricing::parse_catalog(
+            r#"{"openai":{"models":{"gpt-5.2-codex":{"cost":{"input":3,"output":4}}}}}"#,
+            Some("changed-pricing".into()),
+        )
+        .expect("changed catalog");
+        let changed_digest = pricing_configuration_digest(&settings, &database.remote_pricing)
+            .expect("changed pricing digest");
+        let changed_state = format!("{PRICING_RULE_VERSION}:{changed_digest}");
+        assert!(database
+            .historical_rebuild_required(&settings, &changed_state)
+            .expect("changed pricing rebuild gate"));
+
+        let mut updated_settings = settings;
+        updated_settings.installation_marker = "new-installed-bundle".into();
+        let restored_digest =
+            pricing_configuration_digest(&updated_settings, &PricingCatalog::default())
+                .expect("restored pricing digest");
+        let restored_state = format!("{PRICING_RULE_VERSION}:{restored_digest}");
+        database.remote_pricing = PricingCatalog::default();
+        assert!(database
+            .historical_rebuild_required(&updated_settings, &restored_state)
+            .expect("installation rebuild gate"));
+
+        database
+            .save_settings(&updated_settings)
+            .expect("persist updated installation marker");
+        let home = historical_home("startup-after-install");
+        write_rollout(
+            &home,
+            r#"{"timestamp":3000,"request_id":"new-after-install","model":"gpt-5.6-luna","usage":{"input_tokens":1000,"output_tokens":1000}}"#,
+        );
+        database
+            .finish_background_initialization(Some(&home))
+            .expect("rebuild after installed bundle changed");
+        let imported_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
+            .expect("event count after installed bundle change");
+        assert_eq!(imported_count, 3);
+
+        drop(database);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn rebuilding_reprices_historical_codex_auto_review_events() {
+        let (mut database, path) = database();
+        let mut baseline = event(1_000, Some(0.0), 10.0, Some(10_000));
+        baseline.model = "codex-auto-review".into();
+        let mut usage = event(2_000, Some(0.2), 11.0, Some(10_000));
+        usage.model = "codex-auto-review".into();
+        persist(&mut database, vec![baseline, usage]);
+
+        let before: (f64, String) = database
+            .connection
+            .query_row(
+                "SELECT cost_usd, pricing_status FROM usage_events
+                 WHERE model_id='codex-auto-review' ORDER BY timestamp_ms DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("initial Auto Review price");
+        assert_eq!(before.1, "official");
+        assert_eq!(before.0, 0.04);
+
+        database
+            .connection
+            .execute(
+                "UPDATE usage_events
+                 SET eligible=0, pricing_status='pending', cost_usd=NULL
+                 WHERE model_id='codex-auto-review'",
+                [],
+            )
+            .expect("simulate legacy pending Auto Review events");
+        database
+            .rebuild_quotes()
+            .expect("historical Auto Review reprice");
+
+        let after: (f64, String, String) = database
+            .connection
+            .query_row(
+                "SELECT cost_usd, pricing_status, pricing_rule_version
+                 FROM usage_events WHERE model_id='codex-auto-review'
+                 ORDER BY timestamp_ms DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("repriced Auto Review event");
+        assert_eq!(after.0, 0.04);
+        assert_eq!(after.1, "official");
+        assert_eq!(after.2, PRICING_RULE_VERSION);
+        assert_eq!(
+            database
+                .latest_quote()
+                .expect("quote")
+                .expect("historical quote")
+                .estimated_weekly_value_usd,
+            Some(4.0)
+        );
         drop(database);
         let _ = fs::remove_file(path);
     }
