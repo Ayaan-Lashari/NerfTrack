@@ -1,4 +1,9 @@
 # NerfTrack
+## 👤 Author & Creator
+
+**Lead Developer / Founder:** **Ayaan Lashari**** -Original creator and main maintainer of this project.**
+
+If you would like to contribute or report a bug, please feel free to open an issue or submit a pull request!
 
 NerfTrack is a local-only Tauri desktop app that reads Codex usage records and estimates their API-equivalent weekly value. It stores aggregate usage, quota, and diagnostic data on the same machine; prompts, raw JSONL records, credentials, account identifiers, and complete local paths are not returned through the app UI.
 
@@ -71,5 +76,5 @@ NerfTrack's original source code is licensed under the GNU General Public Licens
 ## Current limitations
 
 - The CLI App Server supervisor module is retained as an unintegrated primitive. The status surface explicitly reports that supervision is unavailable in this release; desktop mode does not depend on it.
-- Native Windows builds and Windows ARM64 packaging are verified by the corresponding CI jobs rather than this macOS development machine.
 - Unsigned release artifacts are build outputs only. Signing, notarization, and installer publication require maintainer-controlled release credentials.
+- Using Codex on multiple machines may make graphs unreliable since NerfTrack relies on local-only data.
